@@ -34,7 +34,11 @@ fn effect(ofx_id: &str) -> Option<std::sync::Arc<dyn EffectPlugin>> {
 
 /// A parameter's id by OFX name (the host may prefix ids with a group path).
 fn find<'a>(p: &'a dyn EffectPlugin, name: &str) -> &'a effectcraft_effects::plugin::PluginParam {
-    p.manifest().params.iter().find(|q| q.id.eq_ignore_ascii_case(name) || q.id.to_lowercase().ends_with(&name.to_lowercase())).unwrap_or_else(|| panic!("no parameter `{name}` in {:?}", p.manifest().params.iter().map(|q| &q.id).collect::<Vec<_>>()))
+    p.manifest()
+        .params
+        .iter()
+        .find(|q| q.id.eq_ignore_ascii_case(name) || q.id.to_lowercase().ends_with(&name.to_lowercase()))
+        .unwrap_or_else(|| panic!("no parameter `{name}` in {:?}", p.manifest().params.iter().map(|q| &q.id).collect::<Vec<_>>()))
 }
 
 /// Flattened default values and texts, in declaration order. `set` overrides by parameter name.

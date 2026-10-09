@@ -199,7 +199,15 @@ impl ClipImage {
 
     /// Convert the sub-rectangle `[x0, x1) x [y0, y1)` of an EffectCraft buffer (`sw` pixels per
     /// row, row 0 = top) into an OFX image with the given geometry.
-    pub fn from_rows(src: &[[f32; 4]], sw: usize, crop: (usize, usize, usize, usize), bounds: OfxRectI, rod: OfxRectI, depth: Depth, comps: Comps) -> ClipImage {
+    pub fn from_rows(
+        src: &[[f32; 4]],
+        sw: usize,
+        crop: (usize, usize, usize, usize),
+        bounds: OfxRectI,
+        rod: OfxRectI,
+        depth: Depth,
+        comps: Comps,
+    ) -> ClipImage {
         let (x0, y0, x1, y1) = crop;
         let w = x1.saturating_sub(x0);
         let h = y1.saturating_sub(y0);

@@ -146,12 +146,7 @@ impl OfxEffect {
     }
 
     fn input_comps(&self, prefs: &Prefs) -> Comps {
-        self.cfg
-            .clips
-            .iter()
-            .find(|c| c.role == ClipRole::Input)
-            .map(|c| prefs.comps.get(&c.name).copied().unwrap_or(c.comps))
-            .unwrap_or(Comps::Rgba)
+        self.cfg.clips.iter().find(|c| c.role == ClipRole::Input).map(|c| prefs.comps.get(&c.name).copied().unwrap_or(c.comps)).unwrap_or(Comps::Rgba)
     }
 
     /// The padding the plug-in's region of definition needs around a layer of `layer_size`
@@ -233,7 +228,16 @@ impl OfxEffect {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run(&self, inst: &mut Instance, frame: &mut PluginFrame, params: &PluginParams, time: f64, fps: f64, geom: Geometry, host: Option<&dyn PluginHost>) -> Result<(), String> {
+    fn run(
+        &self,
+        inst: &mut Instance,
+        frame: &mut PluginFrame,
+        params: &PluginParams,
+        time: f64,
+        fps: f64,
+        geom: Geometry,
+        host: Option<&dyn PluginHost>,
+    ) -> Result<(), String> {
         let (w, h, pad) = (geom.w as usize, geom.h as usize, geom.pad as usize);
         let t = time * fps;
         let values = self.bindings.decode(params.flat, params.texts, &geom.coord());
@@ -308,7 +312,13 @@ impl OfxEffect {
             }
         }
 
-        let out_comps = self.cfg.clips.iter().find(|c| c.role == ClipRole::Output).map(|c| inst.prefs.comps.get(&c.name).copied().unwrap_or(c.comps)).unwrap_or(Comps::Rgba);
+        let out_comps = self
+            .cfg
+            .clips
+            .iter()
+            .find(|c| c.role == ClipRole::Output)
+            .map(|c| inst.prefs.comps.get(&c.name).copied().unwrap_or(c.comps))
+            .unwrap_or(Comps::Rgba);
         let out = Arc::new(ClipImage::blank(bounds, rod_px, depth, out_comps));
         *ctx.output.lock().unwrap_or_else(PoisonError::into_inner) = Some(out.clone());
 

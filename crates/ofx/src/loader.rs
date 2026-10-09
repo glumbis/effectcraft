@@ -289,9 +289,8 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     std::panic::catch_unwind(|| unsafe { set_host(host_ptr()) }).map_err(|_| format!("{ofx_id}: setHost panicked"))?;
     let entry = Arc::new(PluginEntry { main, ofx_id: ofx_id.clone(), lock });
 
-    let status = |what: &str, s: OfxStatus| -> Result<(), String> {
-        if s == K_STAT_OK { Ok(()) } else { Err(format!("{ofx_id}: {what} failed (OFX status {s})")) }
-    };
+    let status =
+        |what: &str, s: OfxStatus| -> Result<(), String> { if s == K_STAT_OK { Ok(()) } else { Err(format!("{ofx_id}: {what} failed (OFX status {s})")) } };
     status("Load", entry.call(ACT_LOAD, std::ptr::null(), None, None))?;
 
     let desc = EffectObj::new_descriptor();
@@ -312,7 +311,10 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     let depth = if depths.is_empty() {
         Depth::Float
     } else {
-        [Depth::Float, Depth::Short, Depth::Byte].into_iter().find(|d| depths.iter().any(|s| s == d.name())).ok_or_else(|| format!("{ofx_id}: needs an unsupported pixel depth {depths:?}"))?
+        [Depth::Float, Depth::Short, Depth::Byte]
+            .into_iter()
+            .find(|d| depths.iter().any(|s| s == d.name()))
+            .ok_or_else(|| format!("{ofx_id}: needs an unsupported pixel depth {depths:?}"))?
     };
     let safety = match desc.props.str(IE_RENDER_THREAD_SAFETY).as_deref() {
         Some(IE_RENDER_UNSAFE) => Safety::Unsafe,
@@ -352,7 +354,11 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     let cfg = Arc::new(EffectCfg { context: context.to_string(), clips, depth, safety, slave_params: desc.props.strs(IE_CLIP_PREFS_SLAVE_PARAM) });
 
     let name = desc.props.str(P_LABEL).filter(|s| !s.trim().is_empty()).unwrap_or_else(|| ofx_id.clone());
-    let category = desc.props.str(IE_GROUPING).and_then(|g| g.split('/').map(str::trim).find(|s| !s.is_empty()).map(str::to_string)).unwrap_or_else(|| "OpenFX".to_string());
+    let category = desc
+        .props
+        .str(IE_GROUPING)
+        .and_then(|g| g.split('/').map(str::trim).find(|s| !s.is_empty()).map(str::to_string))
+        .unwrap_or_else(|| "OpenFX".to_string());
     let id = effect_id(&ofx_id);
     let manifest = PluginManifest {
         api: PLUGIN_API_VERSION,

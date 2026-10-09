@@ -648,10 +648,7 @@ mod tests {
 
     #[test]
     fn mixed_arguments_are_taken_from_their_own_files() {
-        assert_eq!(
-            run("Licence for %s expires in %d days (%.1f%%)", &[2, 30], &[99.5]),
-            "Licence for Sapphire expires in 30 days (99.5%)"
-        );
+        assert_eq!(run("Licence for %s expires in %d days (%.1f%%)", &[2, 30], &[99.5]), "Licence for Sapphire expires in 30 days (99.5%)");
     }
 
     #[test]

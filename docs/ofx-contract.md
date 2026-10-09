@@ -71,6 +71,10 @@ pub trait PluginHost {
     /// effect; RenderHost derives it from `EffectCtx::seed`). 0 = unknown. The OFX host pools
     /// its plug-in instances by it so temporal plug-ins never mix layers up.
     fn instance_key(&self) -> u64 { 0 }
+    /// The layer's source time range in layer-time seconds as (first, end): the first source frame
+    /// starts at `first`, the source ends at `end`. None when unknown (stills, solids, text,
+    /// shapes, or a host that does not say); retimers then assume an unbounded range.
+    fn frame_range(&self) -> Option<(f64, f64)> { None }   // default method, added for retimers
 }
 
 pub trait EffectPlugin: Send + Sync {
@@ -85,6 +89,15 @@ pub trait EffectPlugin: Send + Sync {
     fn render_v2(&self, frame: &mut PluginFrame, params: &PluginParams, time: f64, _host: &dyn PluginHost) -> Result<(), String> { self.render(frame, params, time) }
 }
 ```
+
+`frame_range` is backed by `EffectEnv::layer_span: Option<(f64, f64)>` (`crates/effects`, layer-time
+seconds, same meaning), which the renderer fills in `run_effect_stack` (`crates/render`,
+`eval::layer_span`): footage and nested comps last their item's duration from layer time 0; a layer
+with Time Remap reports its visible span (in to out point) in layer time instead, because layer
+time is then no longer source time; layers without a duration get `None`. The OFX crate turns the
+range into frames (`first * fps` to `end * fps - 1`) for the clips' `FrameRange` /
+`UnmappedFrameRange`, the effect duration and the timeline suite, keeps the old 0..99999 fallback
+when it is `None`, and fails `clipGetImage` on the source clip outside the range.
 
 `run_slot` order: flatten params → `padding()` → `Buf::pad` → build `PluginFrame` → `render_v2`.
 On error the frame is restored (as in v1). `render_v2` may be called from several threads at once.

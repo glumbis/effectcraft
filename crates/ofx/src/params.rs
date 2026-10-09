@@ -639,7 +639,11 @@ pub fn map_params(set: &ParamSet, page_order: &[String], layer_clips: &[String])
                     let kind = if n == 3 {
                         PluginParamKind::Point3 { default: [d(0), d(1), d(2)] }
                     } else {
-                        let (fx, fy) = if normalised { (d(0), if flip { 1.0 - d(1) } else { d(1) }) } else { (d(0) / NOMINAL_PROJECT[0], if flip { 1.0 - d(1) / NOMINAL_PROJECT[1] } else { d(1) / NOMINAL_PROJECT[1] }) };
+                        let (fx, fy) = if normalised {
+                            (d(0), if flip { 1.0 - d(1) } else { d(1) })
+                        } else {
+                            (d(0) / NOMINAL_PROJECT[0], if flip { 1.0 - d(1) / NOMINAL_PROJECT[1] } else { d(1) / NOMINAL_PROJECT[1] })
+                        };
                         PluginParamKind::Point { default: [fx, fy] }
                     };
                     push(&mut params, &mut used, &p.name, name, kind, &group);

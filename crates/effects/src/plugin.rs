@@ -290,6 +290,13 @@ pub trait PluginHost {
     fn instance_key(&self) -> u64 {
         0
     }
+    /// The layer's source time range in **layer time** seconds as (first, end): the first source
+    /// frame starts at `first` and the source ends at `end` (see [`crate::EffectEnv::layer_span`]).
+    /// `None` when the source has no duration or the host does not know it (retimers then
+    /// assume an unbounded range).
+    fn frame_range(&self) -> Option<(f64, f64)> {
+        None
+    }
 }
 
 /// The [`PluginHost::instance_key`] of the effect `ctx` renders: its instance seed (stable per
@@ -617,6 +624,10 @@ impl PluginHost for RenderHost<'_, '_> {
 
     fn instance_key(&self) -> u64 {
         ctx_instance_key(self.ctx)
+    }
+
+    fn frame_range(&self) -> Option<(f64, f64)> {
+        self.ctx.env.layer_span
     }
 }
 

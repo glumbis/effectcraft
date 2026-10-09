@@ -78,6 +78,31 @@ blocklisted; if that keeps happening, start with `EFFECTCRAFT_NO_OFX=1` or unins
 * Temporal plug-ins (motion blur, echo, retiming) can ask for the input at other times and for other
   layers; EffectCraft renders those on demand.
 
+## Retimers (Twixtor)
+
+Time-remapping plug-ins such as RE:Vision **Twixtor** (OFX version) are supported as far as the host
+side goes. Twixtor offers the Filter and General contexts; in General its optional extra inputs
+(motion vectors, foreground matte) are Layer parameters like any other extra clip.
+
+* `paramGetIntegral` and `paramGetDerivative` work for double, 2D / 3D double and colour parameters,
+  so a plug-in can integrate an animated Speed % curve to find the source frame. They sample the
+  animated value through the host: the derivative is a central difference over one frame, the
+  integral composite Simpson with steps of at most one frame (at most 4096 steps per call, so ranges
+  longer than that are coarser). Every sample evaluates the effect's parameters, so integrating from
+  frame 0 late in a long clip costs time on every render. Outside a render the value is constant.
+  Integer, choice and string parameters return `kOfxStatErrUnsupported`.
+* The source clip's `FrameRange` / `UnmappedFrameRange`, the effect duration and the timeline
+  suite's bounds are the layer's real source range (footage and nested comps: their duration; Time
+  Remap layers: the visible span), converted with the comp frame rate. Layers without a duration
+  (stills, solids, text, shapes) keep the old fallback of frames 0 to 99999.
+* `clipGetImage` on the source clip accepts fractional times (frame 12.5 renders the layer at that
+  time; footage shows the frame the media layer picks for it, blended if the layer's Frame Blending
+  is on) and fails with `kOfxStatFailed` outside the frame range instead of inventing a frame.
+* Limits: no GPU, no on-screen overlays (the speed graph and motion-vector tools are unavailable), no
+  host-supplied motion vectors (Twixtor's own optical flow runs on the CPU and is slow at high
+  resolution), and any licence needs RE:Vision's own activation. The extra clips' frame ranges are
+  assumed to equal the source's.
+
 ## Licensing
 
 EffectCraft does not include, license or activate any third-party plug-in.
