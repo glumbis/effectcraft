@@ -352,6 +352,12 @@ pub struct EffectEnv<'a> {
     /// centred on their origin (−w/2, −h/2). Edge pinning measures from these bounds
     /// ([`util::pin_rect`]).
     pub bounds_origin: [f64; 2],
+    /// The layer's source time range in **layer time** seconds as (first, end): the layer time of
+    /// the first source frame and the time just past the last one (so the source lasts
+    /// `end - first` seconds and its last frame starts one frame before `end`). `None` when the
+    /// source has no duration (stills, solids, text, shapes) or the renderer does not know it.
+    /// Retimers clamp their source requests to it.
+    pub layer_span: Option<(f64, f64)>,
 }
 
 /// What an effect gets to render with.

@@ -144,7 +144,8 @@ API 2 is for Rust plug-ins and hosts like the OpenFX bridge (`effectcraft-ofx`, 
   `PluginHost` with `input_at(layer_time)` (the effect's input at another time, in its own extent;
   the effects above this one are applied), `layer_input(param_id, layer_time)` (a layer parameter's
   layer, effects and masks applied, resampled into the frame's grid), `params_at(layer_time)`,
-  `frame_rate()` and `time()`. Images are `PluginImage { width, height, pixels, origin, scale }`.
+  `frame_rate()`, `time()` and `frame_range()` (the layer's source time range in layer-time seconds,
+  `None` when it has none). Images are `PluginImage { width, height, pixels, origin, scale }`.
   It may run on several threads at once.
 * **Loading OpenFX plug-ins**: Effect ▸ Load OpenFX Plug-in…, `effect.plugins.loadOfx {path}`
   (an `.ofx` binary, an `.ofx.bundle` or a folder), or `effect.plugins.scanOfx` (the standard

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use effectcraft_effects::plugin::{PluginHost, PluginImage};
 
@@ -28,6 +28,28 @@ pub const EFFECT_MAGIC: u32 = 0x4F46_5845; // "OFXE"
 /// The nominal layer edge (canonical units) used when the real layer is not known yet
 /// (computing padding before a frame exists).
 pub const NOMINAL_LAYER: f64 = 1000.0;
+
+/// The last frame reported for a clip when the host does not know the layer's real duration.
+const UNKNOWN_LAST_FRAME: f64 = 99999.0;
+
+/// The effect duration (frames) reported when the host does not know the layer's real duration.
+const UNKNOWN_DURATION: f64 = 100000.0;
+
+/// The OFX frame range (first, last) of a source lasting from `first` to `end` layer-time seconds
+/// at `fps` frames per second: the frame numbers of the first and the last frame, `None` for an
+/// empty or non-finite span. A span shorter than a frame still has one frame.
+pub fn span_frames(first: f64, end: f64, fps: f64) -> Option<(f64, f64)> {
+    if !(first.is_finite() && end.is_finite() && fps.is_finite() && fps > 0.0 && end > first) {
+        return None;
+    }
+    let (a, b) = ((first * fps).round(), (end * fps).round() - 1.0);
+    // Frame numbers this large are indistinguishable from "unbounded" and could overflow the
+    // ints plug-ins store them in.
+    if a.abs() > 1.0e9 || b.abs() > 1.0e9 {
+        return None;
+    }
+    Some((a, b.max(a)))
+}
 
 /// `kOfxImageEffectPluginRenderThreadSafety`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +326,8 @@ pub struct RenderCtx {
     pub rod: Mutex<OfxRectD>,
     cache: Mutex<HashMap<(String, i64), Option<Arc<ClipImage>>>>,
     params_cache: Mutex<HashMap<i64, Arc<HashMap<String, Vec<PVal>>>>>,
+    /// The source's OFX frame range, asked of the host once ([`RenderCtx::frame_range`]).
+    span: OnceLock<Option<(f64, f64)>>,
 }
 
 impl RenderCtx {
@@ -336,6 +360,7 @@ impl RenderCtx {
             rod: Mutex::new(rod),
             cache: Mutex::new(HashMap::new()),
             params_cache: Mutex::new(HashMap::new()),
+            span: OnceLock::new(),
         }
     }
 
@@ -354,6 +379,21 @@ impl RenderCtx {
         // SAFETY: see `HostPtr`.
         let h: &dyn PluginHost = unsafe { &*g.0 };
         Some(f(h))
+    }
+
+    /// The source's frame range in OFX frames as (first, last), from the host's layer span;
+    /// `None` when the host does not know it (no host, or a source without a duration).
+    pub fn frame_range(&self) -> Option<(f64, f64)> {
+        *self.span.get_or_init(|| self.with_host(|h| h.frame_range()).flatten().and_then(|(first, end)| span_frames(first, end, self.fps)))
+    }
+
+    /// Whether OFX time `t` lies within the source's frames (always true when the range is
+    /// unknown). The last frame lasts until `last + 1`, so sub-frame times inside it are fine.
+    pub fn in_frame_range(&self, t: f64) -> bool {
+        match self.frame_range() {
+            Some((first, last)) => t.is_finite() && t >= first - 1.0e-6 && t < last + 1.0,
+            None => true,
+        }
     }
 
     /// The canonical region of definition of an input clip.
@@ -378,6 +418,19 @@ impl RenderCtx {
         Some(map)
     }
 
+    /// One parameter's values at another time, through the host. Unlike [`RenderCtx::params_at`]
+    /// nothing is cached, so sampling a long range (parameter derivatives and integrals) does not
+    /// evict the entries a render needs.
+    pub fn param_at(&self, name: &str, ofx_time: f64) -> Option<Vec<PVal>> {
+        let sec = self.secs(ofx_time);
+        let key = (sec * 1.0e6).round() as i64;
+        if let Some(v) = self.params_cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+            return v.get(name).cloned();
+        }
+        let (flat, texts) = self.with_host(|h| h.params_at(sec))??;
+        self.bindings.decode(&flat, &texts, &self.geom.coord()).remove(name)
+    }
+
     fn convert(&self, img: PluginImage, comps: Comps) -> Option<Arc<ClipImage>> {
         let (w, h) = (img.width as usize, img.height as usize);
         if w == 0 || h == 0 || img.pixels.len() != w * h {
@@ -395,11 +448,18 @@ impl RenderCtx {
             return self.output.lock().unwrap_or_else(PoisonError::into_inner).clone();
         }
         let sec = self.secs(t);
-        let same_time = (sec - self.time_sec).abs() < 0.25 / self.fps;
+        // Sub-frame times are real requests (retimers ask for frame 12.5): only a time that is the
+        // current one up to rounding is served from the render's own source image.
+        let same_time = (sec - self.time_sec).abs() * self.fps < 1.0e-3;
         if clip.role == ClipRole::Input && same_time && self.src_now.is_some() {
             return self.src_now.clone();
         }
-        let key = (name.to_string(), (sec * 1.0e6).round() as i64);
+        // The source has no frames outside its range: fail the request instead of inventing one.
+        if clip.role == ClipRole::Input && !self.in_frame_range(t) {
+            return None;
+        }
+        // Times closer than a thousandth of a frame share one cache entry.
+        let key = (name.to_string(), (t * 1.0e3).round() as i64);
         if let Some(v) = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
             return v.clone();
         }
@@ -482,7 +542,7 @@ impl Instance {
         obj.props.put_doubles(IE_PROJECT_EXTENT, &[NOMINAL_LAYER, NOMINAL_LAYER]);
         obj.props.put_doubles(IE_PROJECT_OFFSET, &[0.0, 0.0]);
         obj.props.put_double(IE_PROJECT_PAR, 1.0);
-        obj.props.put_double(IE_EFFECT_DURATION, 100000.0);
+        obj.props.put_double(IE_EFFECT_DURATION, UNKNOWN_DURATION);
         obj.props.put_int(IE_SEQUENTIAL_RENDER, 0);
         obj.props.put_str(IE_OPENGL_ENABLED, "false");
         let comps: HashMap<String, Comps> = cfg.clips.iter().map(|c| (c.name.clone(), c.comps)).collect();
@@ -496,8 +556,8 @@ impl Instance {
             c.props.put_double(IMG_PIXEL_ASPECT_RATIO, 1.0);
             c.props.put_double(IE_FRAME_RATE, 30.0);
             c.props.put_double(IE_UNMAPPED_FRAME_RATE, 30.0);
-            c.props.put_doubles(IE_FRAME_RANGE, &[0.0, 99999.0]);
-            c.props.put_doubles(IE_UNMAPPED_FRAME_RANGE, &[0.0, 99999.0]);
+            c.props.put_doubles(IE_FRAME_RANGE, &[0.0, UNKNOWN_LAST_FRAME]);
+            c.props.put_doubles(IE_UNMAPPED_FRAME_RANGE, &[0.0, UNKNOWN_LAST_FRAME]);
             c.props.put_str(CLIP_FIELD_ORDER, FIELD_NONE);
             c.props.put_int(CLIP_CONTINUOUS_SAMPLES, 0);
             c.props.put_int(CLIP_CONNECTED, 1);
@@ -556,9 +616,16 @@ impl Instance {
         self.obj.props.put_double(IE_FRAME_RATE, ctx.fps);
         self.obj.props.put_doubles(IE_PROJECT_SIZE, &g.layer);
         self.obj.props.put_doubles(IE_PROJECT_EXTENT, &g.layer);
+        // The real source range when the host knows it (retimers clamp to it), else the long
+        // fallback; pooled instances are reset on every render.
+        let range = ctx.frame_range();
+        let (first, last) = range.unwrap_or((0.0, UNKNOWN_LAST_FRAME));
+        self.obj.props.put_double(IE_EFFECT_DURATION, if range.is_some() { last - first + 1.0 } else { UNKNOWN_DURATION });
         self.obj.each_clip(|c| {
             c.props.put_double(IE_FRAME_RATE, ctx.fps);
             c.props.put_double(IE_UNMAPPED_FRAME_RATE, ctx.fps);
+            c.props.put_doubles(IE_FRAME_RANGE, &[first, last]);
+            c.props.put_doubles(IE_UNMAPPED_FRAME_RANGE, &[first, last]);
             c.props.put_int(CLIP_CONNECTED, ctx.connected(&c.name) as i32);
         });
         self.obj.set_render(Some(ctx.clone()));
@@ -720,4 +787,24 @@ fn same_values(a: &[PVal], b: &[PVal]) -> bool {
             (PVal::Ptr(p), PVal::Ptr(q)) => p == q,
             _ => false,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spans_become_frame_ranges() {
+        // A 10 s clip at 30 fps has frames 0..=299.
+        assert_eq!(span_frames(0.0, 10.0, 30.0), Some((0.0, 299.0)));
+        // 24 fps, offset start.
+        assert_eq!(span_frames(2.0, 3.0, 24.0), Some((48.0, 71.0)));
+        // Less than a frame still has one frame; empty, reversed and bad spans have none.
+        assert_eq!(span_frames(0.0, 0.01, 30.0), Some((0.0, 0.0)));
+        assert_eq!(span_frames(1.0, 1.0, 30.0), None);
+        assert_eq!(span_frames(2.0, 1.0, 30.0), None);
+        assert_eq!(span_frames(0.0, f64::INFINITY, 30.0), None);
+        assert_eq!(span_frames(0.0, 10.0, 0.0), None);
+        assert_eq!(span_frames(0.0, 1.0e12, 30.0), None);
+    }
 }

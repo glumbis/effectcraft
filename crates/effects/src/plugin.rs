@@ -284,6 +284,13 @@ pub trait PluginHost {
     fn frame_rate(&self) -> f64;
     /// Layer time of the current render, seconds.
     fn time(&self) -> f64;
+    /// The layer's source time range in **layer time** seconds as (first, end): the first source
+    /// frame starts at `first` and the source ends at `end` (see [`crate::EffectEnv::layer_span`]).
+    /// `None` when the source has no duration or the host does not know it (retimers then
+    /// assume an unbounded range).
+    fn frame_range(&self) -> Option<(f64, f64)> {
+        None
+    }
 }
 
 /// Parameter values for one render, flattened (see the module docs) with typed accessors.
@@ -599,6 +606,10 @@ impl PluginHost for RenderHost<'_, '_> {
 
     fn time(&self) -> f64 {
         self.ctx.time
+    }
+
+    fn frame_range(&self) -> Option<(f64, f64)> {
+        self.ctx.env.layer_span
     }
 }
 

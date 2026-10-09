@@ -138,6 +138,18 @@ pub type VarParamTimeFn = extern "C" fn(Handle, f64, u64, u64, u64, u64, u64) ->
 /// first float register already).
 #[cfg(not(windows))]
 pub type VarParamTimeFn = VarParamFn;
+/// [`VarParamFn`] for `paramGetIntegral`, which has two fixed `OfxTime`s (`time1`, `time2`) before
+/// the variadic out-pointers. On Windows x64 argument positions are fixed: `time1` is the second
+/// argument (XMM1), `time2` the third (XMM2) and the first out-pointer the fourth (R9), the rest on
+/// the stack, so both doubles must be declared as `f64` and four integer slots remain (enough for
+/// the four pointers of an RGBA parameter).
+#[cfg(windows)]
+pub type VarParamTime2Fn = extern "C" fn(Handle, f64, f64, u64, u64, u64, u64) -> OfxStatus;
+/// [`VarParamFn`] for `paramGetIntegral` (System V passes the two fixed doubles in the first two
+/// float registers, exactly where [`VarParamFn`]'s `f1`, `f2` are read, and the out-pointers in
+/// the integer registers after the handle).
+#[cfg(not(windows))]
+pub type VarParamTime2Fn = VarParamFn;
 
 /// `OfxParameterSuiteV1`.
 #[repr(C)]
@@ -149,7 +161,7 @@ pub struct OfxParameterSuiteV1 {
     pub param_get_value: VarParamFn,
     pub param_get_value_at_time: VarParamTimeFn,
     pub param_get_derivative: VarParamTimeFn,
-    pub param_get_integral: VarParamTimeFn,
+    pub param_get_integral: VarParamTime2Fn,
     pub param_set_value: VarParamFn,
     pub param_set_value_at_time: VarParamTimeFn,
     pub param_get_num_keys: extern "C" fn(Handle, *mut u32) -> OfxStatus,
