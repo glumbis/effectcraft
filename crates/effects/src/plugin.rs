@@ -284,6 +284,18 @@ pub trait PluginHost {
     fn frame_rate(&self) -> f64;
     /// Layer time of the current render, seconds.
     fn time(&self) -> f64;
+    /// A stable id of the applied effect instance: the same on every frame of one effect on one
+    /// layer, different for every layer and every application of the effect. Plug-ins that keep
+    /// state between frames pool their native instances by it. 0 when unknown.
+    fn instance_key(&self) -> u64 {
+        0
+    }
+}
+
+/// The [`PluginHost::instance_key`] of the effect `ctx` renders: its instance seed (stable per
+/// effect instance), offset so it is never 0.
+pub fn ctx_instance_key(ctx: &EffectCtx) -> u64 {
+    (1u64 << 32) | u64::from(ctx.seed)
 }
 
 /// Parameter values for one render, flattened (see the module docs) with typed accessors.
@@ -354,8 +366,10 @@ pub trait EffectPlugin: Send + Sync {
         "built-in".into()
     }
     /// API 2: transparent pixels to add on every side of the buffer before rendering (glows,
-    /// blurs, regions of definition larger than the input), in buffer pixels.
-    fn padding(&self, _params: &PluginParams, _time: f64, _scale: f64) -> u32 {
+    /// blurs, regions of definition larger than the input), in buffer pixels. `layer_size` is
+    /// the layer's size in layer pixels (the frame's [`PluginFrame::layer_size`]; 0 when unknown)
+    /// and `instance_key` the [`PluginHost::instance_key`] this render will have.
+    fn padding(&self, _params: &PluginParams, _time: f64, _scale: f64, _layer_size: [f64; 2], _instance_key: u64) -> u32 {
         0
     }
     /// API 2: [`EffectPlugin::render`] with host services. The default calls `render`. May be
@@ -600,6 +614,10 @@ impl PluginHost for RenderHost<'_, '_> {
     fn time(&self) -> f64 {
         self.ctx.time
     }
+
+    fn instance_key(&self) -> u64 {
+        ctx_instance_key(self.ctx)
+    }
 }
 
 fn run_slot(slot: usize, ctx: &EffectCtx, mut buf: Buf) -> Buf {
@@ -607,7 +625,8 @@ fn run_slot(slot: usize, ctx: &EffectCtx, mut buf: Buf) -> Buf {
     let m = plugin.manifest();
     let texts = flatten_texts(m, ctx.params);
     let flat = flatten(m, ctx, &buf);
-    let pad = plugin.padding(&PluginParams { manifest: m, flat: &flat, texts: &texts }, ctx.time, buf.scale).min(MAX_PADDING);
+    let key = ctx_instance_key(ctx);
+    let pad = plugin.padding(&PluginParams { manifest: m, flat: &flat, texts: &texts }, ctx.time, buf.scale, ctx.layer_size, key).min(MAX_PADDING);
     let before = buf.clone();
     // Padding moves the layer origin, which points are measured from.
     let flat = if pad > 0 {

@@ -1,6 +1,8 @@
 //! [`OfxEffect`]: one OFX plug-in exposed as an EffectCraft [`EffectPlugin`].
 //!
-//! A pool of plug-in instances serves concurrent renders. Per render the effect:
+//! Plug-in instances are pooled per applied effect instance ([`PluginHost::instance_key`]), so a
+//! plug-in that caches state between frames (temporal ones such as motion blur) never sees two
+//! layers mixed up; concurrent renders of one key take different instances. Per render the effect:
 //!
 //! 1. decodes the flattened EffectCraft parameters into OFX values and applies them to the
 //!    instance (sending `InstanceChanged` for the ones that changed),
@@ -11,10 +13,11 @@
 //!    image covering the whole padded buffer, and
 //! 5. converts the output back into the frame.
 //!
-//! [`padding`](EffectPlugin::padding) runs the same `GetRegionOfDefinition` against a nominal
-//! layer (the real size is not known before the frame exists) and reports how far the
-//! plug-in grows it, so glows and borders are not clipped.
+//! [`padding`](EffectPlugin::padding) runs the same `GetRegionOfDefinition` against a layer of
+//! the real size (a nominal one when it is not known) and reports how far the plug-in grows it,
+//! so glows and borders are not clipped.
 
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -26,10 +29,36 @@ use crate::ffi::*;
 use crate::instance::*;
 use crate::params::Bindings;
 
-/// The most idle instances kept per effect.
+/// The most idle instances kept per instance key.
 const MAX_IDLE: usize = 8;
+/// The most instance keys that keep idle instances (the least recently used are dropped).
+const MAX_KEYS: usize = 64;
+/// The largest buffer edge, in pixels, that padding is measured on (larger layers use the
+/// nominal size).
+const MAX_MEASURE_EDGE: f64 = 65536.0;
 /// The most padding a plug-in may request per side; larger regions are treated as unbounded.
 const MAX_PAD: i32 = 4096;
+
+/// Idle plug-in instances, grouped by the applied effect instance that last used them.
+#[derive(Default)]
+struct Pool {
+    /// Counts check-ins, for least-recently-used eviction.
+    tick: u64,
+    /// Instance key -> (tick of the last check-in, idle instances).
+    idle: HashMap<u64, (u64, Vec<Instance>)>,
+}
+
+/// The geometry padding is measured on: a layer of `layer_size` at the origin with an unpadded
+/// buffer, or the nominal layer when the size is unknown (or absurd).
+fn measure_geometry(scale: f64, layer_size: [f64; 2]) -> Geometry {
+    let [lw, lh] = layer_size;
+    let (bw, bh) = (lw * scale, lh * scale);
+    if lw.is_finite() && lh.is_finite() && bw >= 1.0 && bh >= 1.0 && bw <= MAX_MEASURE_EDGE && bh <= MAX_MEASURE_EDGE {
+        Geometry { scale, layer: layer_size, origin: [0.0; 2], w: bw.round() as i32, h: bh.round() as i32, pad: 0 }
+    } else {
+        Geometry::nominal(scale)
+    }
+}
 
 /// An OFX plug-in as an EffectCraft effect.
 pub struct OfxEffect {
@@ -40,8 +69,9 @@ pub struct OfxEffect {
     pub(crate) desc: Box<EffectObj>,
     pub(crate) bindings: Arc<Bindings>,
     pub(crate) source: String,
-    pool: Mutex<Vec<Instance>>,
-    pad_cache: Mutex<Option<(u64, i32)>>,
+    pool: Mutex<Pool>,
+    /// Instance key -> (hash of the measured inputs, padding).
+    pad_cache: Mutex<HashMap<u64, (u64, i32)>>,
     /// The frame rate of the last render (padding queries have no host).
     fps_bits: AtomicU64,
 }
@@ -55,8 +85,8 @@ impl OfxEffect {
             desc,
             bindings: Arc::new(bindings),
             source,
-            pool: Mutex::new(Vec::new()),
-            pad_cache: Mutex::new(None),
+            pool: Mutex::new(Pool::default()),
+            pad_cache: Mutex::new(HashMap::new()),
             fps_bits: AtomicU64::new(30.0f64.to_bits()),
         }
     }
@@ -65,8 +95,17 @@ impl OfxEffect {
         f64::from_bits(self.fps_bits.load(Ordering::Relaxed))
     }
 
-    fn checkout(&self) -> Result<Instance, String> {
-        if let Some(i) = self.pool.lock().unwrap_or_else(PoisonError::into_inner).pop() {
+    /// An idle instance last used for `key`, or a new one.
+    fn checkout(&self, key: u64) -> Result<Instance, String> {
+        let pooled = {
+            let mut pool = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+            let popped = pool.idle.get_mut(&key).and_then(|(_, list)| list.pop());
+            if pool.idle.get(&key).is_some_and(|(_, list)| list.is_empty()) {
+                pool.idle.remove(&key);
+            }
+            popped
+        };
+        if let Some(i) = pooled {
             return Ok(i);
         }
         let mut inst = Instance::build(self.entry.clone(), self.cfg.clone(), &self.desc);
@@ -74,11 +113,31 @@ impl OfxEffect {
         Ok(inst)
     }
 
-    fn checkin(&self, inst: Instance) {
-        let mut pool = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        if pool.len() < MAX_IDLE {
-            pool.push(inst);
+    /// Return an instance to `key`'s idle list. Instances over the per-key or the key limit are
+    /// dropped (DestroyInstance) after the pool lock is released.
+    fn checkin(&self, key: u64, inst: Instance) {
+        let mut evicted: Vec<Instance> = Vec::new();
+        {
+            let mut guard = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+            let pool = &mut *guard;
+            pool.tick = pool.tick.wrapping_add(1);
+            let tick = pool.tick;
+            let slot = pool.idle.entry(key).or_insert_with(|| (tick, Vec::new()));
+            slot.0 = tick;
+            if slot.1.len() < MAX_IDLE {
+                slot.1.push(inst);
+            } else {
+                evicted.push(inst);
+            }
+            while pool.idle.len() > MAX_KEYS {
+                let oldest = pool.idle.iter().filter(|(k, _)| **k != key).min_by_key(|(_, (t, _))| *t).map(|(k, _)| *k);
+                let Some(oldest) = oldest else { break };
+                if let Some((_, list)) = pool.idle.remove(&oldest) {
+                    evicted.extend(list);
+                }
+            }
         }
+        drop(evicted);
     }
 
     /// Serialise plug-ins that declare themselves render-thread-unsafe.
@@ -95,29 +154,36 @@ impl OfxEffect {
             .unwrap_or(Comps::Rgba)
     }
 
-    /// The padding the plug-in's region of definition needs around a layer.
-    fn compute_pad(&self, params: &PluginParams, time: f64, scale: f64) -> i32 {
+    /// The padding the plug-in's region of definition needs around a layer of `layer_size`
+    /// (layer pixels; 0 when unknown) for the applied effect instance `key`.
+    fn compute_pad(&self, params: &PluginParams, time: f64, scale: f64, layer_size: [f64; 2], key: u64) -> i32 {
         let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         let mut h = DefaultHasher::new();
         params.flat.iter().for_each(|v| v.to_bits().hash(&mut h));
         params.texts.hash(&mut h);
         time.to_bits().hash(&mut h);
         scale.to_bits().hash(&mut h);
-        let key = h.finish();
-        if let Some((k, p)) = *self.pad_cache.lock().unwrap_or_else(PoisonError::into_inner)
-            && k == key
+        layer_size.iter().for_each(|v| v.to_bits().hash(&mut h));
+        let hash = h.finish();
+        let cached = self.pad_cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key).copied();
+        if let Some((k, p)) = cached
+            && k == hash
         {
             return p;
         }
-        let pad = self.measure_pad(params, time, scale).unwrap_or(0);
-        *self.pad_cache.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, pad));
+        let pad = self.measure_pad(params, time, scale, layer_size, key).unwrap_or(0);
+        let mut cache = self.pad_cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.len() >= MAX_KEYS && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, (hash, pad));
         pad
     }
 
-    fn measure_pad(&self, params: &PluginParams, time: f64, scale: f64) -> Option<i32> {
+    fn measure_pad(&self, params: &PluginParams, time: f64, scale: f64, layer_size: [f64; 2], key: u64) -> Option<i32> {
         let _serial = self.serialise();
-        let inst = self.checkout().ok()?;
-        let geom = Geometry::nominal(scale);
+        let inst = self.checkout(key).ok()?;
+        let geom = measure_geometry(scale, layer_size);
         let values = self.bindings.decode(params.flat, params.texts, &geom.coord());
         inst.apply_values(&values);
         let fps = self.fps();
@@ -137,7 +203,7 @@ impl OfxEffect {
         let default = ctx.input_rod();
         let rod = inst.region_of_definition(time * fps, scale, default);
         inst.end();
-        self.checkin(inst);
+        self.checkin(key, inst);
         let rod = geom.from_canon(rod?);
         let b = geom.bounds();
         let grow = (b.x1 - rod.x1).max(rod.x2 - b.x2).max(b.y1 - rod.y1).max(rod.y2 - b.y2).max(0);
@@ -153,15 +219,16 @@ impl OfxEffect {
         }
         let scale = if frame.scale.is_finite() && frame.scale > 0.0 { frame.scale } else { 1.0 };
         let layer = if frame.layer_size[0] > 0.0 && frame.layer_size[1] > 0.0 { frame.layer_size } else { [w as f64 / scale, h as f64 / scale] };
-        let pad = if host.is_some() { self.compute_pad(params, time, scale).min(w / 2).min(h / 2) } else { 0 };
+        let key = host.map_or(0, |h| h.instance_key());
+        let pad = if host.is_some() { self.compute_pad(params, time, scale, frame.layer_size, key).min(w / 2).min(h / 2) } else { 0 };
         let geom = Geometry { scale, layer, origin: frame.origin, w, h, pad };
 
         let _serial = self.serialise();
-        let mut inst = self.checkout()?;
+        let mut inst = self.checkout(key)?;
         let result = self.run(&mut inst, frame, params, time, fps, geom, host);
         inst.end();
         let msg = inst.obj.message();
-        self.checkin(inst);
+        self.checkin(key, inst);
         result.map_err(|e| if msg.is_empty() { e } else { format!("{e}: {msg}") })
     }
 
@@ -272,8 +339,8 @@ impl EffectPlugin for OfxEffect {
         self.source.clone()
     }
 
-    fn padding(&self, params: &PluginParams, time: f64, scale: f64) -> u32 {
-        self.compute_pad(params, time, scale).max(0) as u32
+    fn padding(&self, params: &PluginParams, time: f64, scale: f64, layer_size: [f64; 2], instance_key: u64) -> u32 {
+        self.compute_pad(params, time, scale, layer_size, instance_key).max(0) as u32
     }
 
     fn render_v2(&self, frame: &mut PluginFrame, params: &PluginParams, time: f64, host: &dyn PluginHost) -> Result<(), String> {
