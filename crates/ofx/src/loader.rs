@@ -178,6 +178,15 @@ fn load_binary(bin: &Path, bundle: &str, report: &mut LoadReport) {
         return;
     }
     let label = bin.display().to_string();
+    // A binary that crashed the process last time is skipped; the crash marker stays on disk
+    // until this binary has been loaded and described (the guard removes it when dropped).
+    let _marker = match crate::blocklist::begin(&key, &label) {
+        Ok(g) => g,
+        Err(e) => {
+            report.errors.push(e);
+            return;
+        }
+    };
     let lib = match open_library(bin) {
         Ok(l) => l,
         Err(e) => {

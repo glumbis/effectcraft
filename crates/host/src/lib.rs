@@ -99,6 +99,11 @@ pub fn session() -> Session {
     {
         s.ofx_loader = Some(effectcraft_ofx::loader);
         s.ofx_search_paths = effectcraft_ofx::default_search_paths();
+        s.ofx_clear_blocklist = Some(effectcraft_ofx::blocklist::clear);
+        // A plug-in that crashed the app while loading is remembered here and skipped next time.
+        if let Some(dir) = config_dir() {
+            effectcraft_ofx::blocklist::set_state_dir(dir);
+        }
     }
     s
 }

@@ -16,11 +16,12 @@
 //! Modules: [`ffi`] (the C ABI), [`props`] (property sets), [`params`] (parameter storage and the
 //! mapping to EffectCraft parameters), [`clips`] (clips, images and pixel conversion),
 //! [`instance`] (effect handles, geometry, per-render context, actions), [`effect`] (the
-//! `EffectPlugin` implementation), [`suites`] (the host suites) and [`loader`] (bundle discovery
-//! and registration).
+//! `EffectPlugin` implementation), [`suites`] (the host suites), [`loader`] (bundle discovery
+//! and registration) and [`blocklist`] (skips plug-ins that crashed the app while loading).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod blocklist;
 pub mod clips;
 pub mod effect;
 pub mod ffi;
@@ -32,6 +33,7 @@ pub mod suites;
 
 use std::path::PathBuf;
 
+pub use blocklist::set_state_dir;
 pub use loader::{default_search_paths, load_path};
 
 /// One OFX plug-in that was registered as an effect.

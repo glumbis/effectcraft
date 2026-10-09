@@ -412,6 +412,9 @@ pub struct Session {
     pub ofx_loader: Option<OfxLoader>,
     /// Where `effect.plugins.scanOfx` looks for OpenFX plug-ins (the host's defaults).
     pub ofx_search_paths: Vec<std::path::PathBuf>,
+    /// Forgets the OpenFX crash blocklist (plug-ins skipped because they crashed the app while
+    /// loading): `effect.plugins.scanOfx {"retry": true}`.
+    pub ofx_clear_blocklist: Option<fn()>,
     /// ScriptUI windows and panels opened by scripts (see [`scriptui`]).
     pub script_ui: scriptui::ScriptUi,
     /// The last physical-memory reading (Settings ▸ Memory & CPU budgets); `None` = unknown
@@ -523,6 +526,7 @@ impl Default for Session {
             plugin_loader: None,
             ofx_loader: None,
             ofx_search_paths: vec![],
+            ofx_clear_blocklist: None,
             script_ui: scriptui::ScriptUi::default(),
             sys_memory: None,
             key_move: None,
