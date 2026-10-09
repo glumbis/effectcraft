@@ -147,8 +147,12 @@ fn param_kinds() {
     assert!(matches!(kind("bool"), PluginParamKind::Checkbox { default: true }));
     assert!(matches!(kind("choice"), PluginParamKind::Popup { ref options, default: 1 } if options.len() == 3));
     assert!(matches!(kind("rgba"), PluginParamKind::Color { default } if (default[0] - 0.25).abs() < 1e-9 && default[3] == 1.0));
-    assert!(matches!(kind("double2d"), PluginParamKind::Point { .. }));
-    assert!(matches!(kind("double3d"), PluginParamKind::Point3 { default } if default == [1.0, 2.0, 3.0]));
+    // The test plug-in declares plain (not XY) 2D and 3D doubles, so each component is a slider.
+    assert!(matches!(kind("double2d_x"), PluginParamKind::Slider { default, integer: false, .. } if default == 10.0));
+    assert!(matches!(kind("double2d_y"), PluginParamKind::Slider { default, integer: false, .. } if default == 20.0));
+    assert!(matches!(kind("double3d_x"), PluginParamKind::Slider { default, integer: false, .. } if default == 1.0));
+    assert!(matches!(kind("double3d_y"), PluginParamKind::Slider { default, integer: false, .. } if default == 2.0));
+    assert!(matches!(kind("double3d_z"), PluginParamKind::Slider { default, integer: false, .. } if default == 3.0));
     assert!(matches!(kind("string"), PluginParamKind::Text { ref default } if default == "hello"));
     assert!(matches!(kind("custom"), PluginParamKind::Hidden { ref default } if default == "opaque-data"));
     // It is a pass-through: rendering with the defaults must not change the image.

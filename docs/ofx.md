@@ -44,8 +44,12 @@ effects, Sapphire alone around 270, so the first start-up can take a moment.
   input clips (every clip except `Source`) become **Layer** parameters named after the clip: pick the
   layer to use as that input. A Transition's `SourceTo` clip works the same way.
 * Parameters: doubles and integers become sliders, booleans checkboxes, choices popups, RGBA colours,
-  2D doubles points, 3D doubles a 3-value point, strings text fields; custom parameters carry
-  opaque plug-in data and are hidden. Groups and pages are folded into parameter names.
+  strings text fields; custom parameters carry opaque plug-in data and are hidden. Groups and pages
+  are folded into parameter names.
+* 2D and 3D doubles follow their OFX double type. Only position values (type XY or XY absolute)
+  become an on-screen point: a 2D position a point, a 3D position a 3-value point. Every other 2D or
+  3D double, including the plain default, becomes one slider per component, named `<name>_x`,
+  `_y` and `_z`. A plug-in that wants a viewer point for a value must declare it as a position.
 * The effect's output may be larger than its input (glows, blurs, borders); EffectCraft pads the
   layer buffer by the plug-in's region of definition before rendering.
 * Pixels are float RGBA, premultiplied. Plug-ins that only support 8- or 16-bit are converted.

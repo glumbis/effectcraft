@@ -107,9 +107,23 @@ fn bundle_binary(bundle: &Path) -> Option<PathBuf> {
     std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.is_file() && is_ofx_file(p))
 }
 
+/// The `.ofx.bundle` folder a bare binary belongs to: `X.ofx.bundle/Contents/<platform>/X.ofx`.
+/// Pure path logic (the platform directory may have any name, nothing is read from disk).
+fn bundle_of(bin: &Path) -> Option<PathBuf> {
+    let platform = bin.parent()?;
+    let contents = platform.parent()?;
+    if !contents.file_name()?.to_str()?.eq_ignore_ascii_case("Contents") {
+        return None;
+    }
+    let bundle = contents.parent()?;
+    is_bundle(bundle).then(|| bundle.to_path_buf())
+}
+
 fn find_binaries(path: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>, errors: &mut Vec<String>) {
     if path.is_file() {
-        out.push((path.to_path_buf(), path.to_string_lossy().into_owned()));
+        // A bare binary inside a bundle reports (and describes) its bundle folder; otherwise the binary itself.
+        let bundle = bundle_of(path).unwrap_or_else(|| path.to_path_buf());
+        out.push((path.to_path_buf(), bundle.to_string_lossy().into_owned()));
         return;
     }
     if is_bundle(path) {
@@ -134,7 +148,8 @@ fn find_binaries(path: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>, er
         if meta.is_dir() {
             find_binaries(&p, depth + 1, out, errors);
         } else if meta.is_file() && is_ofx_file(&p) {
-            out.push((p.clone(), p.to_string_lossy().into_owned()));
+            let bundle = bundle_of(&p).unwrap_or_else(|| p.clone());
+            out.push((p.clone(), bundle.to_string_lossy().into_owned()));
         }
     }
 }
@@ -272,8 +287,9 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
 
     let desc = EffectObj::new_descriptor();
     desc.props.put_ptr(IE_PLUGIN_HANDLE, ptr as usize);
+    // The bundle folder itself (plug-ins append `Contents/Resources/...`); unset when no bundle is known.
     if !bundle.is_empty() && bundle != bin.to_string_lossy() {
-        desc.props.put_str(P_PLUGIN_FILE_PATH, &Path::new(bundle).join("Contents").join("Resources").to_string_lossy());
+        desc.props.put_str(P_PLUGIN_FILE_PATH, bundle);
     }
     status("Describe", entry.call(ACT_DESCRIBE, desc.handle(), None, None))?;
 
@@ -343,4 +359,54 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     let effect = OfxEffect::new(manifest, entry, cfg, desc, mapped.bindings, source);
     register_plugin(Arc::new(effect)).map_err(|e| format!("{ofx_id}: {e}"))?;
     Ok(Some(LoadedEffect { id, name, category, ofx_id, context: short_context(context).to_string(), bundle: bundle.to_string() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_of_finds_the_bundle_folder_of_a_bundled_binary() {
+        // The platform directory can have any name, and the bundle name is matched case-insensitively.
+        for (bin, bundle) in [
+            ("C:/OFX/Plugins/Foo.ofx.bundle/Contents/Win64/Foo.ofx", "C:/OFX/Plugins/Foo.ofx.bundle"),
+            ("/Library/OFX/Plugins/Foo.ofx.bundle/Contents/MacOS/Foo.ofx", "/Library/OFX/Plugins/Foo.ofx.bundle"),
+            ("/usr/OFX/Plugins/Foo.ofx.bundle/Contents/Linux-x86-64/Foo.ofx", "/usr/OFX/Plugins/Foo.ofx.bundle"),
+            ("/x/Foo.OFX.BUNDLE/contents/anything/Foo.ofx", "/x/Foo.OFX.BUNDLE"),
+        ] {
+            assert_eq!(bundle_of(Path::new(bin)), Some(PathBuf::from(bundle)), "{bin}");
+        }
+    }
+
+    #[test]
+    fn bundle_of_is_none_outside_a_bundle() {
+        // A loose binary, a binary in a plain folder, and a binary whose parents are not the bundle layout.
+        assert_eq!(bundle_of(Path::new("Foo.ofx")), None);
+        assert_eq!(bundle_of(Path::new("/opt/plugins/Foo.ofx")), None);
+        assert_eq!(bundle_of(Path::new("/opt/Foo/Contents/Win64/Foo.ofx")), None);
+        assert_eq!(bundle_of(Path::new("/opt/Foo.ofx.bundle/Win64/Foo.ofx")), None);
+        assert_eq!(bundle_of(Path::new("/opt/Foo.ofx.bundle/Contents/Foo.ofx")), None);
+        assert_eq!(bundle_of(Path::new("/opt/Foo.ofx.bundle/Contents/Win64/Sub/Foo.ofx")), None);
+        assert_eq!(bundle_of(Path::new("")), None);
+    }
+
+    #[test]
+    fn effect_id_is_the_lower_cased_ofx_id() {
+        assert_eq!(effect_id("org.effectcraft.test.Invert"), "org.effectcraft.test.invert");
+        assert_eq!(effect_id("com.Boris-FX.Sapphire_Blur"), "com.boris-fx.sapphire_blur");
+    }
+
+    #[test]
+    fn effect_id_replaces_invalid_characters() {
+        assert_eq!(effect_id("a b/c:d"), "a_b_c_d");
+        assert_eq!(effect_id("x\u{e9}y"), "x_y");
+    }
+
+    #[test]
+    fn effect_id_prefixes_ec_namespace_and_names_empty_ids() {
+        assert_eq!(effect_id("ec.blur"), "ofx.ec.blur");
+        assert_eq!(effect_id("EC.Blur"), "ofx.ec.blur");
+        assert_eq!(effect_id("ecx.blur"), "ecx.blur");
+        assert_eq!(effect_id(""), "unnamed");
+    }
 }

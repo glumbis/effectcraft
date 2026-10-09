@@ -11,8 +11,9 @@
 //!
 //! Mapping (see `docs/ofx-contract.md`): double / int / bool / choice / RGB / RGBA / string /
 //! custom map to Slider (integer for int) / Checkbox / Popup / Color / Text / Hidden. Angles map
-//! to Angle, absolute 2D positions to Point (converted between buffer pixels and OFX canonical
-//! y-up coordinates), other 2D/3D values to one slider per component named `<id>_x`, `_y`,
+//! to Angle. Position values (double type XY or XY absolute) map to Point (2D) or Point3 (3D),
+//! converted between buffer pixels and OFX canonical y-up coordinates for absolute ones. Every
+//! other 2D/3D value (Plain included) maps to one slider per component named `<id>_x`, `_y`,
 //! `_z`. Groups and pages become the `group` path; push buttons, bytes and secret numeric
 //! parameters are not exposed (the plug-in keeps their default).
 
@@ -630,9 +631,9 @@ pub fn map_params(set: &ParamSet, page_order: &[String], layer_clips: &[String])
                 let n = if p.kind == PKind::Double2D { 2 } else { 3 };
                 let ty = p.props.str(PP_DOUBLE_TYPE).unwrap_or_default();
                 let xy = ty == DOUBLE_TYPE_XY_ABSOLUTE || ty == DOUBLE_TYPE_XY;
-                // 2D plain / position values and every 3D value are points; other 2D kinds
-                // (scales, times, angles) are one slider per component.
-                if n == 3 || xy || ty == DOUBLE_TYPE_PLAIN {
+                // Only position values (double type XY / XY absolute) are on-screen points. Plain
+                // (the OFX default), scale and any other double type are one slider per component.
+                if xy {
                     let normalised = p.props.str(PP_DEFAULT_COORDINATE_SYSTEM).as_deref() == Some(COORDS_NORMALISED);
                     let flip = ty == DOUBLE_TYPE_XY_ABSOLUTE;
                     let kind = if n == 3 {
