@@ -43,8 +43,7 @@ extern "C" fn multi_thread(func: ThreadFn, n_threads: u32, arg: *mut c_void) -> 
         };
         IN_MULTI_THREAD.with(|f| f.set(true));
         let ok = if n == 1 {
-            let r = run(0);
-            r
+            run(0)
         } else {
             thread::scope(|s| {
                 let handles: Vec<_> = (1..n).map(|i| s.spawn(move || run(i))).collect();

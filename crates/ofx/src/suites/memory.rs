@@ -28,7 +28,10 @@ pub fn host_alloc(bytes: usize) -> Option<*mut u8> {
 }
 
 /// Free a block from [`host_alloc`] (null is ignored).
-pub fn host_free(p: *mut u8) {
+///
+/// # Safety
+/// `p` is null or a block from [`host_alloc`] that has not been freed yet.
+pub unsafe fn host_free(p: *mut u8) {
     if p.is_null() {
         return;
     }
@@ -63,7 +66,8 @@ extern "C" fn memory_alloc(_handle: Handle, bytes: usize, out: *mut *mut c_void)
 
 extern "C" fn memory_free(p: *mut c_void) -> OfxStatus {
     guard(|| {
-        host_free(p as *mut u8);
+        // SAFETY: the plug-in frees a block it got from `memory_alloc`.
+        unsafe { host_free(p as *mut u8) };
         K_STAT_OK
     })
 }

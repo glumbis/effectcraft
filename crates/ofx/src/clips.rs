@@ -155,6 +155,8 @@ impl PixBuf {
     }
     /// # Safety
     /// No plug-in may be running that holds this buffer.
+    // The bytes live in an `UnsafeCell`; exclusivity is the caller's contract above.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn bytes_mut(&self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.bytes) }
     }

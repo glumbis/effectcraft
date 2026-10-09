@@ -108,6 +108,8 @@ pub struct PluginEntry {
 
 impl PluginEntry {
     /// Dispatch an action to the plug-in.
+    // `handle` is never dereferenced here, only handed to the plug-in.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn call(&self, action: &str, handle: *const c_void, in_args: Option<&PropSet>, out_args: Option<&PropSet>) -> OfxStatus {
         let a = cstring(action);
         let i = in_args.map(PropSet::as_handle).unwrap_or(std::ptr::null_mut());
@@ -306,6 +308,11 @@ impl HostPtr {
     }
 }
 
+/// Clip images fetched during one render, by clip name and time (microseconds or 1/1000 frame).
+type ImageCache = HashMap<(String, i64), Option<Arc<ClipImage>>>;
+/// Parameter values by OFX name.
+type ParamValues = Arc<HashMap<String, Vec<PVal>>>;
+
 static IMAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Everything the suites need while a render (or a padding query) is in progress.
@@ -329,8 +336,8 @@ pub struct RenderCtx {
     pub output: Mutex<Option<Arc<ClipImage>>>,
     /// The effect's region of definition, canonical.
     pub rod: Mutex<OfxRectD>,
-    cache: Mutex<HashMap<(String, i64), Option<Arc<ClipImage>>>>,
-    params_cache: Mutex<HashMap<i64, Arc<HashMap<String, Vec<PVal>>>>>,
+    cache: Mutex<ImageCache>,
+    params_cache: Mutex<HashMap<i64, ParamValues>>,
     /// The source's OFX frame range, asked of the host once ([`RenderCtx::frame_range`]).
     span: OnceLock<Option<(f64, f64)>>,
 }
@@ -730,7 +737,7 @@ impl Instance {
         for c in &self.cfg.clips {
             let v = out.doubles(&format!("{CLIP_FRAMES_NEEDED_PREFIX}{}", c.name));
             if !v.is_empty() {
-                map.insert(c.name.clone(), v.chunks_exact(2).map(|p| (p[0], p[1])).collect());
+                map.insert(c.name.clone(), v.as_chunks::<2>().0.iter().map(|&[a, b]| (a, b)).collect());
             }
         }
         map

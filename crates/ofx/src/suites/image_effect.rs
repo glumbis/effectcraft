@@ -173,7 +173,8 @@ fn image_mem<'a>(h: Handle) -> Option<&'a ImageMem> {
 extern "C" fn image_memory_free(h: Handle) -> OfxStatus {
     guard(|| {
         let Some(m) = image_mem(h) else { return K_STAT_ERR_BAD_HANDLE };
-        host_free(m.ptr);
+        // SAFETY: `m.ptr` came from `host_alloc` in `image_memory_alloc`; the handle is freed below.
+        unsafe { host_free(m.ptr) };
         // SAFETY: allocated with Box::into_raw above; the magic is cleared so a double free is
         // rejected as long as the allocator does not reuse the address.
         let b = unsafe { Box::from_raw(h as *mut ImageMem) };

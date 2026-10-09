@@ -197,6 +197,8 @@ unsafe fn describe_all_params(set: ParamSet) {
             s.set_dbl(p, c"OfxParamPropDefault", i as c_int, v);
         }
         let p = define_param(set, c"OfxParamTypeDouble2D", c"double2d", c"Double 2D");
+        // A position, so the host shows it as a viewer point (the 3D one stays plain: sliders).
+        s.set_str(p, c"OfxParamPropDoubleType", 0, c"OfxParamDoubleTypeXYAbsolute");
         for i in 0..2 {
             s.set_dbl(p, c"OfxParamPropDefault", i, 10.0 * (i + 1) as f64);
         }

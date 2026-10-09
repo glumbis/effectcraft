@@ -154,12 +154,15 @@ impl ParamObj {
 }
 
 /// The ordered parameters of an effect descriptor or instance.
+// Boxed so the pointers handed to plug-ins stay put while the list grows.
+#[allow(clippy::vec_box)]
 #[derive(Default)]
 pub struct ParamSet {
     items: Mutex<Vec<Box<ParamObj>>>,
 }
 
 impl ParamSet {
+    #[allow(clippy::vec_box)]
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Box<ParamObj>>> {
         self.items.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -651,9 +654,9 @@ pub fn map_params(set: &ParamSet, page_order: &[String], layer_clips: &[String])
                     flat += n;
                 } else {
                     let suffix = ["x", "y", "z"];
-                    for i in 0..n {
-                        let base = format!("{}_{}", p.name, suffix[i]);
-                        let label = format!("{} {}", name, dim_label(p, i, &suffix[i].to_uppercase()));
+                    for (i, s) in suffix.iter().enumerate().take(n) {
+                        let base = format!("{}_{s}", p.name);
+                        let label = format!("{} {}", name, dim_label(p, i, &s.to_uppercase()));
                         push(&mut params, &mut used, &base, label, slider(p, i, false, d(i)), &group);
                     }
                     bindings.items.push(Binding { name: p.name.clone(), kind: p.kind, src: Src::Flat { at: flat, n }, choices: vec![] });
@@ -666,9 +669,9 @@ pub fn map_params(set: &ParamSet, page_order: &[String], layer_clips: &[String])
                 }
                 let n = if p.kind == PKind::Int2D { 2 } else { 3 };
                 let suffix = ["x", "y", "z"];
-                for i in 0..n {
-                    let base = format!("{}_{}", p.name, suffix[i]);
-                    let label = format!("{} {}", name, dim_label(p, i, &suffix[i].to_uppercase()));
+                for (i, s) in suffix.iter().enumerate().take(n) {
+                    let base = format!("{}_{s}", p.name);
+                    let label = format!("{} {}", name, dim_label(p, i, &s.to_uppercase()));
                     push(&mut params, &mut used, &base, label, slider(p, i, true, d(i)), &group);
                 }
                 bindings.items.push(Binding { name: p.name.clone(), kind: p.kind, src: Src::Flat { at: flat, n }, choices: vec![] });
