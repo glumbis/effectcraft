@@ -85,9 +85,15 @@ fn plugins_load_ofx(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// `effect.plugins.scanOfx`: load every plug-in in the host's OpenFX search paths
 /// ([`Session::ofx_search_paths`]). Missing folders are skipped; one bad plug-in doesn't stop
-/// the rest. Returns `{paths, loaded, errors}`.
-fn plugins_scan_ofx(s: &mut Session, _: &Value) -> Result<Value> {
+/// the rest. Plug-ins that crashed the app while loading last time are skipped (the host keeps a
+/// blocklist); `retry: true` forgets that list first. Returns `{paths, loaded, errors}`.
+fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     let loader = s.ofx_loader.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
+    if b_p(p, "retry").unwrap_or(false)
+        && let Some(clear) = s.ofx_clear_blocklist
+    {
+        clear();
+    }
     let (mut paths, mut loaded, mut errors) = (vec![], vec![], vec![]);
     for dir in s.ofx_search_paths.clone() {
         if !dir.exists() {
@@ -503,7 +509,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Scan for OpenFX Plug-ins",
             [],
             None,
-            "{} → {paths, loaded, errors}: loads every OpenFX plug-in in the standard folders and OFX_PLUGIN_PATH",
+            "{retry?} → {paths, loaded, errors}: loads every OpenFX plug-in in the standard folders and OFX_PLUGIN_PATH; plug-ins that crashed the app while loading last time are skipped unless retry is true",
             super::always,
             plugins_scan_ofx
         ),

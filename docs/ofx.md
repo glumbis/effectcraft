@@ -38,6 +38,28 @@ effects, Sapphire alone around 270, so the first start-up can take a moment.
 * To skip the start-up scan (for example to rule OFX out when something misbehaves) set the
   environment variable `EFFECTCRAFT_NO_OFX=1`.
 
+## A plug-in that crashes while loading
+
+A native crash inside a plug-in (in its library start-up code, `Load`, `Describe` or
+`DescribeInContext`) takes the whole app down, and since the standard folders are scanned at every
+start-up, one bad plug-in would make EffectCraft crash on every launch. So, like other OFX hosts,
+EffectCraft keeps a **crash blocklist** in its config folder (`%APPDATA%\EffectCraft` on Windows,
+`~/Library/Application Support/EffectCraft` on macOS, `~/.config/effectcraft` on Linux, or
+`EFFECTCRAFT_CONFIG_DIR`):
+
+* Before it opens a plug-in binary it writes the binary's path to `ofx_loading.txt`, and deletes the
+  file once that binary has been loaded and described (successfully or with an ordinary error).
+* If the app dies in between, the file is still there at the next start. The first load of that run
+  moves the path to `ofx_blocklist.txt` (one path per line) and the binary is **skipped** from then
+  on. The skip shows up in the loader's `errors` ("... skipped: it crashed EffectCraft while loading
+  last time ...") and on stderr at start-up. The rest of the plug-ins load normally.
+* To try a blocklisted plug-in again (after updating or re-licensing it), run
+  `effect.plugins.scanOfx {"retry": true}` from the control protocol, or delete its line (or the whole
+  `ofx_blocklist.txt`) and restart. A plug-in that crashes again is simply blocklisted again.
+
+This only covers loading. A crash while an effect is rendering is not caught and is not
+blocklisted; if that keeps happening, start with `EFFECTCRAFT_NO_OFX=1` or uninstall the plug-in.
+
 ## How OFX maps onto EffectCraft
 
 * Contexts: Filter is preferred, then General, Transition and Generator. A General effect's extra

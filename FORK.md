@@ -47,3 +47,8 @@ anyway"). The same workflow also runs the tests on Linux.
    into the same OFX folder (or load it by hand) and apply the "EC Test" effects.
 5. If something crashes the app, start it with `EFFECTCRAFT_NO_OFX=1` to run without OFX, and note
    which plug-in and effect it was. Native plug-in bugs can take the whole app down.
+6. A plug-in that crashes *while loading* does not need `EFFECTCRAFT_NO_OFX`: the next start-up
+   remembers it in `ofx_blocklist.txt` (in the config folder, `%APPDATA%\EffectCraft` on Windows) and
+   skips it, with a message on stderr, so the app comes up with everything else. To try it again
+   run the control command `effect.plugins.scanOfx {"retry": true}` or delete its line from that
+   file. See [docs/ofx.md](docs/ofx.md).
