@@ -21,8 +21,9 @@
 //! register), on the System V ABIs (Linux, macOS x86-64) integers and doubles are taken from
 //! separate register files. Both are modelled by [`VarArgs`]. Apple Silicon passes variadic
 //! arguments on the stack, which this does not model, so the parameter suite is not available
-//! there. The message functions only read their fixed arguments (the format string is logged
-//! unexpanded).
+//! there. The message functions are declared with extra slots too ([`VarMessageFn`]) and the host
+//! expands the common printf conversions itself; on Apple Silicon they only read their fixed
+//! arguments (the format string is logged with its conversions unexpanded).
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -204,18 +205,52 @@ pub struct OfxMultiThreadSuiteV1 {
     pub mutex_try_lock: extern "C" fn(Handle) -> OfxStatus,
 }
 
-/// `OfxMessageSuiteV1`. The printf arguments are not readable (see the module docs); the
-/// declaration only names the fixed parameters.
+/// The shape of the printf-style message functions (`message`, `setPersistentMessage`): the four
+/// fixed arguments (handle, message type, message id, format) followed by the slots the variadic
+/// arguments are read from. Windows x64: eight 8-byte stack slots (doubles as their bit pattern).
+#[cfg(windows)]
+pub type VarMessageFn = extern "C" fn(Handle, *const c_char, *const c_char, *const c_char, u64, u64, u64, u64, u64, u64, u64, u64) -> OfxStatus;
+/// The shape of the printf-style message functions. System V (and AAPCS64 outside Apple): after the
+/// four fixed integer registers, integer arguments continue in the next two registers and then on
+/// the stack, doubles come from the first eight float registers.
+#[cfg(all(not(windows), not(all(target_vendor = "apple", target_arch = "aarch64"))))]
+pub type VarMessageFn = extern "C" fn(
+    Handle,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+) -> OfxStatus;
+/// The shape of the printf-style message functions. Apple Silicon passes variadic arguments on the
+/// stack in a way the fixed-slot trick does not model, so only the fixed arguments are declared.
+#[cfg(all(not(windows), target_vendor = "apple", target_arch = "aarch64"))]
+pub type VarMessageFn = extern "C" fn(Handle, *const c_char, *const c_char, *const c_char) -> OfxStatus;
+
+/// `OfxMessageSuiteV1`. The printf arguments are read from the declared slots (see
+/// [`VarMessageFn`]).
 #[repr(C)]
 pub struct OfxMessageSuiteV1 {
-    pub message: extern "C" fn(Handle, *const c_char, *const c_char, *const c_char) -> OfxStatus,
+    pub message: VarMessageFn,
 }
 
 /// `OfxMessageSuiteV2`.
 #[repr(C)]
 pub struct OfxMessageSuiteV2 {
-    pub message: extern "C" fn(Handle, *const c_char, *const c_char, *const c_char) -> OfxStatus,
-    pub set_persistent_message: extern "C" fn(Handle, *const c_char, *const c_char, *const c_char) -> OfxStatus,
+    pub message: VarMessageFn,
+    pub set_persistent_message: VarMessageFn,
     pub clear_persistent_message: extern "C" fn(Handle) -> OfxStatus,
 }
 
