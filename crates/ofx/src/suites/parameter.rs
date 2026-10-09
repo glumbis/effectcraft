@@ -204,12 +204,28 @@ macro_rules! var_fn {
     };
 }
 
+/// [`var_fn`] for the suite functions whose first argument after the handle is a fixed
+/// `OfxTime`. On Windows x64 a fixed double travels only in its XMM register (the integer slot
+/// holds garbage), so it has to be declared as `f64`; System V already reads it from the first
+/// float register.
+macro_rules! var_fn_t {
+    ($name:ident, $body:path) => {
+        #[cfg(windows)]
+        extern "C" fn $name(h: Handle, t: f64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> OfxStatus {
+            let va = VarArgs::new([t.to_bits(), a2, a3, a4, a5, a6]);
+            guard(move || $body(h, va))
+        }
+        #[cfg(not(windows))]
+        var_fn!($name, $body);
+    };
+}
+
 var_fn!(param_get_value, get_value);
-var_fn!(param_get_value_at_time, get_value_at_time);
-var_fn!(param_get_derivative, unsupported);
-var_fn!(param_get_integral, unsupported);
+var_fn_t!(param_get_value_at_time, get_value_at_time);
+var_fn_t!(param_get_derivative, unsupported);
+var_fn_t!(param_get_integral, unsupported);
 var_fn!(param_set_value, set_value);
-var_fn!(param_set_value_at_time, set_value_at_time);
+var_fn_t!(param_set_value_at_time, set_value_at_time);
 
 extern "C" fn param_get_num_keys(h: Handle, n: *mut u32) -> OfxStatus {
     guard(|| {

@@ -130,6 +130,14 @@ pub type VarParamFn = extern "C" fn(Handle, u64, u64, u64, u64, u64, u64) -> Ofx
 /// The shape every variadic parameter-suite function is declared with (see the module docs).
 #[cfg(not(windows))]
 pub type VarParamFn = extern "C" fn(Handle, u64, u64, u64, u64, u64, f64, f64, f64, f64, f64) -> OfxStatus;
+/// [`VarParamFn`] for the functions taking a fixed `OfxTime` first: on Windows x64 that double
+/// arrives only in its XMM register, so it must be declared as one.
+#[cfg(windows)]
+pub type VarParamTimeFn = extern "C" fn(Handle, f64, u64, u64, u64, u64, u64) -> OfxStatus;
+/// [`VarParamFn`] for the functions taking a fixed `OfxTime` first (System V reads it from the
+/// first float register already).
+#[cfg(not(windows))]
+pub type VarParamTimeFn = VarParamFn;
 
 /// `OfxParameterSuiteV1`.
 #[repr(C)]
@@ -139,11 +147,11 @@ pub struct OfxParameterSuiteV1 {
     pub param_set_get_property_set: extern "C" fn(Handle, *mut Handle) -> OfxStatus,
     pub param_get_property_set: extern "C" fn(Handle, *mut Handle) -> OfxStatus,
     pub param_get_value: VarParamFn,
-    pub param_get_value_at_time: VarParamFn,
-    pub param_get_derivative: VarParamFn,
-    pub param_get_integral: VarParamFn,
+    pub param_get_value_at_time: VarParamTimeFn,
+    pub param_get_derivative: VarParamTimeFn,
+    pub param_get_integral: VarParamTimeFn,
     pub param_set_value: VarParamFn,
-    pub param_set_value_at_time: VarParamFn,
+    pub param_set_value_at_time: VarParamTimeFn,
     pub param_get_num_keys: extern "C" fn(Handle, *mut u32) -> OfxStatus,
     pub param_get_key_time: extern "C" fn(Handle, u32, *mut f64) -> OfxStatus,
     pub param_get_key_index: extern "C" fn(Handle, f64, c_int, *mut c_int) -> OfxStatus,
