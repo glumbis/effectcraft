@@ -21,6 +21,8 @@ effectcraft-plugin = { workspace = true }
 # WebAssembly effect plug-ins run in wasmi on native builds.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 effectcraft-plugin = { workspace = true, features = ["wasm"] }
+# OpenFX plug-ins are native code: not on the web build (fork only, see docs/ofx.md).
+effectcraft-ofx = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

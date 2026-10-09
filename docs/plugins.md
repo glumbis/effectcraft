@@ -1,6 +1,6 @@
 # Effect plug-ins
 
-EffectCraft loads third-party effects through a small, versioned plug-in API (**API version 1**).
+EffectCraft loads third-party effects through a small, versioned plug-in API (**API version 2**; WebAssembly ABI 1).
 A plug-in effect behaves exactly like a built-in one: it is listed in Effects & Presets (and the
 Effect menu) under its category, applied by id (`effect.apply {"effect": "org.example.posterize"}`)
 or display name, its parameters are ordinary properties (keyframes, expressions, Effect Controls,
@@ -118,8 +118,37 @@ impl EffectPlugin for Swap {
 register_plugin(Arc::new(Swap(manifest)))?; // before the UI builds its menus
 ```
 
-`PluginParams` reads values by parameter id (`f`, `b`, `point`, `color`). At most 64 plug-in
-effects can be registered per process.
+`PluginParams` reads values by parameter id (`f`, `b`, `point`, `color`, and in API 2 `point3`,
+`layer`, `text`). At most 1024 plug-in effects can be registered per process.
+
+## Plug-in API 2 (native plug-ins)
+
+API 2 is for Rust plug-ins and hosts like the OpenFX bridge (`effectcraft-ofx`, see
+[`ofx.md`](ofx.md)); the WebAssembly ABI stays at 1. Manifests with `"api": 1` or `2` are accepted,
+`effect.plugins.list` reports `api: 2`, and up to 1024 plug-in effects can be registered.
+
+* **New parameter types**: `point3` (`default` `[x, y, z]`; x, y arrive in buffer pixels, z as is),
+  `layer` (another layer of the composition; flattens to its id, -1 for none, read with
+  `PluginParams::layer`), `text` (a string field) and `hidden` (a string that is not shown, for
+  opaque plug-in data). `text` / `hidden` take no slot in `flat`; their strings are in
+  `PluginParams::texts`, one per such parameter in declaration order, read with
+  `PluginParams::text(id)`. `slider` gains `"integer": true` (shown with 0 decimals) and every
+  parameter an optional `"group"` path (`"Advanced/Edges"`; informational). WebAssembly modules
+  can't use `point3`, `layer`, `text` or `hidden`.
+* **`PluginFrame`** also carries `origin` (buffer pixels of layer pixel (0, 0); padding shifts it)
+  and `layer_size` (layer pixels).
+* **`EffectPlugin::padding(params, time, scale) -> u32`** asks for that many transparent buffer
+  pixels on every side before rendering (glows, regions of definition larger than the input);
+  at most 4096.
+* **`EffectPlugin::render_v2(frame, params, time, host)`** (default: calls `render`) gets a
+  `PluginHost` with `input_at(layer_time)` (the effect's input at another time, in its own extent;
+  the effects above this one are applied), `layer_input(param_id, layer_time)` (a layer parameter's
+  layer, effects and masks applied, resampled into the frame's grid), `params_at(layer_time)`,
+  `frame_rate()` and `time()`. Images are `PluginImage { width, height, pixels, origin, scale }`.
+  It may run on several threads at once.
+* **Loading OpenFX plug-ins**: Effect ▸ Load OpenFX Plug-in…, `effect.plugins.loadOfx {path}`
+  (an `.ofx` binary, an `.ofx.bundle` or a folder), or `effect.plugins.scanOfx` (the standard
+  OpenFX folders plus `OFX_PLUGIN_PATH`; run at start-up unless `EFFECTCRAFT_NO_OFX=1`).
 
 ## Compatibility
 
