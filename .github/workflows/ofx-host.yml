@@ -1,0 +1,99 @@
+# CI for the OpenFX fork (branch `openfx`, see FORK.md): builds the test OFX
+# plug-in, runs the OFX integration tests against it, and publishes Windows binaries as an artifact
+# so the fork can be tried (e.g. with RSMB or Sapphire) on another PC without building locally.
+name: OFX host
+
+on:
+  push:
+    branches: [openfx]
+  workflow_dispatch:
+
+concurrency:
+  group: ofx-host-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows:
+    name: Windows (test, build, artifact)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ofx-host-windows
+          workspaces: |
+            .
+            examples/ofx/ec-test-ofx
+      - name: Build the test OFX plug-in and lay out its bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --manifest-path examples/ofx/ec-test-ofx/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          $dir = 'target/ofx-test/ec-test-ofx.ofx.bundle/Contents/Win64'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item examples/ofx/ec-test-ofx/target/release/ec_test_ofx.dll "$dir/ec-test-ofx.ofx"
+      - name: Test
+        shell: pwsh
+        env:
+          EC_TEST_OFX_BUNDLE: ${{ github.workspace }}\target\ofx-test\ec-test-ofx.ofx.bundle
+        run: |
+          cargo test -p effectcraft-ofx -p effectcraft-effects -p effectcraft-plugin -p effectcraft-host --features effectcraft-host/openfx
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+      - name: Build the release binaries
+        shell: pwsh
+        run: |
+          cargo build --release -p effectcraft -p effectcraft-cli --features openfx
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+      - name: Collect the artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          New-Item -ItemType Directory -Force dist/EffectCraft-OFX | Out-Null
+          Copy-Item target/release/effectcraft.exe, target/release/effectcraft-cli.exe, FORK.md dist/EffectCraft-OFX/
+          Copy-Item target/ofx-test/ec-test-ofx.ofx.bundle dist/EffectCraft-OFX/ -Recurse
+          Compress-Archive -Path dist/EffectCraft-OFX -DestinationPath dist/EffectCraft-OFX-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: effectcraft-ofx-windows
+          path: dist/EffectCraft-OFX-windows.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  linux:
+    name: Linux (test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ofx-host-linux
+          workspaces: |
+            .
+            examples/ofx/ec-test-ofx
+      - name: Build the test OFX plug-in and lay out its bundle
+        run: |
+          cargo build --release --manifest-path examples/ofx/ec-test-ofx/Cargo.toml
+          dir=target/ofx-test/ec-test-ofx.ofx.bundle/Contents/Linux-x86-64
+          mkdir -p "$dir"
+          cp examples/ofx/ec-test-ofx/target/release/libec_test_ofx.so "$dir/ec-test-ofx.ofx"
+      - name: Test
+        env:
+          EC_TEST_OFX_BUNDLE: ${{ github.workspace }}/target/ofx-test/ec-test-ofx.ofx.bundle
+        run: cargo test -p effectcraft-ofx -p effectcraft-effects -p effectcraft-plugin -p effectcraft-host --features effectcraft-host/openfx
