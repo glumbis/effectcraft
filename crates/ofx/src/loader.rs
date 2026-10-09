@@ -163,11 +163,23 @@ fn open_library(path: &Path) -> Result<libloading::Library, String> {
     #[cfg(windows)]
     {
         use libloading::os::windows::{LOAD_WITH_ALTERED_SEARCH_PATH, Library};
-        unsafe { Library::load_with_flags(path, LOAD_WITH_ALTERED_SEARCH_PATH) }.map(libloading::Library::from).map_err(|e| e.to_string())
+        // LOAD_WITH_ALTERED_SEARCH_PATH needs an absolute path with backslashes (forward slashes
+        // make the loader fail).
+        let native = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let native = PathBuf::from(native.to_string_lossy().replace('/', "\\"));
+        unsafe { Library::load_with_flags(&native, LOAD_WITH_ALTERED_SEARCH_PATH) }.map(libloading::Library::from).map_err(|e| lib_error(&e))
     }
     #[cfg(not(windows))]
     {
-        unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())
+        unsafe { libloading::Library::new(path) }.map_err(|e| lib_error(&e))
+    }
+}
+
+/// A loader error with the OS reason it wraps (libloading's own message omits it on Windows).
+fn lib_error(e: &libloading::Error) -> String {
+    match std::error::Error::source(e) {
+        Some(src) => format!("{e}: {src}"),
+        None => e.to_string(),
     }
 }
 

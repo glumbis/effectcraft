@@ -185,7 +185,8 @@ impl PluginManifest {
     pub fn validate(&self) -> Result<(), String> {
         // API 2 (OpenFX) effects such as Sapphire's can declare far more parameters.
         let max_params: usize = if self.api >= 2 { 1024 } else { 256 };
-        const MAX_TEXT: usize = 1 << 20;
+        // Opaque plug-in data can be large (Sapphire's S_ColorFuse ships a LUT of a few MB).
+        const MAX_TEXT: usize = 64 << 20;
         if !(1..=PLUGIN_API_VERSION).contains(&self.api) {
             return Err(format!("plug-in `{}` targets plug-in API {} but this build implements API 1 to {PLUGIN_API_VERSION}", self.id, self.api));
         }
