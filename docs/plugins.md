@@ -137,14 +137,18 @@ API 2 is for Rust plug-ins and hosts like the OpenFX bridge (`effectcraft-ofx`, 
   can't use `point3`, `layer`, `text` or `hidden`.
 * **`PluginFrame`** also carries `origin` (buffer pixels of layer pixel (0, 0); padding shifts it)
   and `layer_size` (layer pixels).
-* **`EffectPlugin::padding(params, time, scale) -> u32`** asks for that many transparent buffer
-  pixels on every side before rendering (glows, regions of definition larger than the input);
-  at most 4096.
+* **`EffectPlugin::padding(params, time, scale, layer_size, instance_key) -> u32`** asks for that
+  many transparent buffer pixels on every side before rendering (glows, regions of definition
+  larger than the input); at most 4096. `layer_size` is the layer's size in layer pixels (so
+  sizes relative to the frame can be measured) and `instance_key` identifies the applied effect
+  instance (see `PluginHost::instance_key`).
 * **`EffectPlugin::render_v2(frame, params, time, host)`** (default: calls `render`) gets a
   `PluginHost` with `input_at(layer_time)` (the effect's input at another time, in its own extent;
   the effects above this one are applied), `layer_input(param_id, layer_time)` (a layer parameter's
   layer, effects and masks applied, resampled into the frame's grid), `params_at(layer_time)`,
-  `frame_rate()` and `time()`. Images are `PluginImage { width, height, pixels, origin, scale }`.
+  `frame_rate()`, `time()` and `instance_key()` (a stable id of the applied effect instance: the
+  same on every frame, different per layer and per application; plug-ins that keep state between
+  frames pool their native instances by it). Images are `PluginImage { width, height, pixels, origin, scale }`.
   It may run on several threads at once.
 * **Loading OpenFX plug-ins**: Effect ▸ Load OpenFX Plug-in…, `effect.plugins.loadOfx {path}`
   (an `.ofx` binary, an `.ofx.bundle` or a folder), or `effect.plugins.scanOfx` (the standard

@@ -67,6 +67,10 @@ pub trait PluginHost {
     fn frame_rate(&self) -> f64;
     /// Layer time of the current render, seconds.
     fn time(&self) -> f64;
+    /// Stable id of the applied effect instance (same on every frame, different per layer /
+    /// effect; RenderHost derives it from `EffectCtx::seed`). 0 = unknown. The OFX host pools
+    /// its plug-in instances by it so temporal plug-ins never mix layers up.
+    fn instance_key(&self) -> u64 { 0 }
 }
 
 pub trait EffectPlugin: Send + Sync {
@@ -74,8 +78,9 @@ pub trait EffectPlugin: Send + Sync {
     fn render(&self, frame: &mut PluginFrame, params: &PluginParams, time: f64) -> Result<(), String>;
     fn source(&self) -> String { "built-in".into() }
     /// v2: transparent pixels to add on EVERY side of the buffer before rendering (glows,
-    /// blurs, OFX regions of definition larger than the input). In buffer pixels.
-    fn padding(&self, _params: &PluginParams, _time: f64, _scale: f64) -> u32 { 0 }
+    /// blurs, OFX regions of definition larger than the input). In buffer pixels. `layer_size`
+    /// is the layer's size in layer pixels (0 = unknown), `instance_key` the PluginHost key.
+    fn padding(&self, _params: &PluginParams, _time: f64, _scale: f64, _layer_size: [f64; 2], _instance_key: u64) -> u32 { 0 }
     /// v2: render with host services. Default calls `render`.
     fn render_v2(&self, frame: &mut PluginFrame, params: &PluginParams, time: f64, _host: &dyn PluginHost) -> Result<(), String> { self.render(frame, params, time) }
 }

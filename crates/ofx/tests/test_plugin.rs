@@ -100,7 +100,7 @@ fn run(p: &dyn EffectPlugin, w: u32, h: u32, layer: &[Px], set: &[(&str, &[f64])
     let (flat, texts) = defaults(p, set);
     let params = PluginParams { manifest: p.manifest(), flat: &flat, texts: &texts };
     let time = 1.0;
-    let pad = p.padding(&params, time, 1.0);
+    let pad = p.padding(&params, time, 1.0, [w as f64, h as f64], 0);
     let (fw, fh) = (w + 2 * pad, h + 2 * pad);
     let mut pixels = vec![[0.0; 4]; (fw * fh) as usize];
     for y in 0..h {
