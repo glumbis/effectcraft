@@ -10,6 +10,8 @@
 
 <h1 align="center">EffectCraft</h1>
 
+<p align="center"><i>This is an unofficial fork with an OpenFX plug-in host; see <a href="FORK.md">FORK.md</a>.</i></p>
+
 <p align="center">
   <b>Motion graphics and visual effects; an open-source, clean-room reimplementation of Adobe After Effects, rebuilt in pure Rust.</b>
 </p>
