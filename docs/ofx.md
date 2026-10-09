@@ -102,6 +102,10 @@ EffectCraft does not include, license or activate any third-party plug-in.
   whose own plug-ins are sandboxed WebAssembly.)
 * Desktop only: there is no OFX on the web build. The binaries in this fork's CI artifacts are
   Windows x64 only for now.
+* Plug-in messages (errors, licence notices) are formatted with the common printf conversions (`%s`,
+  `%d`, `%u`, `%x`, `%c`, `%p`, `%f`, `%e`, `%g`, with width and precision) and at most 8 arguments;
+  anything else is shown as written. On Apple Silicon the arguments cannot be read and the raw
+  format string is shown.
 * Some plug-ins rely on host features that are not implemented (analysis passes, multi-threaded
   frame rendering, custom interpolation, host-side clip caching). Those plug-ins may load with
   reduced functionality or report errors in the loader's `errors` list.
