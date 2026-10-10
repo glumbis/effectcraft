@@ -11,14 +11,15 @@
 <h1 align="center">EffectCraft</h1>
 
 > [!IMPORTANT]
-> ### 🔌 This fork adds OpenFX plug-in support
+> ### 🔌 This fork adds OpenFX plug-ins and After Effects project import
 > Run **OpenFX (OFX) plug-ins** inside EffectCraft as ordinary effects: tested with
 > **RE:Vision ReelSmart Motion Blur**, **RE:Vision Twixtor** and **Boris FX Sapphire** (all 298 of
-> their effects load and render). Unofficial; proposed upstream in
+> their effects load and render). This `openfx-aep` version also **opens After Effects projects
+> (`.aep` / `.aepx`)** through File ▸ Import. Unofficial; OpenFX support is proposed upstream in
 > [storytold/effectcraft#508](https://github.com/storytold/effectcraft/pull/508).
 >
-> **[⬇ Download for Windows](https://github.com/glumbis/effectcraft/releases/latest)** ·
-> **[Getting started](FORK.md)** · **[How it works](docs/ofx.md)**
+> **[⬇ Download for Windows](https://github.com/glumbis/effectcraft/releases/tag/v0.7.0-ofx-aep.1)** ·
+> **[Getting started](FORK.md)** · **[OpenFX](docs/ofx.md)** · **[Opening .aep files](tools/aep-import/README.md)**
 
 <p align="center">
   <b>Motion graphics and visual effects; an open-source, clean-room reimplementation of Adobe After Effects, rebuilt in pure Rust.</b>

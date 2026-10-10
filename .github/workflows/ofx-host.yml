@@ -5,7 +5,7 @@ name: OFX host
 
 on:
   push:
-    branches: [openfx]
+    branches: [openfx, openfx-aep]
   workflow_dispatch:
 
 concurrency:
@@ -52,7 +52,7 @@ jobs:
       - name: Build the release binaries
         shell: pwsh
         run: |
-          cargo build --release -p effectcraft -p effectcraft-cli --features openfx
+          cargo build --release -p effectcraft -p effectcraft-cli --features "openfx aep"
           if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
       - name: Collect the artifact
         shell: pwsh
@@ -61,6 +61,8 @@ jobs:
           New-Item -ItemType Directory -Force dist/EffectCraft-OFX | Out-Null
           Copy-Item target/release/effectcraft.exe, target/release/effectcraft-cli.exe, FORK.md dist/EffectCraft-OFX/
           Copy-Item target/ofx-test/ec-test-ofx.ofx.bundle dist/EffectCraft-OFX/ -Recurse
+          New-Item -ItemType Directory -Force dist/EffectCraft-OFX/aep-import | Out-Null
+          Copy-Item tools/aep-import/*.py, tools/aep-import/README.md, tools/aep-import/requirements.txt dist/EffectCraft-OFX/aep-import/
           Compress-Archive -Path dist/EffectCraft-OFX -DestinationPath dist/EffectCraft-OFX-windows.zip
       - uses: actions/upload-artifact@v4
         with:

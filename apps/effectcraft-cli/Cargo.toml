@@ -27,3 +27,5 @@ cpu-time = "1"
 [features]
 # OpenFX image-effect plug-ins (docs/ofx.md): native code run without a sandbox. Off by default.
 openfx = ["effectcraft-host/openfx"]
+# Import After Effects projects (.aep / .aepx) through tools/aep-import (Python 3 + py-aep). Off by default.
+aep = ["effectcraft-host/aep"]

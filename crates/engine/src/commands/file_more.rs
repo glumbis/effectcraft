@@ -515,6 +515,29 @@ pub(crate) fn run_js_named(s: &mut Session, code: &str, name: &str) -> Result<Va
     report_js(s, name, out)
 }
 
+/// The After Effects project import needs a host built with the `aep` feature.
+fn has_aep(s: &Session) -> std::result::Result<(), String> {
+    if s.aep_converter.is_some() { Ok(()) } else { Err("After Effects project import is not available in this build".into()) }
+}
+
+/// File ▸ Import ▸ After Effects Project…: the host's converter ([`Session::aep_converter`]) turns
+/// the `.aep` / `.aepx` into an After Effects-style script, which runs like any script and rebuilds
+/// the folders, footage, comps, layers, keyframes, masks and effects. The reply is the script's
+/// report: `output` starts with a summary and lists what could not be imported exactly.
+fn import_aep(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "file.importAep";
+    let convert = s.aep_converter.ok_or_else(|| EngineError::Other("After Effects project import is not available in this build".into()))?;
+    let path = str_p(p, "path").ok_or_else(|| bad(c, "missing `path` (an .aep or .aepx file)"))?.to_string();
+    let code = convert(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
+    let out = run_js(s, &code, &name, false)?;
+    let out = report_js(s, &name, out)?;
+    if let Some(summary) = out.get("output").and_then(Value::as_str).and_then(|o| o.lines().next()) {
+        s.toast(summary.to_string());
+    }
+    Ok(out)
+}
+
 /// Run JavaScript through the session's scripting engine.
 fn run_js(s: &mut Session, code: &str, name: &str, console: bool) -> Result<Value> {
     let runner = s.script.ok_or_else(|| EngineError::Other("JavaScript scripting is not available in this build".into()))?;
@@ -1017,6 +1040,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{path (.jsx/.js JavaScript, or a .jsonl/.json command script) | name (an installed or sample script, see file.scripts.list) | steps: [{command, params}]}",
             always,
             run_script
+        ),
+        cmd!(
+            "file.importAep",
+            "After Effects Project...",
+            [],
+            None,
+            "{path (.aep or .aepx)} → {ok, output (summary, then what could not be imported exactly), error}: rebuilds an After Effects project (needs the `aep` build feature, Python 3 and py-aep)",
+            has_aep,
+            import_aep
         ),
         cmd!(
             "script.run",

@@ -433,6 +433,9 @@ pub struct Session {
     /// Forgets the OpenFX crash blocklist (plug-ins skipped because they crashed the app while
     /// loading): `effect.plugins.scanOfx {"retry": true}`.
     pub ofx_clear_blocklist: Option<fn()>,
+    /// Converts an After Effects project (`.aep` / `.aepx`) into an After Effects-style script that
+    /// rebuilds it (hosts built with the `aep` feature): `file.importAep`.
+    pub aep_converter: Option<AepConverter>,
     /// ScriptUI windows and panels opened by scripts (see [`scriptui`]).
     pub script_ui: scriptui::ScriptUi,
     /// The last physical-memory reading (Settings ▸ Memory & CPU budgets); `None` = unknown
@@ -495,6 +498,10 @@ pub type PluginLoader = fn(&[u8], &str) -> std::result::Result<Value, String>;
 /// (`{loaded: [{id, name, category, ofxId, context, bundle}], errors: [..]}`).
 pub type OfxLoader = fn(&str) -> std::result::Result<Value, String>;
 
+/// Converts an After Effects project file (`.aep` or `.aepx`) into the JavaScript (After Effects
+/// scripting object model) that rebuilds it.
+pub type AepConverter = fn(&str) -> std::result::Result<String, String>;
+
 impl Default for Session {
     fn default() -> Self {
         let project = Arc::new(Project::default());
@@ -545,6 +552,7 @@ impl Default for Session {
             ofx_loader: None,
             ofx_search_paths: vec![],
             ofx_clear_blocklist: None,
+            aep_converter: None,
             script_ui: scriptui::ScriptUi::default(),
             sys_memory: None,
             key_move: None,

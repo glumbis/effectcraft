@@ -27,6 +27,8 @@ effectcraft-ofx = { workspace = true, optional = true }
 [features]
 # Load OpenFX image-effect plug-ins (docs/ofx.md). Off by default.
 openfx = ["dep:effectcraft-ofx"]
+# Import After Effects projects (.aep / .aepx) through tools/aep-import (needs Python 3 + py-aep). Off by default.
+aep = []
 
 [dev-dependencies]
 serde_json = { workspace = true }

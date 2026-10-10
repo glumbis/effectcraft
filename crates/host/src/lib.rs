@@ -12,6 +12,9 @@ use effectcraft_engine::{ExportJob, ExportResult, Exporter, Importer, Session};
 use effectcraft_project::Footage;
 pub use effectcraft_script as script;
 
+#[cfg(all(feature = "aep", not(target_arch = "wasm32")))]
+mod aep;
+
 struct MediaImporter;
 
 impl Importer for MediaImporter {
@@ -105,6 +108,12 @@ pub fn session() -> Session {
         if let Some(dir) = config_dir() {
             effectcraft_ofx::blocklist::set_state_dir(dir);
         }
+    }
+    // After Effects projects are converted by an external Python program: only with the `aep`
+    // feature, never on the web build.
+    #[cfg(all(feature = "aep", not(target_arch = "wasm32")))]
+    {
+        s.aep_converter = Some(aep::convert);
     }
     s
 }

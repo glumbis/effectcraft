@@ -37,6 +37,19 @@ Hub).
 **Effect ▸ Load OpenFX Plug-in…** and pick the `.ofx` file inside its `Contents\Win64` folder) and
 apply one of the **EC Test** effects.
 
+## Opening After Effects projects (.aep / .aepx)
+
+This version can also open After Effects projects: **File ▸ Import ▸ After Effects Project…**. It
+rebuilds the comps, layers, keyframes, expressions, masks and effects, and lists anything it couldn't
+bring over (third-party effects, layer styles and the like). It needs **Python 3** and the free
+**py-aep** library, installed once with:
+
+```sh
+py -m pip install py-aep
+```
+
+Details and limits: [tools/aep-import/README.md](tools/aep-import/README.md).
+
 ## Tips
 
 - **Twixtor starts at Speed 100 %**, which changes nothing: set Speed to e.g. 50 for half-speed
