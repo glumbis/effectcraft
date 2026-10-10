@@ -1,9 +1,12 @@
-# EffectCraft with OpenFX plug-ins
+# EffectCraft with OpenFX plug-ins and After Effects project import
 
-This fork of [EffectCraft](https://github.com/storytold/effectcraft) can run **OpenFX (OFX)
-plug-ins**, the plug-in standard used by DaVinci Resolve, Nuke, Vegas and Natron, as ordinary
-effects: they show up in Effects & Presets, their settings appear in Effect Controls, and they take
-keyframes and expressions.
+This fork of [EffectCraft](https://github.com/storytold/effectcraft) adds two things:
+
+- **OpenFX (OFX) plug-ins**, the plug-in standard of DaVinci Resolve, Nuke, Vegas and Natron, run as
+  ordinary effects: they show up in Effects & Presets, their settings appear in Effect Controls, and
+  they take keyframes and expressions.
+- **Opening After Effects projects** (`.aep` and `.aepx`): File ▸ Import ▸ After Effects Project…
+  rebuilds the comps, layers, keyframes, expressions, masks and effects.
 
 | Plug-in | Status |
 |---|---|
@@ -12,43 +15,43 @@ keyframes and expressions.
 | Boris FX **Sapphire** (290 effects) | ✅ loads and renders |
 | Other OFX plug-ins | Should work if they have a CPU render path; [report how it goes](https://github.com/glumbis/effectcraft/issues) |
 
-The OFX support is proposed for the official EffectCraft in
-[storytold/effectcraft#508](https://github.com/storytold/effectcraft/pull/508). Until then
-it lives here. This fork is **unofficial**: please don't report problems with it to the EffectCraft
-maintainers or to the plug-in vendors.
+The OpenFX support is proposed for the official EffectCraft in
+[storytold/effectcraft#508](https://github.com/storytold/effectcraft/pull/508). This fork is
+**unofficial**: please don't report problems with it to the EffectCraft maintainers or to the
+plug-in vendors.
 
-## Getting started (Windows)
+## Install (Windows)
 
 1. **Download** `EffectCraft-OFX-windows.zip` from the
-   [latest release](https://github.com/glumbis/effectcraft/releases/latest) and unzip it anywhere.
-2. **Install your plug-ins** with their own installers, choosing the **OFX** version (not the After
-   Effects one). They install into `C:\Program Files\Common Files\OFX\Plugins`, where EffectCraft
-   finds them automatically.
-3. **Run `effectcraft.exe`.** It isn't code-signed, so Windows SmartScreen may warn the first time:
-   click *More info* ▸ *Run anyway*. Your plug-ins appear in **Effects & Presets** under their own
-   categories (for example *REVision Effects*, *Sapphire Stylize*).
+   [latest release](https://github.com/glumbis/effectcraft/releases/latest) and unzip it.
+2. **Double-click `Install EffectCraft.bat`.** It installs the app for your user (no administrator
+   rights), adds **"EffectCraft (OFX)"** to the Start menu and desktop, and sets up After Effects
+   project import: it finds Python 3 and installs the free py-aep library, or offers to install
+   Python for you if it's missing.
+3. **Install your plug-ins** with their own installers, choosing the **OFX** version (not the After
+   Effects one). They go into `C:\Program Files\Common Files\OFX\Plugins`, where EffectCraft finds
+   them automatically.
+4. **Start "EffectCraft (OFX)".** It isn't code-signed, so Windows may warn the first time: *More
+   info* ▸ *Run anyway*. Plug-ins appear in **Effects & Presets** under their own categories (for
+   example *REVision Effects*, *Sapphire Stylize*), plus **EC Test**, a tiny test plug-in that comes
+   with the download.
+
+To remove it: *Uninstall EffectCraft.bat* in the install folder
+(`%LOCALAPPDATA%\Programs\EffectCraft-OFX`). Your projects, settings and plug-ins stay.
 
 **Licences:** EffectCraft doesn't include or unlock any plug-in. Without a licence they run as
 trials with a watermark; activate them with the vendor's own tools (RE:Vision Activate, the Boris FX
 Hub).
 
-**Want to check it works without a commercial plug-in?** The zip also contains
-`ec-test-ofx.ofx.bundle`, a tiny test plug-in. Put it in the OFX folder above (or choose
-**Effect ▸ Load OpenFX Plug-in…** and pick the `.ofx` file inside its `Contents\Win64` folder) and
-apply one of the **EC Test** effects.
+## Opening After Effects projects
 
-## Opening After Effects projects (.aep / .aepx)
+**File ▸ Import ▸ After Effects Project…**, then pick an `.aep` or `.aepx`. The main comp opens when
+it's done, and a report lists anything that couldn't come over (third-party effects, layer styles,
+Curves and the like). Footage is looked for at its saved path and next to the project; missing files
+become placeholders you can relink.
 
-This version can also open After Effects projects: **File ▸ Import ▸ After Effects Project…**. It
-rebuilds the comps, layers, keyframes, expressions, masks and effects, and lists anything it couldn't
-bring over (third-party effects, layer styles and the like). It needs **Python 3** and the free
-**py-aep** library, installed once with:
-
-```sh
-py -m pip install py-aep
-```
-
-Details and limits: [tools/aep-import/README.md](tools/aep-import/README.md).
+It needs Python 3 and py-aep, which the installer sets up. Without the installer:
+`py -m pip install py-aep`. Details and limits: [tools/aep-import/README.md](tools/aep-import/README.md).
 
 ## Tips
 
@@ -62,19 +65,21 @@ Details and limits: [tools/aep-import/README.md](tools/aep-import/README.md).
 - If a plug-in crashes EffectCraft while loading, it's skipped automatically next launch. To start
   without any OFX plug-ins, set the environment variable `EFFECTCRAFT_NO_OFX=1`.
 
-More detail (supported features, limits, how it works): [docs/ofx.md](docs/ofx.md).
+More detail: [docs/ofx.md](docs/ofx.md) (OpenFX) and [tools/aep-import/README.md](tools/aep-import/README.md)
+(After Effects projects).
 
 ## Building it yourself
 
 You need [Rust](https://rustup.rs/) 1.95 or newer (and on Windows the Visual Studio C++ build tools).
-OFX support is an opt-in feature:
+Both additions are opt-in features:
 
 ```sh
-cargo run --release -p effectcraft --features openfx
+cargo run --release -p effectcraft --features "openfx aep"
 ```
 
 ## Credits
 
 Built by [@glumbis](https://github.com/glumbis), mostly written with Claude Code. EffectCraft
 itself is by the [EffectCraft contributors](https://github.com/storytold/effectcraft). The OpenFX API
-headers are © the OpenFX contributors (BSD-3-Clause).
+headers are © the OpenFX contributors (BSD-3-Clause). After Effects projects are read with
+[py-aep](https://github.com/forticheprod/py-aep) © Fortiche Production (MIT), installed separately.

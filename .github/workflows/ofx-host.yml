@@ -59,7 +59,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           New-Item -ItemType Directory -Force dist/EffectCraft-OFX | Out-Null
-          Copy-Item target/release/effectcraft.exe, target/release/effectcraft-cli.exe, FORK.md dist/EffectCraft-OFX/
+          Copy-Item target/release/effectcraft.exe, target/release/effectcraft-cli.exe dist/EffectCraft-OFX/
+          Copy-Item FORK.md dist/EffectCraft-OFX/README.md
+          Copy-Item tools/fork-installer/* dist/EffectCraft-OFX/
           Copy-Item target/ofx-test/ec-test-ofx.ofx.bundle dist/EffectCraft-OFX/ -Recurse
           New-Item -ItemType Directory -Force dist/EffectCraft-OFX/aep-import | Out-Null
           Copy-Item tools/aep-import/*.py, tools/aep-import/README.md, tools/aep-import/requirements.txt dist/EffectCraft-OFX/aep-import/
