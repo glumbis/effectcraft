@@ -7,6 +7,18 @@
   </a>
 </p>
 
+> [!WARNING]
+> ### ⚠️ This is an unofficial fork of EffectCraft
+> The official project is [storytold/effectcraft](https://github.com/storytold/effectcraft). This
+> fork adds **OpenFX plug-ins** and **After Effects project (`.aep`) import**; its work lives on the
+> [`openfx`](https://github.com/glumbis/effectcraft/tree/openfx) branch, and this `main` branch is
+> only an older copy of upstream.
+>
+> **[⬇ Download the fork for Windows](https://github.com/glumbis/effectcraft/releases/latest)** ·
+> **[Getting started](https://github.com/glumbis/effectcraft/blob/openfx/FORK.md)** ·
+> **[How the fork is organised](https://github.com/glumbis/effectcraft/blob/openfx/FORK.md#how-this-fork-is-organised)** ·
+> **[OpenFX helper (ec-extension-ofx)](https://github.com/glumbis/ec-extension-ofx)**
+
 
 <h1 align="center">EffectCraft</h1>
 
