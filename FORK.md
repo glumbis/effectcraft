@@ -1,4 +1,4 @@
-# EffectCraft with OpenFX plug-ins and After Effects project import
+# EffectCraft with OpenFX plug-ins and After Effects project import (unofficial)
 
 This fork of [EffectCraft](https://github.com/storytold/effectcraft) adds two things:
 
@@ -15,10 +15,8 @@ This fork of [EffectCraft](https://github.com/storytold/effectcraft) adds two th
 | Boris FX **Sapphire** (290 effects) | ✅ loads and renders |
 | Other OFX plug-ins | Should work if they have a CPU render path; [report how it goes](https://github.com/glumbis/effectcraft/issues) |
 
-The OpenFX support is proposed for the official EffectCraft in
-[storytold/effectcraft#508](https://github.com/storytold/effectcraft/pull/508). This fork is
-**unofficial**: please don't report problems with it to the EffectCraft maintainers or to the
-plug-in vendors.
+This fork is **unofficial**: please don't report problems with it to the EffectCraft maintainers or
+to the plug-in vendors. Use [this fork's Issues](https://github.com/glumbis/effectcraft/issues).
 
 ## Install (Windows)
 
@@ -76,6 +74,27 @@ Both additions are opt-in features:
 ```sh
 cargo run --release -p effectcraft --features "openfx aep"
 ```
+
+## How this fork is organised
+
+| What | Where |
+|---|---|
+| **Download** (Windows, OpenFX + `.aep` import) | [Latest release](https://github.com/glumbis/effectcraft/releases/latest), built from the `openfx` branch |
+| `openfx` | The fork you download: EffectCraft 0.7 with the in-process OpenFX host and `.aep` import. Default for the releases |
+| `openfx-aep` | Same commit as `openfx` (kept so older links keep working) |
+| `feat/openfx-host` | The branch of the first upstream proposal, [storytold/effectcraft#508](https://github.com/storytold/effectcraft/pull/508) |
+| `claude/openfx-external-helper-*` | The new upstream proposal: a safe **external effect helper** interface (no OpenFX code inside EffectCraft) |
+| `ofx-host` | Development history of the OpenFX host before it was squashed into `feat/openfx-host` |
+| `main` | An older copy of upstream EffectCraft; not used for builds |
+| [ec-extension-ofx](https://github.com/glumbis/ec-extension-ofx) | The OpenFX host as a separate helper program, for EffectCraft builds with external helper support |
+
+**Where it's going.** The EffectCraft maintainers asked for OpenFX not to run inside EffectCraft
+itself (a crashing plug-in would take the app and your work down with it). So upstream gets a
+small, safe interface for *external effect helpers*, separate programs that EffectCraft talks to,
+and the OpenFX host moves into one of them,
+[ec-extension-ofx](https://github.com/glumbis/ec-extension-ofx). If a plug-in crashes there,
+EffectCraft shows an error on the effect and keeps running. Until that lands upstream, the release
+above stays the way to use OpenFX plug-ins.
 
 ## Credits
 
