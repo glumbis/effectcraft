@@ -89,13 +89,11 @@ impl DirectorySource {
             if let Some(l) = std::env::var_os("LOCALAPPDATA") {
                 dirs.push(PathBuf::from(l).join("Microsoft\\Windows\\Fonts"));
             }
-        } else if cfg!(unix) && !cfg!(target_arch = "wasm32") {
-            dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(PathBuf::from));
-            if let Some(h) = &home {
-                dirs.push(h.join(".local/share/fonts"));
-                dirs.push(h.join(".fonts"));
-            }
         }
+        // Linux/BSD: the usual folders, the XDG data folders, a Flatpak sandbox's host font
+        // folders (/run/host/…) and the folders the fontconfig configuration names.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+        dirs.extend(crate::font_dirs::unix_font_dirs(&crate::font_dirs::FontEnv::from_process()));
         dirs.extend(extra_dirs(std::env::var_os("EFFECTCRAFT_FONT_DIRS").as_deref()));
         Self { dirs }
     }
@@ -112,7 +110,8 @@ fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            if depth < 4 {
+            // Bounded, so a symlink loop ends.
+            if depth < 8 {
                 walk(&p, depth + 1, out);
             }
         } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc")) {

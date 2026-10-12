@@ -223,8 +223,16 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 if let Some(z) = v.get("zoom") {
                     app.ui.viewer.zoom = z.as_f64().map(|z| z as f32);
                 }
+                // The active comp's Resolution (`view.res.*`), saved with the project.
                 if let Some(r) = v.get("res").and_then(Value::as_str) {
-                    app.ui.viewer.res = Resolution::ALL.into_iter().find(|x| x.label().eq_ignore_ascii_case(r)).unwrap_or(app.ui.viewer.res);
+                    let Some(res) = Resolution::ALL.into_iter().find(|x| x.label().eq_ignore_ascii_case(r)) else {
+                        return err(format!("unknown resolution `{r}` (auto, full, half, third, quarter)"));
+                    };
+                    if let Some(cid) = app.session.active_comp_id()
+                        && let Err(e) = app.session.set_resolution(cid, res)
+                    {
+                        return err(e);
+                    }
                 }
                 if let Some(Value::Array(a)) = v.get("pan") {
                     app.ui.viewer.pan = [a.first().and_then(Value::as_f64).unwrap_or(0.0) as f32, a.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32];
@@ -308,6 +316,9 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 Err(e) => return err(e),
             };
             let m = modifiers(p);
+            // egui keeps the modifiers from `ModifiersChanged` (not the ones on a pointer event)
+            // and the synthetic events arrive one per frame: hold them for the whole gesture.
+            app.synthetic.push(egui::Event::ModifiersChanged(m));
             app.synthetic.push(egui::Event::PointerMoved(pos));
             if req.method == "ui.click" {
                 let button = match s("button") {
@@ -321,6 +332,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                     app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: m });
                 }
             }
+            app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
             Outcome::AfterInput
         }
         "ui.drag" => {
@@ -332,6 +344,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             };
             let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(12).max(2);
             let m = modifiers(p);
+            app.synthetic.push(egui::Event::ModifiersChanged(m));
             app.synthetic.push(egui::Event::PointerMoved(a));
             app.synthetic.push(egui::Event::PointerButton { pos: a, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
             for i in 1..=steps {
@@ -339,6 +352,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 app.synthetic.push(egui::Event::PointerMoved(a + (b - a) * f));
             }
             app.synthetic.push(egui::Event::PointerButton { pos: b, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+            app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
             Outcome::AfterInput
         }
         "ui.scroll" => {
@@ -522,11 +536,16 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
         let automation_id = app.auto.elements.iter().chain(app.auto.previous.iter()).find(|e| e.response_id == Some(id)).map(|e| e.id.as_str());
         json!({"id": format!("{:016x}", id.value()), "rect": rect, "automationId": automation_id, "registryCandidates": candidates})
     });
+    let mut ui = json!(app.ui);
+    // The viewer's Resolution is the active comp's (kept in the project).
+    if let Some(v) = ui.get_mut("viewer").and_then(Value::as_object_mut) {
+        v.insert("res".into(), json!(app.viewer_res()));
+    }
     json!({
         "window": [size.x, size.y],
         "pixelsPerPoint": ctx.pixels_per_point(),
         "fps": app.fps,
-        "ui": app.ui,
+        "ui": ui,
         "playing": app.playback.playing,
         "time": app.session.time().seconds(),
         "activeComp": app.session.state.active_comp.map(|i| i.0),

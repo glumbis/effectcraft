@@ -145,7 +145,7 @@ carries outside-range warnings; the existing objects from `keys.set` and `prop.g
 also report both bases and warnings. `prop.get.time` is comp seconds. Separated Position
 `prop.set` retains per-axis replies; for these commands, `path` or `prop` identifies a property, not a group.
 
-Set offsets with `layer.timing {layer, start: 10.5}`; `in`, `out` and `delta` also use comp seconds.
+Set offsets with `layer.timing {layer, start: 10.5}`; `in`, `out` and `delta` also use comp seconds; `inDelta` / `outDelta` trim each layer from its own in/out point.
 For an unstretched layer starting at 10.5 s in a 30 fps comp,
 `prop.addKey {layer: "A", path: "transform/opacity", time: 15.3,
 timeBase: "comp", value: 0}` writes a key at comp 15.3 s (layer 4.8 s), matching
@@ -220,6 +220,10 @@ build real projects through these interfaces; they are worked examples of everyt
 * **Nested comps**: `comp.settings {preserveFrameRate, preserveResolution}` (Composition Settings ▸
   Advanced); `comp.info` / `get_comp` report both. A precomp layer shows nothing outside its
   nested comp's span.
+* **Viewer Resolution** belongs to each comp and is saved with the project, as in After Effects:
+  `view.res.full|half|third|quarter|auto {comp?}` or `view.res.custom {factor: 1..40, comp?}`
+  (headless too; no undo step, the project becomes modified). `comp.info` reports `resolution`
+  and `resolutionFactor` (`null` for Auto).
 * **Several footage items at once**: `file.newCompFromSelection {single, dimensionsFrom, duration,
   sequence, overlap, overlapDuration, transition, addToRenderQueue}` is one undo step (select the
   items first: `project.select`).
@@ -499,6 +503,12 @@ one of its `styles` to `layer.setText {"font", "style"}`; `text.fontFeatures` sa
 options a font draws with its own glyphs.
 A tool with its own font library can hand it over without installing it: folders listed in
 `EFFECTCRAFT_FONT_DIRS` (a path list, `:`-separated, `;` on Windows) are scanned like the system font folders.
+On Linux and the BSDs the system font folders are `/usr/share/fonts`, `/usr/local/share/fonts`,
+`~/.local/share/fonts`, `~/.fonts`, `$XDG_DATA_HOME/fonts`, `fonts` in each `$XDG_DATA_DIRS` folder,
+every `<dir>` the fontconfig configuration names (`/etc/fonts/fonts.conf` with its includes,
+`~/.config/fontconfig/fonts.conf`) and, in the Flatpak, the host's fonts under `/run/host`. The
+Flatpak can't see other folders; grant one with
+`flatpak override --user --filesystem=<dir>:ro --env=EFFECTCRAFT_FONT_DIRS=<dir> ai.storyteller.effectcraft`.
 
 In expressions, `text.sourceText.style` / `getStyleAt(i, t)` read styles and the setters
 (`setFontSize(v, start?, count?)`, `setFillColor`, `setText`, `setJustification`…) return a

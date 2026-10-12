@@ -525,18 +525,22 @@ fn aux_views(
         return full;
     }
     let gap = 2.0;
+    let views = app.session.state.views3d.get(&cid).cloned().unwrap_or_default();
     let (main, aux): (Rect, Vec<(Rect, View3D)>) = if n == 2 {
         let mid = full.center().x;
-        (Rect::from_min_max(pos2(mid + gap / 2.0, full.min.y), full.max), vec![(Rect::from_min_max(full.min, pos2(mid - gap / 2.0, full.max.y)), View3D::Top)])
+        (
+            Rect::from_min_max(pos2(mid + gap / 2.0, full.min.y), full.max),
+            vec![(Rect::from_min_max(full.min, pos2(mid - gap / 2.0, full.max.y)), views.pane(0))],
+        )
     } else {
         let c = full.center();
         let q = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_min_max(pos2(x0, y0), pos2(x1, y1));
         (
             q(c.x + gap / 2.0, c.y + gap / 2.0, full.max.x, full.max.y),
             vec![
-                (q(full.min.x, full.min.y, c.x - gap / 2.0, c.y - gap / 2.0), View3D::Top),
-                (q(c.x + gap / 2.0, full.min.y, full.max.x, c.y - gap / 2.0), View3D::Front),
-                (q(full.min.x, c.y + gap / 2.0, c.x - gap / 2.0, full.max.y), View3D::Right),
+                (q(full.min.x, full.min.y, c.x - gap / 2.0, c.y - gap / 2.0), views.pane(0)),
+                (q(c.x + gap / 2.0, full.min.y, full.max.x, c.y - gap / 2.0), views.pane(1)),
+                (q(full.min.x, c.y + gap / 2.0, c.x - gap / 2.0, full.max.y), views.pane(2)),
             ],
         )
     };
@@ -545,14 +549,23 @@ fn aux_views(
     p.rect_filled(full, 0.0, Color32::from_black_alpha(200));
     let t = app.session.time();
     let (cw, ch) = (comp.width as f32, comp.height as f32);
-    let views = app.session.state.views3d.get(&cid).cloned().unwrap_or_default();
     let share = app.session.state.share_view_options;
+    // The camera and light wireframes of each view (as in After Effects, where every view of the
+    // layout shows them), evaluated on a snapshot of the project.
+    let snap_project = app.session.project.clone();
+    let snap_expr = app.session.expr.clone();
+    let ectx = EvalCtx { project: &snap_project, comp_id: cid, comp, time: t, expr: snap_expr.as_deref(), footage: None };
+    let selected = app.session.state.selected_layers.clone();
+    let mut picked: Option<(usize, View3D)> = None;
     for (i, (r, v)) in aux.into_iter().enumerate() {
         p.rect_filled(r, 0.0, bg);
         let fit = ((r.width() - 20.0) / cw).min((r.height() - 20.0) / ch).max(0.01);
         let cr = Rect::from_center_size(r.center(), vec2(cw * fit, ch * fit));
         let scale = (fit * ctx.pixels_per_point()).min(1.0) as f64;
-        let cam = views.cam(v, comp.width as f64, comp.height as f64).state();
+        // The Active Camera pane renders through the comp's own camera; the others through their
+        // view camera.
+        let through_active = v == View3D::ActiveCamera;
+        let cam = if through_active { three_d::active_camera(&ectx) } else { views.cam(v, comp.width as f64, comp.height as f64).state() };
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -564,7 +577,12 @@ fn aux_views(
         let tex = match cached {
             Some((k, tex)) if k == key => tex,
             _ => {
-                let opts = effectcraft_engine::render::RenderOpts { scale, view: comp.has_3d().then_some(cam), draft: true, ..Default::default() };
+                let opts = effectcraft_engine::render::RenderOpts {
+                    scale,
+                    view: (comp.has_3d() && !through_active).then_some(cam),
+                    draft: true,
+                    ..Default::default()
+                };
                 let img = app.session.render(cid, t, opts);
                 let tex = crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
                 ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
@@ -580,11 +598,55 @@ fn aux_views(
                 p.rect_stroke(Rect::from_center_size(cr.center(), cr.size() * k), 0.0, Stroke::new(1.0, Color32::from_white_alpha(120)), StrokeKind::Middle);
             }
         }
+        if comp.has_3d() {
+            let map = ViewerMap { origin: cr.min, zoom: fit, comp: [cw, ch], area: r };
+            draw_rigs(app, &p.with_clip_rect(r), &map, &ectx, &selected, cam, through_active, Some(v.id()));
+        }
         let label = if comp.has_3d() { v.label() } else { crate::i18n::tr("Active Camera") };
         p.text(r.left_bottom() + vec2(8.0, -8.0), Align2::LEFT_BOTTOM, label, Tokens::ui(11.0), Color32::from_white_alpha(200));
         app.auto.add(&format!("viewer.view.{}", v.id()), r, label);
+        if comp.has_3d()
+            && let Some(chosen) = pane_selector(app, ui, i + 1, r, v)
+        {
+            picked = Some((i + 1, chosen));
+        }
+    }
+    if let Some((pane, v)) = picked
+        && let Err(e) = app.session.execute("view.setPaneView", json!({"pane": pane, "view": v.id(), "comp": cid.0}))
+    {
+        app.ui.status = e.to_string();
     }
     main
+}
+
+/// The view selector in the top-left corner of pane `pane` (1 to 3) of a multi-view layout, a
+/// popup of every 3D view like the toolbar's 3D View menu. Returns the view chosen this frame.
+fn pane_selector(app: &mut EffectcraftApp, ui: &mut egui::Ui, pane: usize, area: Rect, current: View3D) -> Option<View3D> {
+    let t = app.tokens;
+    let r = Rect::from_min_size(area.min + vec2(6.0, 6.0), vec2(124.0, 20.0));
+    let pid = egui::Id::new(("viewer-pane-view", pane));
+    let response = widgets::dropdown(ui, r, crate::i18n::tr(current.label()), &t, pid);
+    if response.clicked() {
+        let open = widgets::popup_is_open(ui, pid);
+        ui.data_mut(|d| d.insert_temp(pid.with("open"), !open));
+    }
+    app.auto.add_response(&format!("viewer.view.{pane}.type"), &response, "View of pane");
+    if !widgets::popup_is_open(ui, pid) {
+        return None;
+    }
+    let chosen = widgets::popup_list(ui, pid, r.left_bottom() + vec2(0.0, 2.0), r, View3D::ALL.len(), 0, |ui| {
+        ui.set_min_width(124.0);
+        let mut chosen = None;
+        for (k, v) in View3D::ALL.iter().enumerate() {
+            let item = ui.selectable_label(*v == current, crate::i18n::tr(v.label()));
+            app.auto.add(&format!("viewer.view.{pane}.typeItem.{k}"), item.rect, v.label());
+            if item.clicked() {
+                chosen = Some(*v);
+            }
+        }
+        chosen
+    });
+    chosen.filter(|v| *v != current)
 }
 
 /// View ▸ Split with New Locked Viewer: the locked viewer on the left of the Composition panel
@@ -733,10 +795,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     let (cw, ch) = (comp.width as f32, comp.height as f32);
     let fit = ((area.width() - 40.0) / cw).min((area.height() - 40.0) / ch).max(0.01);
+    // Fit up to 100% follows the panel's size like Fit does, and stops at 100%.
+    let fit = if app.ui.viewer.fit_up_to_100 { fit.min(1.0 / ctx.pixels_per_point()) } else { fit };
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("viewer-fit"), fit));
     let zoom = app.ui.viewer.zoom.unwrap_or(fit);
     let center = area.center() + vec2(app.ui.viewer.pan[0], app.ui.viewer.pan[1]);
-    let origin = center - vec2(cw * zoom / 2.0, ch * zoom / 2.0);
+    // On the physical pixel grid, so at 100 % every comp pixel covers exactly one screen pixel
+    // instead of being blended with its neighbour (#882).
+    let ppp = ctx.pixels_per_point();
+    let origin = snap_to_pixels(center - vec2(cw * zoom / 2.0, ch * zoom / 2.0), ppp);
     let map = ViewerMap { origin, zoom, comp: [cw, ch], area };
     ctx.data_mut(|d| d.insert_temp(map_id(), map));
     let comp_rect = Rect::from_min_size(origin, vec2(cw * zoom, ch * zoom));
@@ -746,7 +813,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     app.ui.viewer.extended = extended_region(app, &comp, cid, map);
 
     // Frame.
-    let ppp = ctx.pixels_per_point();
     let scale = app.viewer_scale(zoom, ppp);
     if !app.playback.playing {
         // Queue the frame on screen before any prefetch.
@@ -1045,12 +1111,37 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add("viewer.warpBanner", r, &text);
     }
 
+    // Footage that can't be decoded (no decoder for its codec / profile): say why on the layer
+    // instead of leaving a black picture.
+    let mut notices = 0;
+    for layer in comp.layers.iter().filter(|l| l.is_active_at(time) && l.switches.video) {
+        let effectcraft_engine::project::LayerSource::Footage { item } = &layer.source else { continue };
+        let Some(effectcraft_engine::project::ItemKind::Footage(f)) = app.session.project.item(*item).map(|i| &i.kind) else { continue };
+        let Some(why) = app.session.footage.problem(f) else { continue };
+        if notices >= 3 {
+            break;
+        }
+        let (m, _) = l2c(&ectx, layer);
+        let (w, h) = effectcraft_engine::render::source_size(&app.session.project, layer);
+        let c = m.apply(effectcraft_engine::geom::vec2(w as f64 / 2.0, h as f64 / 2.0));
+        let at = map.to_screen([c.x, c.y]);
+        let text = format!("{}: {}", layer.name, why);
+        let galley = painter.layout(text.clone(), Tokens::medium(12.0), Color32::WHITE, (map.area.width() - 40.0).clamp(80.0, 420.0));
+        let r = Rect::from_center_size(at + vec2(0.0, notices as f32 * 4.0), galley.size() + vec2(24.0, 16.0)).intersect(map.area);
+        painter.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0x4a, 0x1a, 0x14, 0xe6));
+        painter.rect_stroke(r, 3.0, Stroke::new(1.0, t.warning), StrokeKind::Inside);
+        painter.galley(pos2(r.min.x + 12.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+        app.auto.add(&format!("viewer.footageProblem.{}", layer.id.0), r, &text);
+        notices += 1;
+    }
+
     // Free transform box of a path (double-click a path with the Selection tool).
     let ft = ov::draw_free_transform(app, &ctx, &painter, &map, &paths);
 
     // Cameras and lights (wireframes) and the 3D view name.
     if comp.has_3d() {
-        draw_rigs(app, &painter, &map, &ectx, &selected);
+        let through_active = VIEW_CAM.with(|c| c.get()).is_none();
+        draw_rigs(app, &painter, &map, &ectx, &selected, cam_state(&ectx), through_active, None);
         let view = app.session.state.views3d.get(&cid).map(|v| v.current).unwrap_or_default();
         let label = match (view, comp.active_camera(time)) {
             (View3D::ActiveCamera, Some(c)) => format!("Active Camera ({})", c.name),
@@ -1132,7 +1223,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if context_layers.is_empty() {
             ui.label(crate::i18n::tr("No unlocked layer selected"));
         } else {
-            super::timeline::layer_menu(ui, &context_layers, &mut context_actions);
+            let vector = context_layers
+                .iter()
+                .filter_map(|id| comp.layer(effectcraft_engine::project::LayerId(*id)))
+                .any(|layer| super::timeline::vector_footage_layer(&app.session.project, layer));
+            super::timeline::layer_menu(ui, &context_layers, vector, &mut context_actions);
         }
         ui.separator();
         if ui.button(copy_frame).clicked() {
@@ -1209,7 +1304,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mods = ui.input(|i| i.modifiers);
     let space_pan = super::space_hand(&ctx);
     // Pen tool: each press places a vertex (dragging pulls Bezier tangents); pressing on the
-    // first vertex closes the path.
+    // first vertex closes the path, pressing an open path's last vertex resumes it.
     if app.ui.tool == Tool::Pen
         && !space_pan
         && resp.hovered()
@@ -1847,6 +1942,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     super::camera_tracker_ui::viewer_hook(app, ui, &painter, &map, &ectx, &|c, l| l2c(c, l).0);
     // Effect point controls and crosshair/eyedropper picks (on top of the viewer's gestures).
     crate::panels::effect_controls::viewer_hook(app, ui, &painter, &map, &ectx, &|c, l| l2c(c, l).0);
+    // Selected shape gradients' start and end points (#612).
+    crate::panels::gradient_handles::viewer_hook(app, ui, &painter, &map, &ectx, &|c, l| l2c(c, l).0);
 
     // Status chips (render time / caching).
     if app.playback.playing && app.playback.waiting {
@@ -1857,7 +1954,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     vt::draw_snap(&ctx, &painter, &map, &ectx);
     vt::rulers(app, ui, &map, outer, area);
-    vt::bottom_bar(app, ui, bar, zoom, fit, time, &comp);
+    vt::bottom_bar(app, ui, bar, zoom, time, &comp);
     if err_h > 0.0 {
         super::expr_bar::draw(app, ui, err_bar, cid);
     }
@@ -1887,13 +1984,26 @@ fn drag_axes(ctx: &EvalCtx, l: &Layer) -> ([f64; 3], [f64; 3]) {
 
 /// Wireframes of cameras (frustum, point of interest) and lights (position, direction) as seen
 /// through the current 3D view.
-fn draw_rigs(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap, ectx: &EvalCtx, selected: &[LayerId]) {
+/// Camera and light wireframes seen through `cam` (`through_active`: `cam` is the active camera,
+/// which is then not drawn). `pane` names the automation ids: `None` for the main view
+/// (`viewer.camera.<id>`), `Some(view)` for a view of a 2- or 4-view layout
+/// (`viewer.view.<view>.camera.<id>`).
+#[allow(clippy::too_many_arguments)]
+fn draw_rigs(
+    app: &mut EffectcraftApp,
+    painter: &egui::Painter,
+    map: &ViewerMap,
+    ectx: &EvalCtx,
+    selected: &[LayerId],
+    cam: CameraState,
+    through_active: bool,
+    pane: Option<&str>,
+) {
     use effectcraft_engine::geom::Vec3;
     use effectcraft_engine::project::{LayerSource, LightKind};
-    let cam = cam_state(ectx);
     let (w, h) = (ectx.comp.width as f64, ectx.comp.height as f64);
     let active = ectx.comp.active_camera(ectx.time).map(|c| c.id);
-    let through_active = VIEW_CAM.with(|c| c.get()).is_none();
+    let prefix = pane.map(|v| format!("viewer.view.{v}.")).unwrap_or_else(|| "viewer.".to_string());
     let proj = |p: Vec3| cam.project(w, h, p).map(|v| map.to_screen([v.x, v.y]));
     let seg = |a: Vec3, b: Vec3, stroke: Stroke| {
         if let (Some(x), Some(y)) = (proj(a), proj(b)) {
@@ -1930,7 +2040,7 @@ fn draw_rigs(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap,
                 }
             }
             if let Some(s) = proj(eye) {
-                app.auto.add(&format!("viewer.camera.{}", l.id.0), Rect::from_center_size(s, vec2(14.0, 14.0)), &l.name);
+                app.auto.add(&format!("{prefix}camera.{}", l.id.0), Rect::from_center_size(s, vec2(14.0, 14.0)), &l.name);
             }
         } else {
             let LayerSource::Light { kind } = l.source else { continue };
@@ -1951,16 +2061,16 @@ fn draw_rigs(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap,
                     painter.circle_stroke(q, 3.0, stroke);
                 }
             }
-            app.auto.add(&format!("viewer.light.{}", l.id.0), Rect::from_center_size(s, vec2(16.0, 16.0)), &l.name);
+            app.auto.add(&format!("{prefix}light.{}", l.id.0), Rect::from_center_size(s, vec2(16.0, 16.0)), &l.name);
         }
     }
 }
 
 /// Pen tool press at `pos`: continue the path in progress (pressing its first vertex closes it),
-/// add a vertex on a visible path's segment, or start a new path: a mask on the selected
-/// footage/solid layer (or shape layer, with Tool Creates Mask), a shape path (Shape n group with
-/// the Tools bar's Fill and Stroke) on the selected shape layer, or a new shape layer when
-/// nothing is selected. The placed point snaps.
+/// resume an open path whose last vertex is pressed, add a vertex on a visible path's segment, or
+/// start a new path: a mask on the selected footage/solid layer (or shape layer, with Tool Creates
+/// Mask), a shape path (Shape n group with the Tools bar's Fill and Stroke) on the selected shape
+/// layer, or a new shape layer when nothing is selected. The placed point snaps.
 /// Add a Position keyframe at a motion path's frame, keeping the path where it is.
 fn add_motion_key(app: &mut EffectcraftApp, f: ov::PathFrame) {
     if let Err(e) = app.session.execute("prop.addKey", json!({"layer": f.layer.0, "prop": f.prop, "time": f.time.seconds()})) {
@@ -2044,6 +2154,11 @@ fn pen_press(
             let index = v.as_u64().unwrap_or(0) as usize;
             ui.data_mut(|d| d.insert_temp(gid, Gesture::Pen { layer: lid, mask: uid, index, vertex: lp, inv, press: pos }));
         }
+        return;
+    }
+    // Clicking the last vertex of an open path (e.g. after Esc ended it) resumes drawing it.
+    if let Some(cur) = ov::open_end_at(paths, map, pos, 8.0) {
+        ui.data_mut(|d| d.insert_temp(pen_id(), cur));
         return;
     }
     // On a visible path's segment the Pen adds a vertex there; on a motion path, a keyframe.
@@ -2373,21 +2488,32 @@ pub(crate) fn styled_line(painter: &egui::Painter, pts: [Pos2; 2], stroke: Strok
     }
 }
 
-/// Texture filtering for Viewer Zoom Quality: More Accurate = bilinear, Faster = nearest.
+/// `p` (points) moved to the nearest physical pixel corner at `ppp` pixels per point.
+pub(crate) fn snap_to_pixels(p: Pos2, ppp: f32) -> Pos2 {
+    if !(ppp.is_finite() && ppp > 0.0 && p.x.is_finite() && p.y.is_finite()) {
+        return p;
+    }
+    pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp)
+}
+
+/// Texture filtering for Viewer Zoom Quality: More Accurate = bilinear, Faster = nearest. As in
+/// After Effects, a magnified frame (above 100 %, or a lower Resolution) always shows its pixels
+/// as blocks, never smoothed, in either mode (#882).
 pub(crate) fn zoom_texture_options(smooth: bool) -> egui::TextureOptions {
-    if smooth { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST }
+    if smooth { egui::TextureOptions { magnification: egui::TextureFilter::Nearest, ..egui::TextureOptions::LINEAR } } else { egui::TextureOptions::NEAREST }
 }
 
 /// The sampler GPU frames (mipmapped display textures) are drawn with: More Accurate filters
 /// bilinearly within and between mip levels, so a frame shown below 100 % is averaged instead of
-/// skipping pixels (#417); Faster takes the nearest pixel of the full-size frame.
+/// skipping pixels (#417); Faster takes the nearest pixel of the full-size frame. Magnified, both
+/// show the nearest pixel (#882).
 pub(crate) fn zoom_sampler(smooth: bool) -> eframe::wgpu::SamplerDescriptor<'static> {
     use eframe::wgpu::{FilterMode, MipmapFilterMode, SamplerDescriptor};
     let label = Some("viewer frame");
     if smooth {
         SamplerDescriptor {
             label,
-            mag_filter: FilterMode::Linear,
+            mag_filter: FilterMode::Nearest,
             min_filter: FilterMode::Linear,
             mipmap_filter: MipmapFilterMode::Linear,
             ..Default::default()
@@ -2484,6 +2610,35 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
 mod tests {
     use super::*;
     use effectcraft_engine::geom::{Mat4, vec3};
+
+    /// #882: the frame's corner sits on a physical pixel at any display scaling, so 100 % maps
+    /// comp pixels 1:1 onto screen pixels.
+    #[test]
+    fn frame_origin_snaps_to_physical_pixels() {
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for p in [pos2(-201.12, 72.4), pos2(689.8, 239.75), pos2(0.3, -0.37)] {
+                let s = snap_to_pixels(p, ppp);
+                for v in [s.x * ppp, s.y * ppp] {
+                    assert!((v - v.round()).abs() < 1e-3, "ppp {ppp}: {p:?} → {s:?}");
+                }
+                assert!((s - p).length() <= 0.71 / ppp, "moved by at most half a pixel: {p:?} → {s:?}");
+            }
+        }
+        assert_eq!(snap_to_pixels(pos2(1.3, 2.0), 0.0), pos2(1.3, 2.0));
+    }
+
+    /// #882: a magnified frame shows its pixels as blocks in both Zoom Quality modes; More
+    /// Accurate only smooths when the frame is shown smaller.
+    #[test]
+    fn magnified_frames_are_never_smoothed() {
+        use eframe::wgpu::FilterMode;
+        for smooth in [true, false] {
+            assert_eq!(zoom_texture_options(smooth).magnification, egui::TextureFilter::Nearest);
+            assert_eq!(zoom_sampler(smooth).mag_filter, FilterMode::Nearest);
+        }
+        assert_eq!(zoom_texture_options(true).minification, egui::TextureFilter::Linear);
+        assert_eq!(zoom_sampler(true).min_filter, FilterMode::Linear);
+    }
 
     /// A perspective-like homography: w = 100 + y (the plane crosses the camera at y = −100).
     fn tilted() -> Mat3 {

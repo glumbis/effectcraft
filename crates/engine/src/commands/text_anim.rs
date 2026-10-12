@@ -115,6 +115,13 @@ fn add_animator(s: &mut Session, p: &Value) -> Result<Value> {
         if added == 0 && !kinds.is_empty() {
             return Err(bad(C, "unknown animator property"));
         }
+        // Like After Effects, a scripted animator has no selectors until the script adds one
+        // (addProperty("ADBE Text Selector")); a default 0-100% one would select every character.
+        if kinds.is_empty()
+            && let Some(sels) = g.sub_mut("selectors")
+        {
+            sels.children.clear();
+        }
         let uid = g.uid;
         anims.children.push(g.into());
         proj.next_id = next;

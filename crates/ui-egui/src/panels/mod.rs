@@ -18,6 +18,7 @@ pub mod forms;
 pub mod fx_editors;
 pub mod fx_widgets;
 pub mod gradient_editor;
+pub mod gradient_handles;
 pub mod graph;
 pub mod graph_tools;
 pub mod home;

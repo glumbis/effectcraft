@@ -72,6 +72,30 @@ fn project_rename_replaces_the_name() {
     assert!(!h.ctx.egui_wants_keyboard_input(), "Enter releases the keyboard");
 }
 
+/// #881: Tab in the Project panel's rename field commits the name like Enter and gives the keyboard
+/// back to the panel; it doesn't leave keyboard focus on another widget (the row's label swatch),
+/// where Enter would no longer rename and the arrow keys would move between widgets.
+#[test]
+fn tab_in_the_project_rename_field_commits_and_keeps_enter_renaming() {
+    let (mut h, comp) = harness();
+    let name = |h: &Harness<'_, EffectcraftApp>| h.state().session.project.items.values().find(|i| i.id.0 == comp).unwrap().name.clone();
+    let edit = format!("project.item.{comp}.nameEdit");
+    let editing = |h: &Harness<'_, EffectcraftApp>| h.state().auto.elements.iter().any(|e| e.id == edit);
+    let p = center(&h, &format!("project.item.{comp}.name"));
+    click(&mut h, p, 1);
+    key(&mut h, Key::Enter);
+    type_text(&mut h, "Hero");
+    key(&mut h, Key::Tab);
+    assert_eq!(name(&h), "Hero", "Tab commits the name");
+    assert!(!editing(&h), "Tab closes the rename field");
+    assert_eq!(h.ctx.memory(|m| m.focused()), None, "no other widget takes the keyboard");
+    key(&mut h, Key::Enter);
+    assert!(editing(&h), "Enter renames again");
+    type_text(&mut h, "Main");
+    key(&mut h, Key::Enter);
+    assert_eq!(name(&h), "Main");
+}
+
 #[test]
 fn timecode_field_replaces_commits_and_cancels() {
     let (mut h, _) = harness();

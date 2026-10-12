@@ -988,3 +988,25 @@ fn script_text_path_options_expose_after_effects_match_names() {
         ])
     );
 }
+
+/// A scripted text animator has only the selectors the script adds, and the Range Selector and
+/// its Start/End/Offset resolve by After Effects match name (#837).
+#[test]
+fn scripted_text_range_selector_resolves_and_is_the_only_selector() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("Sel", 960, 300, 1, 3, 30);
+        var t = c.layers.addText("MOVARA");
+        var a = t.property("ADBE Text Properties").property("ADBE Text Animators").addProperty("ADBE Text Animator");
+        a.property("ADBE Text Animator Properties").addProperty("ADBE Text Opacity").setValue(0);
+        var sels = a.property("ADBE Text Selectors");
+        var sel = sels.addProperty("ADBE Text Selector");
+        sel.property("ADBE Text Percent Start").setValue(50);
+        var end = sel.property("ADBE Text Percent End").value;
+        [sels.numProperties, sel.matchName, sel.property("start").value, end, sel.property("ADBE Text Percent Offset").matchName]
+        "#,
+    );
+    assert_eq!(o.result, json!([1, "ADBE Text Selector", 50, 100, "ADBE Text Percent Offset"]));
+}

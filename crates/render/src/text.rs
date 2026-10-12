@@ -167,9 +167,10 @@ fn range_params(ctx: &EvalCtx, layer: &Layer, sel: &PropGroup, n: usize) -> Rang
     let units_index = adv.map(|a| ctx.e(layer, a, "units") == 1).unwrap_or(false);
     let div = if units_index { n.max(1) as f64 } else { 100.0 };
     Range {
-        start: ctx.f(layer, sel, "start", 0.0) / div,
-        end: ctx.f(layer, sel, "end", if units_index { n as f64 } else { 100.0 }) / div,
-        offset: ctx.f(layer, sel, "offset", 0.0) / div,
+        // Start and End stay within 0..100% (0..n in Index units); Offset within -100..100%.
+        start: ctx.f(layer, sel, "start", 0.0).clamp(0.0, div) / div,
+        end: ctx.f(layer, sel, "end", if units_index { n as f64 } else { 100.0 }).clamp(0.0, div) / div,
+        offset: ctx.f(layer, sel, "offset", 0.0).clamp(-div, div) / div,
         amount: af("amount", 100.0) / 100.0,
         shape: Shape::from_index(adv.map(|a| ctx.e(layer, a, "shape")).unwrap_or(0)),
         smoothness: af("smoothness", 100.0) / 100.0,

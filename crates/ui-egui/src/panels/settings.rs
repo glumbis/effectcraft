@@ -816,6 +816,9 @@ pub fn recovery(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             }
         });
     });
+    if choice.is_none() && super::dialogs::ui_enter(ctx) {
+        choice = Some("autosave");
+    }
     let Some(c) = choice else { return };
     app.dialog = None;
     app.recovery = None;

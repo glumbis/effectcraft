@@ -865,13 +865,13 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 val = 1.0 - val;
             }
             let op = P.f[2].z;
+            var fx = vec4<f32>(vec3<f32>(val) * op, op);
             if (P.u[1].z == 1u) {
-                // Normal: the noise over the layer at Opacity, then Blend With Original.
-                let over = vec4<f32>(vec3<f32>(val) * op, op) + px * (1.0 - op);
-                px = px * P.f[2].y + over * (1.0 - P.f[2].y);
-            } else {
-                px = put(px, vec3<f32>(val), op, P.f[2].y);
+                // Normal: the noise over the layer at Opacity.
+                fx = fx + px * (1.0 - op);
             }
+            // Inside the layer's alpha (its masks), then Blend With Original.
+            px = px * P.f[2].y + fx * px.w * (1.0 - P.f[2].y);
         }
         default: {}
     }

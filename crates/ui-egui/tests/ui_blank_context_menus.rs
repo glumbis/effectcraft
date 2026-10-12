@@ -1,6 +1,6 @@
 //! Right-click actions in the blank Project and Timeline areas, and on Timeline property names.
 use effectcraft_engine::Session;
-use effectcraft_ui_egui::{Dialog, EffectcraftApp};
+use effectcraft_ui_egui::{Dialog, EffectcraftApp, dock::PanelKind};
 use egui::{Event, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::{Harness, kittest::Queryable as _};
 use serde_json::json;
@@ -130,6 +130,23 @@ fn timeline_blank_menu_opens_composition_settings() {
     h.get_by_label("Composition Settings…").click();
     h.run_steps(3);
     assert_eq!(h.state().dialog, Some(Dialog::CompSettings));
+}
+
+#[test]
+fn timeline_blank_menu_opens_current_comp_in_essential_graphics() {
+    for graph in [false, true] {
+        let mut h = harness();
+        let comp = h.state().session.active_comp_id().unwrap();
+        let area = rect(&h, "timeline.layerMarquee");
+        let p = if graph { pos2(area.max.x + 150.0, area.center().y) } else { area.center() };
+        right_click(&mut h, p);
+        let target = if graph { "timeline.context.graph.essentialGraphics" } else { "timeline.context.outline.essentialGraphics" };
+        assert!(h.state().auto.find(target).is_some());
+        h.get_by_label("Open in Essential Graphics").click();
+        h.run_steps(3);
+        assert_eq!(h.state().session.state.essential_primary, Some(comp));
+        assert!(h.state().ui.dock.contains(PanelKind::EssentialGraphics));
+    }
 }
 
 /// #407: right-clicking a property's name in the Timeline opens After Effects' property menu:

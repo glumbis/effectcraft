@@ -32,6 +32,9 @@ pub const LANGUAGES: &[(&str, &str)] = &[
     ("Українська", "uk"),
     ("Español", "es"),
     ("Português (Brasil)", "pt-br"),
+    ("Русский", "ru"),
+    ("Français", "fr"),
+    ("Deutsch", "de"),
 ];
 
 /// Settings ▸ Startup & Repair ▸ Window Graphics: (label, `startup.windowGraphics` value).
@@ -334,6 +337,42 @@ pub struct LabelPref {
     pub color: String,
 }
 
+/// A Composition Settings preset the user saved (Composition Settings ▸ Preset ▸ Save): the
+/// frame size, pixel aspect and frame rate, as in After Effects' own presets.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompPreset {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_aspect: f64,
+    pub frame_rate: f64,
+}
+
+impl CompPreset {
+    /// Longest preset name kept.
+    pub const MAX_NAME: usize = 128;
+
+    /// Values a composition accepts (a hand-edited settings file can hold anything).
+    pub fn is_valid(&self) -> bool {
+        let size = 4..=30000;
+        !self.name.trim().is_empty()
+            && self.name.chars().count() <= Self::MAX_NAME
+            && size.contains(&self.width)
+            && size.contains(&self.height)
+            && self.pixel_aspect.is_finite()
+            && (0.01..=100.0).contains(&self.pixel_aspect)
+            && self.frame_rate.is_finite()
+            && (1.0..=999.0).contains(&self.frame_rate)
+    }
+}
+
+/// Saved composition presets, skipping entries that don't parse instead of losing the list.
+fn lenient_comp_presets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<CompPreset>, D::Error> {
+    let v = Vec::<Value>::deserialize(d)?;
+    Ok(v.into_iter().filter_map(|x| serde_json::from_value(x).ok()).collect())
+}
+
 fn default_labels() -> Vec<LabelPref> {
     Label::ALL.iter().skip(1).map(|l| LabelPref { name: l.name().to_string(), color: hex(l.rgb()) }).collect()
 }
@@ -392,6 +431,9 @@ pub struct Prefs {
     pub preview: crate::preview::PreviewSettings,
     /// View ▸ Simulate Output ▸ My Custom RGB.
     pub custom_rgb: crate::viewer::CustomRgb,
+    /// Composition Settings presets the user saved, in the order saved.
+    #[serde(deserialize_with = "lenient_comp_presets")]
+    pub comp_presets: Vec<CompPreset>,
     /// Top-level keys this version doesn't know (kept for newer versions).
     #[serde(flatten)]
     pub extra: Extra,
@@ -427,6 +469,7 @@ impl Default for Prefs {
             recent_fonts: vec![],
             preview: crate::preview::PreviewSettings::default(),
             custom_rgb: crate::viewer::CustomRgb::default(),
+            comp_presets: vec![],
             extra: Extra::new(),
         }
     }
@@ -552,6 +595,7 @@ impl Prefs {
     /// Clamp values into their valid ranges and fill missing labels.
     pub fn normalize(&mut self) {
         self.version = PREFS_VERSION;
+        self.comp_presets.retain(CompPreset::is_valid);
         if !is_choice(WINDOW_GRAPHICS, &self.startup.window_graphics) {
             self.startup.window_graphics = Startup::default().window_graphics;
         }
@@ -660,8 +704,8 @@ impl Prefs {
         Ok(())
     }
 
-    /// Reset one page (`general`, `labels`, `autoSave`…) or everything (`None`). Open Recent is
-    /// kept.
+    /// Reset one page (`general`, `labels`, `autoSave`…) or everything (`None`). Open Recent and
+    /// the saved composition presets are kept.
     pub fn reset(&mut self, page: Option<&str>) -> Result<(), String> {
         let d = Prefs::default();
         let Some(page) = page else {
@@ -671,6 +715,7 @@ impl Prefs {
                 recent_presets: std::mem::take(&mut self.recent_presets),
                 recent_fonts: std::mem::take(&mut self.recent_fonts),
                 preview: std::mem::take(&mut self.preview),
+                comp_presets: std::mem::take(&mut self.comp_presets),
                 ..d
             };
             return Ok(());

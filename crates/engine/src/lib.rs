@@ -707,9 +707,38 @@ impl Session {
         self.events.push(Event::ProjectChanged { revision: self.revision });
     }
 
+    /// Set a comp's Resolution. As in After Effects it is saved with the project (which becomes
+    /// modified) but is no undo step, and it changes no pixels: the comp's cached frames stay
+    /// valid ([`effectcraft_project::Comp::same_pixels`]).
+    pub fn set_resolution(&mut self, comp: ItemId, r: effectcraft_project::Resolution) -> Result<()> {
+        if self.project.comp(comp).ok_or(EngineError::NoComp)?.resolution == r {
+            return Ok(());
+        }
+        Arc::make_mut(&mut self.project).comp_mut(comp).ok_or(EngineError::NoComp)?.resolution = r;
+        self.bump();
+        Ok(())
+    }
+
+    /// Keep what lives outside the undo history (each comp's Resolution) as it is in `from`, the
+    /// project before undo, redo or a history jump restored another state.
+    pub(crate) fn keep_view_settings(&mut self, from: &Project) {
+        let keep: Vec<(ItemId, effectcraft_project::Resolution)> =
+            self.project.comps().filter_map(|(id, c)| from.comp(*id).map(|f| (*id, f.resolution)).filter(|(_, r)| *r != c.resolution)).collect();
+        if keep.is_empty() {
+            return;
+        }
+        let p = Arc::make_mut(&mut self.project);
+        for (id, r) in keep {
+            if let Some(c) = p.comp_mut(id) {
+                c.resolution = r;
+            }
+        }
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some((label, p)) = self.history.undo.pop() else { return false };
         let cur = std::mem::replace(&mut self.project, p);
+        self.keep_view_settings(&cur);
         self.history.redo.push((label, cur));
         self.history.merge_key = None;
         self.sanitize_state();
@@ -720,6 +749,7 @@ impl Session {
     pub fn redo(&mut self) -> bool {
         let Some((label, p)) = self.history.redo.pop() else { return false };
         let cur = std::mem::replace(&mut self.project, p);
+        self.keep_view_settings(&cur);
         self.history.undo.push((label, cur));
         self.history.merge_key = None;
         self.sanitize_state();
@@ -857,6 +887,26 @@ impl Session {
             self.state.current_track = None;
         }
         self.events.push(Event::OpenComp(id));
+    }
+
+    /// The open compositions, as a project file records them ([`effectcraft_project::SavedView`]).
+    pub fn saved_view(&self) -> effectcraft_project::SavedView {
+        effectcraft_project::SavedView { active_comp: self.state.active_comp, open_comps: self.state.open_comps.clone() }
+    }
+
+    /// Reopen the compositions a project file was saved with (#748). Ids that no longer name a
+    /// comp are skipped; with none left the project stays on the comp [`Session::replace_project`]
+    /// opened (its first), as files from before the view was saved do.
+    pub fn restore_view(&mut self, view: &effectcraft_project::SavedView) {
+        let mut open: Vec<ItemId> = Vec::new();
+        for id in view.open_comps.iter().copied().filter(|id| self.project.comp(*id).is_some()) {
+            if !open.contains(&id) {
+                open.push(id);
+            }
+        }
+        let Some(active) = view.active_comp.filter(|id| self.project.comp(*id).is_some()).or_else(|| open.first().copied()) else { return };
+        self.state.open_comps = open;
+        self.open_comp(active);
     }
 
     pub fn toast(&mut self, msg: impl Into<String>) {

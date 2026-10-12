@@ -5,8 +5,9 @@ use effectcraft_project::Marker;
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, bad, comp_id, f_p, has_comp, has_layers, layers_p, str_p};
-use crate::{EngineError, Result, Session, cmd};
+use super::{CommandSpec, always, bad, comp_id, f_p, has_comp, has_layers, layers_p, str_p};
+use crate::prefs::CompPreset;
+use crate::{EngineError, Result, Session, cmd, query};
 
 fn has_roi(s: &Session) -> std::result::Result<(), String> {
     has_comp(s)?;
@@ -164,6 +165,65 @@ fn responsive_time(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"start": start.seconds(), "end": end.seconds()}))
 }
 
+// ---------------------------------------------------------------- composition presets
+
+/// `comp.savePreset`: remember a frame size, pixel aspect and frame rate under a name in the
+/// settings (shown in Composition Settings ▸ Preset). A preset with the same name is replaced.
+fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "comp.savePreset";
+    let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(C, "missing `name`"))?;
+    let num = |k: &str| f_p(p, k).ok_or_else(|| bad(C, format!("missing `{k}`")));
+    let dim = |k: &str| {
+        num(k).and_then(|v| {
+            if v.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&v) { Ok(v as u32) } else { Err(bad(C, format!("`{k}` must be a whole number"))) }
+        })
+    };
+    let preset =
+        CompPreset { name: name.to_string(), width: dim("width")?, height: dim("height")?, pixel_aspect: num("pixelAspect")?, frame_rate: num("frameRate")? };
+    if !preset.is_valid() {
+        return Err(bad(
+            C,
+            format!(
+                "not a valid preset: width and height 4–30000 px, pixel aspect 0.01–100, frame rate 1–999, a name of at most {} characters",
+                CompPreset::MAX_NAME
+            ),
+        ));
+    }
+    let presets = &mut s.prefs.comp_presets;
+    let replaced = match presets.iter_mut().find(|q| q.name == preset.name) {
+        Some(q) => {
+            *q = preset;
+            true
+        }
+        None => {
+            presets.push(preset);
+            false
+        }
+    };
+    s.save_prefs();
+    s.prefs_revision += 1;
+    Ok(json!({"name": name, "replaced": replaced}))
+}
+
+/// `comp.deletePreset`: forget a saved composition preset.
+fn delete_preset(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "comp.deletePreset";
+    let name = str_p(p, "name").ok_or_else(|| bad(C, "missing `name`"))?;
+    let before = s.prefs.comp_presets.len();
+    s.prefs.comp_presets.retain(|q| q.name != name);
+    if s.prefs.comp_presets.len() == before {
+        return Err(bad(C, format!("no saved preset named `{name}`")));
+    }
+    s.save_prefs();
+    s.prefs_revision += 1;
+    Ok(Value::Null)
+}
+
+/// `comp.presets`: the saved composition presets.
+fn list_presets(s: &mut Session, _: &Value) -> Result<Value> {
+    serde_json::to_value(&s.prefs.comp_presets).map_err(|e| bad("comp.presets", e.to_string()))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("comp.cropToRegionOfInterest", "Crop Comp to Region of Interest", ["Composition"], None, "{comp?}", has_roi, crop_to_roi),
@@ -178,6 +238,17 @@ pub fn specs() -> Vec<CommandSpec> {
             save_frame
         ),
         cmd!("comp.copyFrame", "Copy Frame to Clipboard", ["Composition"], None, "{comp?, time?, scale?}", has_comp, copy_frame),
+        cmd!(
+            "comp.savePreset",
+            "Save Composition Preset",
+            [],
+            None,
+            "{name, width, height, pixelAspect, frameRate} (replaces a saved preset with the same name)",
+            always,
+            save_preset
+        ),
+        cmd!("comp.deletePreset", "Delete Composition Preset", [], None, "{name}", always, delete_preset),
+        query!("comp.presets", "Composition Presets", "{}", list_presets),
         cmd!("comp.responsiveTime", "Responsive Design — Time", [], None, "{op: intro|outro|workArea}", has_comp, responsive_time),
     ]
 }

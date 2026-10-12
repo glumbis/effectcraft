@@ -8,6 +8,7 @@ use effectcraft_engine::render::EvalCtx;
 use egui::{Align2, Rect, Sense, pos2, vec2};
 use serde_json::json;
 
+use crate::state::TextColorPick;
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
 
@@ -201,7 +202,21 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if crate::widgets::color_popup(ui, pop, fs.left_bottom(), &mut rgb) {
             actions.push(json!({key: [rgb[0], rgb[1], rgb[2]], "merge": format!("char-{key}")}));
         }
-        p.text(pos2(fs.max.x + 6.0, y + 10.0), Align2::LEFT_CENTER, label, Tokens::ui(11.5), t.text_dim);
+        let er = Rect::from_min_size(pos2(fs.max.x + 4.0, y + 1.0), vec2(18.0, 18.0));
+        let active = app.ui.text_color_pick.as_ref().is_some_and(|pick| pick.layer == target.as_ref().map_or(0, |tt| tt.layer) && pick.field == key);
+        let eye = super::fx_widgets::eyedropper_button(ui, er, active, egui::Id::new(("char-eye", key)), &t);
+        app.auto.add(&format!("character.{key}.eyedropper"), er, &format!("{label} eyedropper"));
+        if eye.clicked() {
+            if active {
+                app.ui.text_color_pick = None;
+                app.ui.status.clear();
+            } else if let Some(tt) = &target {
+                app.ui.fx_pick = None;
+                app.ui.text_color_pick = Some(TextColorPick { layer: tt.layer, field: key.into(), range: tt.range });
+                app.ui.status = crate::i18n::tr_args("Click in the Composition panel to sample text {}", &[&label]);
+            }
+        }
+        p.text(pos2(er.max.x + 6.0, y + 10.0), Align2::LEFT_CENTER, label, Tokens::ui(11.5), t.text_dim);
     }
     y += 32.0;
     // Style toggles: Faux Bold, Faux Italic, All Caps, Small Caps, Superscript, Subscript.

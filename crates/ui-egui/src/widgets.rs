@@ -194,6 +194,24 @@ pub fn keep_focus(ctx: &egui::Context, field: &Response, text: &str) {
     }
 }
 
+/// Put the keyboard on a dialog's first text field the frame the dialog opens, with its whole
+/// `text` selected, so typing replaces the value without a click. Unlike [`keep_focus`] the
+/// focus is the user's afterwards.
+pub fn focus_on_open(ctx: &egui::Context, field: &Response, text: &str) {
+    // The dialog is open in consecutive passes; a gap means it was closed and opened again.
+    let shown = field.id.with("focus-on-open-pass");
+    let pass = ctx.cumulative_pass_nr();
+    let previous = ctx.data_mut(|d| {
+        let previous = d.get_temp::<u64>(shown);
+        d.insert_temp(shown, pass);
+        previous
+    });
+    if previous.is_none_or(|p| p.saturating_add(1) < pass) {
+        select_all(ctx, field.id, text);
+        field.request_focus();
+    }
+}
+
 /// Select all of the text field `id`'s `text`, so typing replaces it.
 pub fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
     let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
@@ -314,6 +332,11 @@ fn field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens, sea
 
 /// Dropdown-looking control ("Full ▾").
 pub fn dropdown(ui: &mut Ui, rect: Rect, text: &str, t: &Tokens, id: egui::Id) -> Response {
+    dropdown_tip(ui, rect, text, None, t, id)
+}
+
+/// [`dropdown`] with a tooltip `tip` (shown always; it replaces the elided text's tooltip).
+pub fn dropdown_tip(ui: &mut Ui, rect: Rect, text: &str, tip: Option<&str>, t: &Tokens, id: egui::Id) -> Response {
     let resp = ui.interact(rect, id, Sense::click());
     ui.painter().rect_filled(rect, 3.0, if resp.hovered() { t.hover } else { t.field_bg });
     ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
@@ -335,6 +358,9 @@ pub fn dropdown(ui: &mut Ui, rect: Rect, text: &str, t: &Tokens, id: egui::Id) -
     };
     ui.painter().text(pos2(rect.min.x + 7.0, rect.center().y), Align2::LEFT_CENTER, shown, Tokens::ui(11.5), t.text);
     icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.max.x - 9.0, rect.center().y), vec2(8.0, 8.0)), Icon::ChevronDown, t.text_dim);
+    if let Some(tip) = tip {
+        return resp.on_hover_text(tip.to_string());
+    }
     if text.chars().count() > 0 && !fits(text) {
         return resp.on_hover_text(text.to_string());
     }

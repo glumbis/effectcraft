@@ -831,9 +831,14 @@ fn flac_audio_of_any_shape_reads_in_device_blocks() {
             }
             at += 1024;
         }
-        // ffmpeg's sine source has an amplitude of 1/8, on both channels (mono is duplicated).
+        // ffmpeg's sine source has an amplitude of 1/8 (mono is duplicated). The fixture carries
+        // channels 0 and 1 at full level and the others at half, so a multichannel file sounds as
+        // its stereo downmix (tests/downmix.rs checks that matrix channel by channel).
+        let gains = effectcraft_media::downmix::stereo_gains(channels as usize, false);
+        let side = |s: usize| gains.iter().enumerate().map(|(c, g)| f64::from(g[s]) * if c < 2 { 1.0 } else { 0.5 }).sum::<f64>();
+        let want = 0.125 * ((side(0).powi(2) + side(1).powi(2)) / 2.0).sqrt() / 2f64.sqrt();
         let rms = (sum / n.max(1) as f64).sqrt();
-        assert!((rms - 0.125 / 2f64.sqrt()).abs() < 0.003, "{}: rms {rms}", p.display());
+        assert!((rms - want).abs() < 0.003, "{}: rms {rms}, expected {want}", p.display());
         eprintln!("{}: read {secs} s in {:?}, slowest block after the first {worst:?}", p.display(), t0.elapsed());
         assert_eq!(pool.stats().opened, 1, "opened once, not per block");
     }
@@ -1043,4 +1048,33 @@ fn a_called_off_read_does_not_decode() {
     pool.cancellable(&on, &mut || got = pool.frame(ItemId(1), &f, t));
     let img = got.expect("decoded once wanted again");
     assert_eq!((img.width, img.height), (1920, 1080));
+}
+
+/// H.264 High 4:2:2 10-bit: the software decoder lacks it; the pool says why, once, and the
+/// footage reports it (not a black frame without a word).
+#[test]
+fn an_unsupported_stream_reports_why_it_shows_no_picture() {
+    let Some(p) = ffmpeg_fixture(
+        "h264_high422_10bit.mp4",
+        &["-f", "lavfi", "-i", "testsrc=size=320x180:rate=24:duration=1", "-c:v", "libx264", "-profile:v", "high422", "-pix_fmt", "yuv422p10le"],
+    ) else {
+        return;
+    };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    assert_eq!(pool.problem(&f), None, "nothing is wrong before a frame was asked for");
+    if pool.frame(ItemId(1), &f, Tick::ZERO).is_some() {
+        // a decoder that handles 4:2:2 (FilmCraft's, or a hardware one): no notice
+        assert_eq!(pool.problem(&f), None);
+        return;
+    }
+    let why = pool.problem(&f).expect("a failed frame leaves a reason");
+    assert!(why.contains("4:2:2"), "names the stream: {why}");
+    assert!(why.contains("isn't supported"), "says it is unsupported: {why}");
+    assert!(!why.contains("decode error"), "no error wrappers: {why}");
+    // it stays for the other frames, and is dropped when the file is forgotten
+    assert!(pool.frame(ItemId(1), &f, Tick::from_seconds_f64(0.5)).is_none());
+    assert_eq!(pool.problem(&f).as_deref(), Some(why.as_str()));
+    pool.forget(&f.path);
+    assert_eq!(pool.problem(&f), None);
 }

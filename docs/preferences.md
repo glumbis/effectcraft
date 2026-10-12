@@ -96,7 +96,9 @@ Commands (CLI, MCP, control channel):
   how much of a position motion path the viewer draws (all, none, N seconds or N keyframes
   around the current time)
 - `previews.showInternalWireframes`: outlines of the layers inside a selected collapsed precomp
-- `previews.zoomQuality`: Faster = nearest-neighbour viewer scaling, More Accurate = bilinear
+- `previews.zoomQuality`: Faster = nearest-neighbour viewer scaling, More Accurate = averaged
+  (bilinear, mipmapped) when the frame is shown below 100 %; magnified frames show their pixels as
+  blocks in both modes, and the frame sits on the physical pixel grid, so 100 % is exact
 - `previews.displayProfile`: the monitor's colour space for View ▸ Use Display Color Management
 - `appearance.useLabelColorForTabs`: Composition / Timeline tabs show the comp's label colour,
   Effect Controls / Properties the layer's
@@ -225,3 +227,17 @@ checkpoint after a client restart.
 
 Commands: `file.autoSave` (now), `file.recoveryInfo`, `file.openRecent {index? | path?}`,
 `file.clearRecent`, `file.revert`, `file.incrementAndSave`.
+
+## Logs
+
+The desktop app writes its log records to standard error and to `Logs/effectcraft.log` in the
+config directory. Each launch moves the previous log to `effectcraft.1.log` (and that one to
+`effectcraft.2.log`), so the log of a run that crashed survives the next start; a log stops
+growing at 16 MiB. A launch from the Dock, the Start menu or a launcher has no terminal, so
+attach these files to a bug report. Help ▸ Reveal Logging File shows this run's log (or Help ▸
+Enable Logging's `EffectCraft Log.txt` while that is on, which keeps every EffectCraft record
+across launches).
+
+By default the log has `info` records from EffectCraft and warnings and errors from everything
+else. `RUST_LOG` replaces that with env_logger-style directives: `debug`,
+`warn,effectcraft_render=trace`, `wgpu_core=info`. The control-channel token is never logged.

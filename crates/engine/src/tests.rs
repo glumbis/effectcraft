@@ -628,3 +628,61 @@ fn new_text_rejects_malformed_positions_without_creating_a_layer() {
     s.execute("layer.newText", json!({"text": "No explicit position"})).unwrap();
     assert_eq!(s.active_comp().unwrap().layers.len(), 2);
 }
+
+/// The active comp and the open comp tabs are saved with the project and restored on open (#748).
+#[test]
+fn reopening_a_project_restores_its_active_comp() {
+    use effectcraft_project::ItemId;
+    let dir = std::env::temp_dir().join(format!("ec-test-748-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("view.ecproj").to_string_lossy().to_string();
+    let mut s = Session::default();
+    let a = s.execute("comp.new", json!({"name": "CompA"})).unwrap()["comp"].as_u64().unwrap();
+    let b = s.execute("comp.new", json!({"name": "CompB"})).unwrap()["comp"].as_u64().unwrap();
+    let c = s.execute("comp.new", json!({"name": "CompC"})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("comp.open", json!({"comp": "CompB"})).unwrap();
+    s.state.open_comps.retain(|id| id.0 != c);
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!(s2.state.active_comp, Some(ItemId(b)));
+    assert_eq!(s2.state.open_comps, vec![ItemId(a), ItemId(b)]);
+    assert!(!s2.is_dirty());
+
+    // A file from before the view was saved opens on its first comp, as it always did.
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let obj = old.as_object_mut().unwrap();
+    obj.remove("activeComp");
+    obj.remove("openComps");
+    std::fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+    let mut s3 = Session::default();
+    s3.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!((s3.state.active_comp, s3.state.open_comps.clone()), (Some(ItemId(a)), vec![ItemId(a)]));
+
+    // Ids that no longer name a comp (edited by hand, or written by another tool) fall back.
+    obj_set(&mut old, json!(999), json!([999, b, "x"]));
+    std::fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+    let mut s4 = Session::default();
+    s4.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!((s4.state.active_comp, s4.state.open_comps.clone()), (Some(ItemId(b)), vec![ItemId(b)]));
+    obj_set(&mut old, json!(999), json!([]));
+    std::fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+    let mut s5 = Session::default();
+    s5.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!((s5.state.active_comp, s5.state.open_comps.clone()), (Some(ItemId(a)), vec![ItemId(a)]));
+
+    // XML copies carry it too.
+    let xml = dir.join("view.ecprojx").to_string_lossy().to_string();
+    s.execute("file.saveAs", json!({"path": xml})).unwrap();
+    let mut s6 = Session::default();
+    s6.execute("file.open", json!({"path": xml})).unwrap();
+    assert_eq!(s6.state.active_comp, Some(ItemId(b)));
+    let _ = std::fs::remove_dir_all(dir);
+
+    fn obj_set(v: &mut serde_json::Value, active: serde_json::Value, open: serde_json::Value) {
+        let o = v.as_object_mut().unwrap();
+        o.insert("activeComp".into(), active);
+        o.insert("openComps".into(), open);
+    }
+}

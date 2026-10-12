@@ -122,10 +122,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Bottom bar: magnification and View menus.
     p.rect_filled(bar, 0.0, t.panel_bg);
     let mr = Rect::from_min_size(pos2(bar.min.x + 8.0, bar.center().y - 10.0), vec2(80.0, 20.0));
-    if let Some(z) =
-        super::viewer_tools::magnification_menu(app, ui, mr, "layer-mag", "layerPanel.magnification", "layerMagnification", zoom as f32, app.ui.layer_zoom, fit)
-    {
-        app.ui.layer_zoom = z;
+    if let Some((z, up)) = super::viewer_tools::magnification_menu(
+        app,
+        ui,
+        mr,
+        "layer-mag",
+        "layerPanel.magnification",
+        "layerMagnification",
+        zoom as f32,
+        app.ui.layer_zoom,
+        false,
+    ) {
+        // The Layer panel keeps no fit mode: Fit up to 100% is the fit, at most 100 %.
+        app.ui.layer_zoom = if up { Some(fit.min(1.0 / ui.ctx().pixels_per_point())) } else { z };
         app.ui.layer_pan = [0.0, 0.0];
     }
     let vx = mr.max.x + 10.0;

@@ -560,6 +560,25 @@ impl EffectcraftApp {
         &mut self.dialog_state.gradient
     }
 
+    /// Feed this frame's share of the queued synthetic input (control channel `ui.click`,
+    /// `ui.drag`…) into `raw_input`. Pointer events go one per frame so egui sees press → moves
+    /// → release as a real gesture.
+    pub fn feed_synthetic(&mut self, raw_input: &mut egui::RawInput) {
+        if !self.synthetic.is_empty() {
+            // Pointer events go one per frame so egui sees press → moves → release as a real drag.
+            let pointer = |e: &egui::Event| matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. });
+            let n = if pointer(&self.synthetic[0]) {
+                1
+            } else {
+                self.synthetic
+                    .iter()
+                    .position(|e| pointer(e) || matches!(e, egui::Event::Key { pressed: false, .. }))
+                    .map_or(self.synthetic.len(), |i| if pointer(&self.synthetic[i]) { i.max(1) } else { i + 1 })
+            };
+            raw_input.events.extend(self.synthetic.drain(..n));
+        }
+    }
+
     /// Show panel `p` (opening it in its usual place if it is closed), bring it to the front and
     /// give it the focus: Window ▸ <panel>.
     pub fn show_panel(&mut self, p: PanelKind) {
@@ -826,27 +845,26 @@ impl EffectcraftApp {
         self.viewer_image.clone()
     }
 
+    /// The viewer's Resolution: the active composition's (saved with the project).
+    pub fn viewer_res(&self) -> state::Resolution {
+        self.session.active_comp().map(|c| c.resolution).unwrap_or_default()
+    }
+
     /// The render scale used by the viewer right now.
     pub fn viewer_scale(&self, zoom: f32, ppp: f32) -> f64 {
         // The preview's Resolution (when not Auto) while it plays.
         if self.playback.playing
             && let Some(f) = self.playback.res
         {
-            let r = match f {
-                1 => state::Resolution::Full,
-                2 => state::Resolution::Half,
-                3 => state::Resolution::Third,
-                4 => state::Resolution::Quarter,
-                n => state::Resolution::Custom(n.min(40) as u8),
-            };
-            return r.scale(zoom, ppp);
+            return state::Resolution::from_factor(f.into()).scale(zoom, ppp);
         }
         // Auto follows the zoom alike while playing and paused, so frames cached while scrubbing
         // play back, and frames cached by a preview stay on screen when it stops.
-        let full = self.ui.viewer.res.scale(zoom, ppp);
+        let res = self.viewer_res();
+        let full = res.scale(zoom, ppp);
         // Fast Previews ▸ Adaptive Resolution / Fast Draft: lower resolution while dragging.
         let (_, k) = self.session.state.viewer.fast_previews.render(self.ui.viewer.interacting || self.ui.viewer.property_interacting);
-        if k < 1.0 && self.ui.viewer.res == state::Resolution::Auto {
+        if k < 1.0 && res.is_auto() {
             return full.min((full * 0.5).max(self.session.prefs.adaptive_limit()));
         }
         full
@@ -1817,19 +1835,7 @@ impl eframe::App for EffectcraftApp {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let injected = !self.synthetic.is_empty();
-        if injected {
-            // Pointer events go one per frame so egui sees press → moves → release as a real drag.
-            let pointer = |e: &egui::Event| matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. });
-            let n = if pointer(&self.synthetic[0]) {
-                1
-            } else {
-                self.synthetic
-                    .iter()
-                    .position(|e| pointer(e) || matches!(e, egui::Event::Key { pressed: false, .. }))
-                    .map_or(self.synthetic.len(), |i| if pointer(&self.synthetic[i]) { i.max(1) } else { i + 1 })
-            };
-            raw_input.events.extend(self.synthetic.drain(..n));
-        }
+        self.feed_synthetic(raw_input);
         if pointer_wrap::prepare_input(ctx, raw_input, injected) {
             self.session.history.merge_key = None;
         }
