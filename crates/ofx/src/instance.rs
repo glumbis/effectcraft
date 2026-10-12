@@ -115,9 +115,52 @@ impl PluginEntry {
         let i = in_args.map(PropSet::as_handle).unwrap_or(std::ptr::null_mut());
         let o = out_args.map(PropSet::as_handle).unwrap_or(std::ptr::null_mut());
         let main = self.main;
-        // SAFETY: `main` is the plug-in's entry point, called with the argument shapes the
-        // specification fixes; the handles are alive for the duration of the call.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { main(a.as_ptr(), handle, i, o) })).unwrap_or(K_STAT_ERR_FATAL)
+        // Raw pointers aren't Send; they cross to the render thread as addresses.
+        let (h, i, o) = (handle as usize, i as usize, o as usize);
+        let run = || {
+            // SAFETY: `main` is the plug-in's entry point, called with the argument shapes the
+            // specification fixes; the handles are alive for the duration of the call (the
+            // caller waits for it, also when it runs on another thread).
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                main(a.as_ptr(), h as *const c_void, i as *mut c_void, o as *mut c_void)
+            }))
+            .unwrap_or(K_STAT_ERR_FATAL)
+        };
+        // Linux plug-ins are built for glibc's 8 MiB thread stacks, and renders run on the
+        // renderer's worker threads (2 MiB): a heavy render (Twixtor's optical flow) overflowed
+        // them and crashed. Renders get a thread with a plug-in-sized stack there.
+        if cfg!(target_os = "linux") && action == ACT_RENDER { on_plugin_stack(run).unwrap_or(K_STAT_ERR_FATAL) } else { run() }
+    }
+}
+
+/// Stack size of the threads plug-in code runs on (renders on Linux, `multiThread` workers):
+/// twice glibc's default, which Linux plug-ins are written for.
+pub(crate) const PLUGIN_STACK: usize = 16 << 20;
+
+thread_local! {
+    /// Set on threads that already have [`PLUGIN_STACK`].
+    pub(crate) static ON_PLUGIN_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` on a thread with [`PLUGIN_STACK`] and wait for it (directly when this thread already
+/// has one, or when no thread can be started). `None` if `f` panicked.
+pub(crate) fn on_plugin_stack<R: Send>(f: impl FnOnce() -> R + Send) -> Option<R> {
+    if ON_PLUGIN_STACK.with(std::cell::Cell::get) {
+        return Some(f());
+    }
+    let f = Mutex::new(Some(f));
+    let job = || {
+        ON_PLUGIN_STACK.with(|c| c.set(true));
+        f.lock().unwrap_or_else(PoisonError::into_inner).take().map(|f| f())
+    };
+    let spawned = std::thread::scope(|s| match std::thread::Builder::new().name("ofx-render".into()).stack_size(PLUGIN_STACK).spawn_scoped(s, job) {
+        Ok(h) => Some(h.join().ok().flatten()),
+        Err(_) => None,
+    });
+    match spawned {
+        Some(r) => r,
+        // No thread: run here (the closure is still unused).
+        None => f.lock().unwrap_or_else(PoisonError::into_inner).take().map(|f| f()),
     }
 }
 

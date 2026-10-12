@@ -11,6 +11,7 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread::{self, ThreadId};
 
 use crate::ffi::*;
+use crate::instance::{ON_PLUGIN_STACK, PLUGIN_STACK};
 
 thread_local! {
     static SPAWNED: Cell<Option<u32>> = const { Cell::new(None) };
@@ -46,9 +47,21 @@ extern "C" fn multi_thread(func: ThreadFn, n_threads: u32, arg: *mut c_void) -> 
             run(0)
         } else {
             thread::scope(|s| {
-                let handles: Vec<_> = (1..n).map(|i| s.spawn(move || run(i))).collect();
-                let first = run(0);
-                handles.into_iter().fold(first, |acc, h| h.join().unwrap_or(false) && acc)
+                // Plug-in-sized stacks (see PLUGIN_STACK); an index whose thread can't be started
+                // runs on this thread afterwards.
+                let spawned: Vec<_> =
+                    (1..n).map(|i| (i, thread::Builder::new().name("ofx-worker".into()).stack_size(PLUGIN_STACK).spawn_scoped(s, move || {
+                        ON_PLUGIN_STACK.with(|s| s.set(true));
+                        run(i)
+                    }))).collect();
+                let mut ok = run(0);
+                for (i, h) in spawned {
+                    ok &= match h {
+                        Ok(h) => h.join().unwrap_or(false),
+                        Err(_) => run(i),
+                    };
+                }
+                ok
             })
         };
         IN_MULTI_THREAD.with(|f| f.set(false));
