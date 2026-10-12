@@ -96,7 +96,10 @@ XML). Saving goes through `Project::to_file_json`, which checks that the text re
 anything is written (JSON can't hold NaN or infinity), and files are written atomically. Opening
 a file that a newer EffectCraft saved shows a warning: fields this version doesn't know are
 dropped if it saves the project. Save, Save As, Save a Copy and Increment and Save keep the
-file's format (`.ecprojx` stays XML).
+file's format (`.ecprojx` stays XML). Next to `savedBy` the file records the active comp and the
+open comp tabs (`activeComp`, `openComps`), which opening restores; they are editor state, not
+part of `Project`, so older files (and ids that no longer name a comp) open on the first comp and
+older versions ignore them.
 
 `schema` changes when a saved value changes meaning; a project from an older schema is converted
 when it is opened (`effectcraft_engine::upgrade_effects`, which also refreshes effect instances
@@ -192,7 +195,10 @@ are dropped; running jobs finish into the cache. When the budget (Settings ▸ M
 full the least recently shown frames go first. The timeline's green bar counts cached frames
 of the current content and viewer settings.
 Resolution Auto renders the pixels the magnification needs, as in After Effects (Full above
-50 %, Half down to 33.3 %, Third down to 25 %, then Quarter). Below 100 % the viewer averages
+50 %, Half down to 33.3 %, Third down to 25 %, then Quarter). The Resolution is the comp's
+(`Comp::resolution`, saved with the project): setting it is no undo step (undo, redo and history
+jumps carry the current values over) and, like the Shy switches, it is outside
+`Comp::same_pixels`, so cached frames stay valid. Below 100 % the viewer averages
 instead of skipping pixels (Viewer Zoom Quality More Accurate): GPU frames carry a mip chain
 sampled trilinearly, CPU frames go up averaged down by the whole factor that leaves about one
 texel per screen pixel.
@@ -389,6 +395,9 @@ their on-screen scale, as text is vector in After Effects; on shape layers and v
 switch is Continuously Rasterize and does the same. Quality: Draft samples
 nearest-neighbour, Wireframe draws the layer bounds. Slip edit (`layer.slip`, Alt+PageUp/Down,
 dragging the source bar in the timeline) moves the source under fixed in/out points.
+Dragging a layer bar's in or out edge with several layers selected trims every selected layer by
+the same amount from its own in/out point (`layer.timing {inDelta | outDelta}`), clamped to the
+comp and to one frame of layer, as one undo step.
 
 **Nested comps** show nothing before they start or after they end (`Comp::covers`), even when
 the precomp layer is trimmed or remapped past them. A comp with **Preserve frame rate when nested

@@ -639,3 +639,36 @@ fn media_browser_over_a_virtual_tree() {
     assert_eq!(*b.actions.lock().unwrap(), ["openFolder"]);
     assert!(s.execute("mediaBrowser.action", json!({})).is_err());
 }
+
+/// Footage the source can't decode is reported with its reason by `project.summary` and
+/// `footage.info`, so an agent can tell the user why the picture is black.
+#[test]
+fn footage_that_cannot_be_decoded_reports_why() {
+    struct Broken;
+    impl FootageSource for Broken {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            None
+        }
+        fn problem(&self, f: &Footage) -> Option<String> {
+            Some(format!("{} isn't supported by the built-in decoder", f.codec))
+        }
+    }
+    let mut s = Session { footage: Arc::new(Broken), ..Default::default() };
+    s.execute("comp.new", json!({"name": "C", "width": 64, "height": 36, "duration": 2})).unwrap();
+    let f = Footage {
+        kind: FootageKind::Video,
+        path: "a.mp4".into(),
+        codec: "H.264 (High 4:2:2)".into(),
+        width: 64,
+        height: 36,
+        has_video: true,
+        ..Default::default()
+    };
+    let item = std::sync::Arc::make_mut(&mut s.project).add_item("Clip", Default::default(), None, ItemKind::Footage(f));
+    let sum = s.execute("project.summary", json!({})).unwrap();
+    let it = sum["items"].as_array().unwrap().iter().find(|i| i["id"] == json!(item.0)).unwrap();
+    assert_eq!(it["problem"], json!("H.264 (High 4:2:2) isn't supported by the built-in decoder"));
+    assert!(sum["items"].as_array().unwrap().iter().filter(|i| i["id"] != json!(item.0)).all(|i| i.get("problem").is_none()), "only footage reports one");
+    s.execute("footage.open", json!({"item": item.0})).unwrap();
+    assert_eq!(s.execute("footage.info", json!({})).unwrap()["problem"], it["problem"]);
+}

@@ -274,6 +274,7 @@ impl EffectcraftApp {
                 }
                 DockAction::Focus(p) => {
                     self.ui.focused = p;
+                    panels::viewer_text::panel_clicked(self, &ctx, p);
                     // A click in (or on the tab of) another Composition viewer makes it active.
                     if let Some(id) = panels::viewers::id_of(p) {
                         panels::viewers::activate(self, &ctx, id);

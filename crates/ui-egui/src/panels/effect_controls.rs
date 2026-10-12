@@ -121,7 +121,7 @@ pub fn choose_files_after_apply(app: &mut EffectcraftApp, applied: &serde_json::
 
 /// An undo-merge key for one gesture on `id`: a new key each time a drag starts, so separate
 /// drags are separate undo steps while one drag is one step.
-pub(super) fn gesture_key(ui: &egui::Ui, id: egui::Id, started: bool) -> String {
+pub(crate) fn gesture_key(ui: &egui::Ui, id: egui::Id, started: bool) -> String {
     let kid = id.with("gesture");
     let n: u64 = if started {
         let n = ui.data(|d| d.get_temp::<u64>(kid)).unwrap_or(0) + 1;
@@ -194,6 +194,7 @@ pub(crate) fn toggle_pick(app: &mut EffectcraftApp, kind: &str, layer: &Layer, p
         app.ui.fx_pick = None;
     } else {
         app.ui.fx_pick = Some(pick);
+        app.ui.text_color_pick = None;
         app.ui.status = if kind == "point" {
             format!("Click in the Composition panel to set {}", prop.name)
         } else {
@@ -1120,9 +1121,35 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
         app.auto.add(&format!("effectControls.effect.{}.twirl", g.uid), tw, &g.name);
-        let name = bp.text(pos2(tw.max.x + 6.0, r.center().y), Align2::LEFT_CENTER, &g.name, Tokens::semibold(12.0), t.text);
-        app.auto.add(&format!("effectControls.effect.{}.name", g.uid), name, &g.name);
+        let rename_id = egui::Id::new(("ec-rename", g.uid));
+        let editing: Option<String> = ctx.data(|d| d.get_temp(rename_id));
         let reset = Rect::from_min_size(pos2(r.max.x - 96.0, r.min.y + 4.0), vec2(40.0, 18.0));
+        if let Some(mut value) = editing.as_ref().cloned() {
+            let name_rect = Rect::from_min_max(pos2(tw.max.x + 6.0, r.min.y + 2.0), pos2(reset.min.x - 6.0, r.max.y - 2.0));
+            let response = ui.put(name_rect, egui::TextEdit::singleline(&mut value).id(rename_id.with("field")).font(Tokens::semibold(12.0)));
+            // Focus the field the frame it first exists: focusing an id not yet on screen leaves
+            // the accessibility tree with a focus it doesn't contain.
+            if ctx.data_mut(|d| d.remove_temp::<bool>(rename_id.with("start"))).is_some() {
+                crate::widgets::select_all(&ctx, response.id, &value);
+                response.request_focus();
+            }
+            app.auto.add(&format!("effectControls.effect.{}.nameEdit", g.uid), name_rect, "Effect name");
+            // Escape cancels. egui drops the field's focus on Escape in the same frame, so the
+            // key is checked on the focus being lost as well as held.
+            let escape = (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let commit = response.lost_focus() || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if escape || commit {
+                ctx.data_mut(|d| d.remove::<String>(rename_id));
+                if !escape && !value.trim().is_empty() && value != g.name {
+                    actions.push(("prop.renameGroup".into(), json!({"layer": layer.id.0, "prop": g.uid, "name": value})));
+                }
+            } else {
+                ctx.data_mut(|d| d.insert_temp(rename_id, value));
+            }
+        } else {
+            let name = bp.text(pos2(tw.max.x + 6.0, r.center().y), Align2::LEFT_CENTER, &g.name, Tokens::semibold(12.0), t.text);
+            app.auto.add(&format!("effectControls.effect.{}.name", g.uid), name, &g.name);
+        }
         let rresp = ui.interact(reset, egui::Id::new(("ec-reset", g.uid)), Sense::click());
         bp.text(reset.center(), Align2::CENTER_CENTER, crate::i18n::tr("Reset"), Tokens::ui(11.5), if rresp.hovered() { t.hot_text } else { t.text_dim });
         app.auto.add(&format!("effectControls.effect.{}.reset", g.uid), reset, "Reset");
@@ -1145,8 +1172,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let hresp = ui.interact(
             Rect::from_min_max(pos2(tw.max.x, r.min.y), pos2(reset.min.x - 4.0, r.max.y)),
             egui::Id::new(("ec-hdr", g.uid)),
-            Sense::click_and_drag(),
+            if editing.is_some() { Sense::hover() } else { Sense::click_and_drag() },
         );
+        if hresp.double_clicked() {
+            ctx.data_mut(|d| d.insert_temp(rename_id, g.name.clone()));
+            ctx.data_mut(|d| d.insert_temp(rename_id.with("start"), true));
+        }
         hresp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, &g.name));
         app.auto.add(&format!("effectControls.effect.{}", g.uid), r, &g.name);
         if hresp.clicked() || hresp.drag_started() || hresp.secondary_clicked() {
@@ -1175,6 +1206,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             item(ui, "Copy", true, "effect.copy", json!({"layer": lid, "effect": g.uid}));
             item(ui, "Paste", has_clip, "effect.paste", json!({"layers": [lid]}));
             item(ui, "Duplicate", true, "effect.duplicate", json!({"layer": lid, "effect": g.uid}));
+            if ui.button(crate::i18n::tr("Rename")).clicked() {
+                ctx.data_mut(|d| d.insert_temp(rename_id, g.name.clone()));
+                ctx.data_mut(|d| d.insert_temp(rename_id.with("start"), true));
+                ui.close();
+            }
             ui.separator();
             item(ui, "Reset", true, "effect.reset", json!({"layer": lid, "effect": g.uid}));
             item(ui, "Remove", true, "effect.remove", json!({"layer": lid, "effect": g.uid}));
@@ -1386,7 +1422,50 @@ pub fn viewer_hook(
             app.ui.status.clear();
         }
     }
-    let picking = app.ui.fx_pick.is_some();
+    if let Some(pick) = app.ui.text_color_pick.clone() {
+        if ectx.comp.layer(effectcraft_engine::project::LayerId(pick.layer)).is_none() {
+            app.ui.text_color_pick = None;
+            app.ui.status.clear();
+        } else {
+            app.viewer_pixels();
+            let resp = ui.interact(map.area, egui::Id::new("viewer-text-color-pick"), Sense::click());
+            app.auto.add("viewer.textColorPick", map.area, &pick.field);
+            let chip = Rect::from_min_size(map.area.min + vec2(10.0, 10.0), vec2(220.0, 22.0));
+            painter.rect_filled(chip, 11.0, Color32::from_black_alpha(180));
+            painter.text(chip.center(), Align2::CENTER_CENTER, crate::i18n::tr_args("Click to sample text {}", &[&pick.field]), Tokens::ui(11.5), t.text);
+            if let Some(pos) = resp.hover_pos() {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                let c = map.to_comp(pos);
+                app.pointer_comp = Some([c[0] as f32, c[1] as f32]);
+                if let Some(img) = &app.viewer_image
+                    && let Some(s) = fw::sample_frame(img, super::viewer_tools::shown_region(&ctx, map.comp), c)
+                {
+                    let sw = Rect::from_min_size(pos + vec2(14.0, 14.0), vec2(26.0, 18.0));
+                    painter.rect_filled(sw, 2.0, Color32::from_rgb((s[0] * 255.0) as u8, (s[1] * 255.0) as u8, (s[2] * 255.0) as u8));
+                    painter.rect_stroke(sw, 2.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Outside);
+                }
+            }
+            if resp.clicked()
+                && let Some(pos) = resp.interact_pointer_pos()
+                && let Some(img) = &app.viewer_image
+                && let Some(s) = fw::sample_frame(img, super::viewer_tools::shown_region(&ctx, map.comp), map.to_comp(pos))
+            {
+                let mut params = json!({"layer": pick.layer});
+                params[&pick.field] = json!([s[0], s[1], s[2]]);
+                if let Some(range) = pick.range {
+                    params["range"] = json!(range);
+                }
+                actions.push(("layer.setText".into(), params));
+                app.ui.text_color_pick = None;
+                app.ui.status.clear();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                app.ui.text_color_pick = None;
+                app.ui.status.clear();
+            }
+        }
+    }
+    let picking = app.ui.fx_pick.is_some() || app.ui.text_color_pick.is_some();
     let point_pick = app.ui.fx_pick.clone().filter(|p| p.kind == "point");
     if app.ui.viewer.show_layer_controls || point_pick.is_some() {
         // ⊕ controls for the point parameters of the selected effects.

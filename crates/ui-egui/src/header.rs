@@ -12,7 +12,7 @@ use crate::widgets;
 use crate::{Dialog, EffectcraftApp};
 use effectcraft_color::BlendMode;
 use effectcraft_engine::commands::shape_tool::{PaintKind, ToolPaint};
-use effectcraft_engine::project::{LayerId, LayerSource};
+use effectcraft_engine::project::{LayerId, LayerSource, PropGroup};
 use effectcraft_engine::viewer as vw;
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -329,6 +329,24 @@ fn tool_options(app: &mut EffectcraftApp, v: serde_json::Value) {
     }
 }
 
+/// The Colors property of the first Gradient Fill (`gfill`) or Gradient Stroke (`gstroke`) on the
+/// shape `layers`, in contents order through nested groups: (layer, property uid). The toolbar's
+/// gradient swatch edits it in the Gradient Editor.
+fn gradient_colors(app: &EffectcraftApp, layers: &[u64], paint: &str) -> Option<(u64, u64)> {
+    fn find(g: &PropGroup, paint: &str, depth: usize) -> Option<u64> {
+        if depth >= 16 {
+            return None;
+        }
+        g.groups().filter(|c| c.enabled).find_map(|c| match c.match_id.as_str() {
+            m if m == paint => c.get("colors").map(|p| p.uid),
+            "group" | "contents" => find(c, paint, depth + 1),
+            _ => None,
+        })
+    }
+    let comp = app.session.active_comp()?;
+    layers.iter().find_map(|&l| comp.layer(LayerId(l)).and_then(|layer| layer.props.sub("contents")).and_then(|c| find(c, paint, 0)).map(|u| (l, u)))
+}
+
 /// The colour picker of the Fill or Stroke swatch.
 fn picker_id(key: &str) -> egui::Id {
     egui::Id::new(("tool-pick", key))
@@ -381,8 +399,9 @@ fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pa
         if wresp.clicked() {
             widgets::open_popup(ui, opts);
         }
-        // The swatch picks a Solid Color's colour and opens the options for the other kinds;
-        // Alt-click steps through the kinds (as in After Effects).
+        // The swatch picks a Solid Color's colour, edits a Linear or Radial Gradient's colours in
+        // the Gradient Editor (the selected shape layer's Gradient Fill / Gradient Stroke), and
+        // opens the options otherwise; Alt-click steps through the kinds (as in After Effects).
         let sr = Rect::from_min_size(pos2(wr.max.x + 6.0, cy - 8.0), vec2(20.0, 16.0));
         let sresp = ui.interact(sr, egui::Id::new(("tool-paint-swatch", key)), Sense::click()).on_hover_text(format!("{title}: {}", tp.kind.label()));
         paint_swatch(p, sr, &tp, sresp.hovered(), &t);
@@ -394,7 +413,16 @@ fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pa
                 paint_kind(app, shape_layers, key, next);
             } else if tp.kind == PaintKind::Solid {
                 widgets::open_popup(ui, picker_id(key));
+            } else if let Some((layer, prop)) = matches!(tp.kind, PaintKind::Linear | PaintKind::Radial)
+                .then(|| gradient_colors(app, shape_layers, if key == "fill" { "gfill" } else { "gstroke" }))
+                .flatten()
+            {
+                let ctx = ui.ctx().clone();
+                if let Err(e) = crate::menus::invoke(app, &ctx, "prop.editGradient", json!({"layer": layer, "prop": prop})) {
+                    app.ui.status = e;
+                }
             } else {
+                // No selected shape layer with that gradient: its options (new shapes' kind).
                 widgets::open_popup(ui, opts);
             }
         }

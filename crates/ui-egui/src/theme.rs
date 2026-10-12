@@ -340,6 +340,13 @@ pub fn install(ctx: &egui::Context, t: &Tokens, language: &str) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
+    // Inter and egui's own fallbacks have no small triangles (the `▸` of "File ▸ Import"), which
+    // would draw as missing-glyph boxes: JetBrains Mono fills in the symbols the others lack.
+    for (family, stack) in &mut fonts.families {
+        if *family != FontFamily::Monospace {
+            stack.push("jbmono".into());
+        }
+    }
     install_script_fallbacks(&mut fonts, language);
     ctx.set_fonts(fonts);
     apply_visuals(ctx, t);
@@ -647,6 +654,19 @@ mod tests {
         // And an English interface leaves the operating system's locale in charge.
         let mut english = FontDefinitions::default();
         install_script_fallbacks(&mut english, "en");
+    }
+
+    #[test]
+    fn interface_symbols_have_a_glyph_in_every_family() {
+        let ctx = egui::Context::default();
+        install(&ctx, &Tokens::for_kind(Default::default()), "en");
+        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+        for family in [FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name("medium".into()), FontFamily::Name("semibold".into())] {
+            let id = FontId::new(12.0, family);
+            for c in "▸•›·▶◀●○⚠…×".chars() {
+                assert!(ctx.fonts_mut(|f| f.has_glyph(&id, c)), "{c} has no glyph in {id:?}");
+            }
+        }
     }
 
     #[test]

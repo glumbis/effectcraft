@@ -208,6 +208,9 @@ struct Inner {
     /// audio is read from the decoder instead of trying again on every read.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     conform_failed: Mutex<HashSet<std::path::PathBuf>>,
+    /// Movies that failed to open or decode (path to a readable reason; see
+    /// [`FootageSource::problem`]). The first failure of a file is logged, later ones are not.
+    problems: Mutex<HashMap<Arc<str>, String>>,
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -277,6 +280,7 @@ impl MediaPool {
                 conform: Mutex::default(),
                 conforming: Mutex::default(),
                 conform_failed: Mutex::default(),
+                problems: Mutex::default(),
             }),
         }
     }
@@ -324,6 +328,7 @@ impl MediaPool {
     pub fn clear(&self) {
         self.clear_frames();
         lock(&self.inner.sources).clear();
+        lock(&self.inner.problems).clear();
     }
 
     /// Forget a file (after it changed on disk, or to retry a file that failed to open).
@@ -331,6 +336,7 @@ impl MediaPool {
         lock(&self.inner.sources).remove(path);
         lock(&self.inner.models).remove(path);
         lock(&self.inner.gifs).remove(path);
+        lock(&self.inner.problems).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
@@ -361,8 +367,11 @@ impl MediaPool {
             Ok(img) => Some(img),
             // nobody wants the frame any more (`cancellable`): not an error
             Err(MediaError::Cancelled) => None,
+            // (a movie's failure is logged once per file, when it is recorded)
             Err(e) => {
-                log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
+                if lock(&self.inner.problems).get(footage.path.as_str()).is_none() {
+                    log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
+                }
                 None
             }
         }
@@ -454,8 +463,8 @@ impl MediaPool {
     }
 
     /// `frames` stereo sample frames of `footage`'s audio starting at source time `start`, at
-    /// `rate` Hz, interleaved (L R L R …). Mono is duplicated to both channels; channels beyond
-    /// the first two are dropped. Silence where there is no audio (or before the media starts).
+    /// `rate` Hz, interleaved (L R L R …). Mono is duplicated to both channels; multichannel
+    /// sources are downmixed to stereo ([`crate::downmix`]). Silence where there is no audio (or before the media starts).
     /// With a conformed audio folder, reads come from the conformed file once it is written.
     pub fn audio_samples(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> Vec<f32> {
         if !footage.has_audio || footage.missing || rate == 0 || frames == 0 {
@@ -605,12 +614,26 @@ impl Inner {
             match opened {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    log::warn!("media: cannot open {path}: {e}");
+                    self.note_problem(path, "", &e);
                     None
                 }
             }
         })
         .clone()
+    }
+
+    /// Remember why the movie at `path` cannot be shown (`codec` is the footage's, when known)
+    /// and log it the first time. I/O errors (missing or unreadable file) are not decoder
+    /// problems and are left to the missing-footage handling.
+    fn note_problem(&self, path: &Arc<str>, codec: &str, e: &MediaError) {
+        // A decode called off for a newer frame (#329) says nothing about the file either.
+        if matches!(e, MediaError::Io(_) | MediaError::Cancelled) {
+            return;
+        }
+        let reason = describe_problem(codec, e);
+        if lock(&self.problems).insert(path.clone(), reason.clone()).is_none() {
+            log::warn!("media: {path}: {reason}");
+        }
     }
 
     /// The decoded frames of the animated GIF or WebP at `path`. The first caller decodes it, outside the
@@ -785,7 +808,10 @@ impl Inner {
             }
             Some(mt) => {
                 let (src, turn) = self.opened(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
-                let vf = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
+                let vf = src
+                    .video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0)))
+                    .map_err(MediaError::from)
+                    .inspect_err(|e| self.note_problem(path, &footage.codec, e))?;
                 // A movie shown turned a quarter (a phone held upright): the footage's size and
                 // the render's are the turned picture's, the decoded frame's are the file's.
                 let side = |(w, h): (u32, u32)| if crate::probe::swaps_sides(turn) { (h, w) } else { (w, h) };
@@ -843,6 +869,13 @@ impl FootageSource for MediaPool {
         self.frame_sized(item, footage, t, size, float)
     }
 
+    fn problem(&self, footage: &Footage) -> Option<String> {
+        if footage.missing || footage.kind != FootageKind::Video {
+            return None;
+        }
+        lock(&self.inner.problems).get(footage.path.as_str()).cloned()
+    }
+
     fn vector_frame(&self, _item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
         if footage.missing || !effectcraft_render::is_vector_footage(footage) {
             return None;
@@ -873,7 +906,7 @@ impl FootageSource for MediaPool {
 
 /// `frames` stereo sample frames (interleaved) of `src` from sample `s0` at `rate` Hz, which
 /// FilmCraft serves as decoded when it is the source's own rate. Mono is duplicated to both
-/// channels; silence before the start. An error where decoding fails.
+/// channels, multichannel sources are downmixed ([`crate::downmix`]); silence before the start. An error where decoding fails.
 fn read_stereo(src: &SharedSource, s0: i64, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
     let mut out = vec![0.0; frames * 2];
     let skip = usize::try_from(s0.saturating_neg()).unwrap_or(0);
@@ -881,13 +914,26 @@ fn read_stereo(src: &SharedSource, s0: i64, frames: usize, rate: u32) -> std::re
         return Ok(out);
     }
     let buf = src.audio(s0.max(0), frames - skip, rate).map_err(|e| e.to_string())?;
-    let (Some(l), Some(r)) = (buf.channels.first(), buf.channels.get(1).or(buf.channels.first())) else { return Ok(out) };
     let Some(dst) = skip.checked_mul(2).and_then(|i| out.get_mut(i..)) else { return Ok(out) };
-    for ([o0, o1], (a, b)) in dst.as_chunks_mut::<2>().0.iter_mut().zip(l.iter().zip(r)) {
-        *o0 = *a;
-        *o1 = *b;
-    }
+    let aac = src.info().audio.as_ref().is_some_and(|a| a.codec.starts_with("AAC"));
+    crate::downmix::downmix_into(&buf.channels, aac, dst);
     Ok(out)
+}
+
+/// The one-line reason a movie shows no picture: its `codec` (the probe's, e.g. "H.264 (High
+/// 4:2:2)") and what the decoder said, without the error wrappers it passed through.
+fn describe_problem(codec: &str, e: &MediaError) -> String {
+    let mut detail = match e {
+        MediaError::Io(s) | MediaError::Unsupported(s) | MediaError::Decode(s) => s.as_str(),
+        MediaError::Cancelled => "the decode was called off",
+    };
+    let mut unsupported = matches!(e, MediaError::Unsupported(_));
+    while let Some(rest) = ["decode error: ", "unsupported media: ", "unsupported: ", "I/O error: "].iter().find_map(|p| detail.strip_prefix(p)) {
+        unsupported |= detail.starts_with("unsupported");
+        detail = rest;
+    }
+    let what = if codec.is_empty() { "This video" } else { codec };
+    if unsupported { format!("{what} isn't supported by the built-in decoder: {detail}") } else { format!("{what} can't be decoded: {detail}") }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

@@ -141,13 +141,24 @@ fn parse_args(args: impl IntoIterator<Item = String>, env_port: Option<String>) 
 }
 
 fn main() -> eframe::Result {
-    // Help ▸ Enable Logging writes through this logger; warnings feed the compatibility report.
+    // First, so the panic hook and every start-up warning are recorded. Records go to stderr
+    // and the session log; Help ▸ Enable Logging writes through this logger too, and warnings
+    // feed the compatibility report.
     effectcraft_engine::logging::install();
     effectcraft_engine::logging::install_panic_hook();
     let Some(Args { control_port, files, demo, home }) = parse_args(std::env::args().skip(1), std::env::var("EFFECTCRAFT_CONTROL_PORT").ok()) else {
         println!("effectcraft {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     };
+    // The session log lives in the settings folder (`Logs/effectcraft.log`, the previous two runs
+    // kept): a launch from the Dock or a menu has no terminal. Opened after the arguments, so
+    // `--version` leaves no file behind; records logged until now are written to it first.
+    if let Some(dir) = effectcraft_host::config_dir() {
+        match effectcraft_engine::logging::attach_session_log(&effectcraft_engine::logging::log_dir(Some(&dir))) {
+            Ok(path) => log::info!("effectcraft {}, log file {}", env!("CARGO_PKG_VERSION"), path.display()),
+            Err(e) => log::warn!("no log file: {e}"),
+        }
+    }
     // The font menus list the installed fonts: read their names while the window opens.
     effectcraft_engine::text::fonts::scan_system_in_background();
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.
@@ -173,8 +184,8 @@ fn main() -> eframe::Result {
         wgpu_options: wgpu_options(launch.backends),
         ..Default::default()
     };
-    // Start-up milestones: with `RUST_LOG=info` they go to stderr, so a window that never
-    // appears shows how far start-up got (#234).
+    // Start-up milestones go to stderr and the session log, so a window that never appears
+    // shows how far start-up got (#234).
     log::info!("effectcraft {}: opening the window", env!("CARGO_PKG_VERSION"));
     // Registered before the event loop starts, so it catches the Finder event that launched us as
     // well as later ones. Lives until the event loop returns; the app creator only borrows it.
@@ -244,7 +255,7 @@ fn main() -> eframe::Result {
             let project = files.iter().find(|f| is_project_file(f)).cloned();
             if let Some(p) = project {
                 if let Err(e) = session.execute("file.open", json!({"path": p})) {
-                    eprintln!("effectcraft: {e}");
+                    log::warn!("{p}: {e}");
                 }
             } else if demo {
                 let _ = session.execute("file.openDemoProject", json!({}));
@@ -253,7 +264,7 @@ fn main() -> eframe::Result {
             if !media.is_empty()
                 && let Err(e) = session.execute("file.import", json!({"paths": media}))
             {
-                eprintln!("effectcraft: {e}");
+                log::warn!("import: {e}");
             }
             let show_home = home.unwrap_or(session.prefs.startup.show_home_on_launch && files.is_empty() && control_port.is_none());
             // The ScriptUI panels open when the app last quit open again (a failing one is
@@ -388,8 +399,12 @@ fn startup_failed(e: &eframe::Error, gl_next: bool) {
     let message = format!(
         "EffectCraft couldn't start its window: {e}\n\n{next}Updating the graphics driver often helps. If it keeps happening, please report it at https://github.com/storytold/effectcraft/issues with this message."
     );
-    log::error!("{message}");
-    eprintln!("effectcraft: {message}");
+    // Standard error and the session log; standard error alone when RUST_LOG turned errors off.
+    if log::log_enabled!(log::Level::Error) {
+        log::error!("{message}");
+    } else {
+        eprintln!("effectcraft: {message}");
+    }
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("EffectCraft")

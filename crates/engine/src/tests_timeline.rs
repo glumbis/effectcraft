@@ -414,6 +414,25 @@ fn time_set_snaps_to_the_nearest_frame_and_ae_timecode() {
     assert_eq!(effectcraft_time::format_timecode_ae(75, fr, true), "0;00;02;15");
 }
 
+/// #890: at 29.97 / 59.94 fps the displayed (non-drop) timecode was read back as drop-frame, so
+/// committing the current-time field moved the playhead to another frame from minute 1 on.
+#[test]
+fn time_set_round_trips_the_displayed_timecode_at_drop_frame_rates() {
+    for fps in [29.97, 59.94] {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "T", "width": 64, "height": 64, "frameRate": fps, "duration": 4000})).unwrap();
+        for frame in [0_i64, 1799, 1800, 1801, 3600, 17982, 17983, 100_000] {
+            let r = s.execute("time.set", json!({"frame": frame})).unwrap();
+            let display = r["display"].as_str().unwrap().to_string();
+            let r = s.execute("time.set", json!({"timecode": display})).unwrap();
+            assert_eq!(r["frame"], frame, "{fps} fps: displayed {display}");
+        }
+        // Explicit drop-frame fields still mean drop-frame.
+        let r = s.execute("time.set", json!({"timecode": "0;01;00;02"})).unwrap();
+        assert_eq!(r["frame"], if fps > 30.0 { 3598 } else { 1800 });
+    }
+}
+
 #[test]
 fn time_set_keeps_the_frame_shown_in_the_current_time_field() {
     let mut s = Session::default();
@@ -731,6 +750,70 @@ fn reveal_shortcuts_take_in_time_remap() {
     }
 }
 
+/// UU on a layer nothing was changed on shows nothing, whatever its kind: cameras, lights, text
+/// and nulls have their own Transform defaults, and Separate Dimensions keeps the comp centre.
+#[test]
+fn modified_reveal_is_empty_for_untouched_layers() {
+    let (mut s, solid) = setup();
+    let mut layers = vec![("solid", solid)];
+    for (cmd, params) in [
+        ("layer.newText", json!({"text": "Hi"})),
+        ("layer.newShape", json!({})),
+        ("layer.newNull", json!({})),
+        ("layer.newCamera", json!({})),
+        ("layer.newLight", json!({})),
+        ("layer.newLight", json!({"type": "ambient"})),
+    ] {
+        let r = s.execute(cmd, params.clone()).unwrap_or_else(|e| panic!("{cmd} {params}: {e}"));
+        layers.push((cmd, r["layer"].as_u64().unwrap()));
+    }
+    s.execute("prop.separateDimensions", json!({"layer": solid})).unwrap();
+    for (what, l) in layers {
+        s.execute("layer.select", json!({"layers": [l]})).unwrap();
+        let r = s.execute("anim.reveal", json!({"kind": "modified"})).unwrap();
+        let paths: Vec<String> = r["props"].as_array().unwrap().iter().filter_map(|p| p["prop"].as_u64()).map(|u| path_of(&s, l, u)).collect();
+        assert!(paths.is_empty(), "{what}: {paths:?}");
+    }
+}
+
+/// Match-id path of property or group `uid` of `layer`.
+fn path_of(s: &Session, layer: u64, uid: u64) -> String {
+    let l = s.active_comp().unwrap().layer(effectcraft_project::LayerId(layer)).unwrap();
+    let mut out = String::new();
+    for n in l.props.node_chain(uid).unwrap_or_default() {
+        out.push('/');
+        out.push_str(n.match_id());
+    }
+    out
+}
+
+/// UU takes in static changes outside Transform: Material, Camera and Light Options, a
+/// separated position, and layer styles in full.
+#[test]
+fn modified_reveal_takes_in_options_and_layer_styles() {
+    let (mut s, solid) = setup();
+    let modified = |s: &mut Session, l: u64| -> Vec<String> {
+        s.execute("layer.select", json!({"layers": [l]})).unwrap();
+        let r = s.execute("anim.reveal", json!({"kind": "modified"})).unwrap();
+        r["props"].as_array().unwrap().iter().filter_map(|p| p["prop"].as_u64()).map(|u| path_of(s, l, u)).collect()
+    };
+    s.execute("prop.set", json!({"layer": solid, "path": "materialOptions/diffuse", "value": 80})).unwrap();
+    assert_eq!(modified(&mut s, solid), ["/materialOptions/diffuse"]);
+    s.execute("prop.separateDimensions", json!({"layer": solid})).unwrap();
+    s.execute("prop.set", json!({"layer": solid, "path": "transform/positionX", "value": 10})).unwrap();
+    assert_eq!(modified(&mut s, solid), ["/transform/positionX", "/materialOptions/diffuse"]);
+    s.execute("layer.style.dropShadow", json!({"layers": [solid]})).unwrap();
+    assert!(modified(&mut s, solid).contains(&"/layerStyles/dropShadow".to_string()), "{:?}", modified(&mut s, solid));
+
+    let cam = s.execute("layer.newCamera", json!({})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": cam, "path": "cameraOptions/blurLevel", "value": 50})).unwrap();
+    s.execute("prop.set", json!({"layer": cam, "path": "transform/rotation", "value": 15})).unwrap();
+    assert_eq!(modified(&mut s, cam), ["/transform/rotation", "/cameraOptions/blurLevel"]);
+    let light = s.execute("layer.newLight", json!({})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": light, "path": "lightOptions/intensity", "value": 40})).unwrap();
+    assert_eq!(modified(&mut s, light), ["/lightOptions/intensity"]);
+}
+
 /// Enable Time Remapping on a layer extended past its source's end (its last frame frozen) puts
 /// the end key at the source's end, not at the extended out point (#290).
 #[test]
@@ -982,4 +1065,58 @@ fn add_item_keeps_footage_longer_than_the_comp_at_full_length() {
     let l = s.execute("layer.addItem", json!({"item": item.0})).unwrap()["layer"].as_u64().unwrap();
     let layer = s.active_comp().unwrap().layer(effectcraft_project::LayerId(l)).unwrap();
     assert_eq!(layer.out_point.seconds(), 10.0);
+}
+
+/// View > Go to Time's dialog sends its Frame field as a float; `time.set` used to reject it
+/// with "need `time`, `frame` or `timecode`".
+#[test]
+fn go_to_time_accepts_a_float_frame_from_the_dialog() {
+    let (mut s, _) = setup();
+    let r = s.execute("time.set", json!({"frame": 12.0})).unwrap();
+    assert_eq!(r["frame"], json!(12));
+    let r = s.execute("time.set", json!({"frame": 7})).unwrap();
+    assert_eq!(r["frame"], json!(7));
+}
+
+/// Dragging a trim edge with several layers selected trims every selected layer by the same
+/// amount from its own in/out point (as in AE), clamped to the comp and to one frame of layer;
+/// a whole merged drag is one undo step.
+#[test]
+fn relative_trim_moves_every_selected_layer_by_the_same_delta() {
+    let (mut s, a) = setup();
+    let b = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 100, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.timing", json!({"layers": [a], "in": 0.5, "out": 2.0})).unwrap();
+    s.execute("layer.timing", json!({"layers": [b], "in": 1.0, "out": 3.5})).unwrap();
+    let io = |s: &Session, l: u64| {
+        let l = s.active_comp().unwrap().layer(effectcraft_project::LayerId(l)).unwrap();
+        (l.in_point.seconds(), l.out_point.seconds())
+    };
+    let near = |x: f64, y: f64| (x - y).abs() < 1e-9;
+    let undo_len = s.history.undo.len();
+    // In-point drag in frame steps, merged into one edit.
+    for _ in 0..3 {
+        s.execute("layer.timing", json!({"layers": [a, b], "inDelta": 0.1, "merge": "bar-trim"})).unwrap();
+    }
+    assert_eq!(s.history.undo.len(), undo_len + 1);
+    let ((ai, ao), (bi, bo)) = (io(&s, a), io(&s, b));
+    assert!(near(ai, 0.8) && near(ao, 2.0) && near(bi, 1.3) && near(bo, 3.5), "{ai} {ao} {bi} {bo}");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(near(io(&s, a).0, 0.5) && near(io(&s, b).0, 1.0));
+    s.history.merge_key = None;
+    // Out-point drag: b hits the comp end (4 s) while a keeps going.
+    s.execute("layer.timing", json!({"layers": [a, b], "outDelta": 1.0})).unwrap();
+    assert!(near(io(&s, a).1, 3.0) && near(io(&s, b).1, 4.0), "{:?} {:?}", io(&s, a), io(&s, b));
+    // In-point drag left: a stops at the comp start.
+    s.execute("layer.timing", json!({"layers": [a, b], "inDelta": -0.8})).unwrap();
+    assert!(near(io(&s, a).0, 0.0) && near(io(&s, b).0, 0.2), "{:?} {:?}", io(&s, a), io(&s, b));
+    // Trimming past the other edge keeps one frame of layer.
+    s.execute("layer.timing", json!({"layers": [a, b], "inDelta": 10.0})).unwrap();
+    let fd = 1.0 / 30.0;
+    assert!(near(io(&s, a).0, 3.0 - fd) && near(io(&s, b).0, 4.0 - fd), "{:?} {:?}", io(&s, a), io(&s, b));
+    s.execute("layer.timing", json!({"layers": [a, b], "outDelta": -10.0})).unwrap();
+    assert!(near(io(&s, a).1, 3.0) && near(io(&s, b).1, 4.0), "{:?} {:?}", io(&s, a), io(&s, b));
+    // A point already outside the comp trims from where it is instead of jumping onto the edge.
+    s.execute("layer.timing", json!({"layers": [a], "in": -1.0})).unwrap();
+    s.execute("layer.timing", json!({"layers": [a], "inDelta": 0.1})).unwrap();
+    assert!(near(io(&s, a).0, -0.9), "{:?}", io(&s, a));
 }

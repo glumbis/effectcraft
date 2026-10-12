@@ -610,15 +610,36 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 actions.push(("file.useProxy".into(), json!({"item": id.0})));
             }
         }
-        let name_clip = Rect::from_min_max(pos2(x0 + 30.0, r.min.y), pos2(r.min.x + name_w + 4.0, r.max.y)).intersect(list);
+        // Footage that can't be decoded (no decoder for its codec / profile): a warning marker
+        // at the end of the name cell, the reason on hover.
+        let problem = match &it.kind {
+            ItemKind::Footage(f) => app.session.footage.problem(f),
+            _ => None,
+        };
+        let name_clip =
+            Rect::from_min_max(pos2(x0 + 30.0, r.min.y), pos2(r.min.x + name_w + 4.0 - if problem.is_some() { 16.0 } else { 0.0 }, r.max.y)).intersect(list);
+        if let Some(why) = &problem {
+            let m = Rect::from_center_size(pos2(r.min.x + name_w - 8.0, r.center().y), vec2(13.0, 12.0));
+            lp.add(egui::Shape::convex_polygon(vec![m.center_top(), m.right_bottom(), m.left_bottom()], t.warning, Stroke::NONE));
+            lp.text(m.center() + vec2(0.0, 1.5), Align2::CENTER_CENTER, "!", Tokens::semibold(9.0), Color32::BLACK);
+            ui.interact(m.expand(2.0).intersect(list), egui::Id::new(("pproblem", id.0)), Sense::hover()).on_hover_text(why.as_str());
+            app.auto.add(&format!("project.item.{}.problem", id.0), m, why);
+        }
         let name_rect = Rect::from_min_max(pos2(x0 + 28.0, r.min.y + 2.0), pos2(r.min.x + name_w + 2.0, r.max.y - 2.0));
         // Inline edits (rename / comment).
         let cell_edit = |app: &mut EffectcraftApp, ui: &mut egui::Ui, actions: &mut Vec<(String, serde_json::Value)>, field: &str, cell: Rect| -> bool {
             let Some((eid, ef, mut buf)) = editing.clone().filter(|(e, f, _)| *e == id.0 && f == field) else { return false };
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
-            let resp = child.add(egui::TextEdit::singleline(&mut buf).desired_width(cell.width()).font(Tokens::ui(12.0)));
+            // The field keeps Tab (egui would move the keyboard to the next widget, where Enter no
+            // longer renames, #881): Tab commits like Enter and gives the keyboard back to the panel.
+            let filter = egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, ..Default::default() };
+            let resp = child.add(egui::TextEdit::singleline(&mut buf).desired_width(cell.width()).font(Tokens::ui(12.0)).event_filter(filter));
             app.auto.add(&format!("project.item.{}.{field}Edit", id.0), cell, field);
-            if resp.lost_focus() {
+            let tab = resp.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Tab));
+            if tab {
+                resp.surrender_focus();
+            }
+            if resp.lost_focus() || tab {
                 ctx.data_mut(|d| d.remove::<Editing>(edit_id()));
                 if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     let (cmd, params) = if ef == "name" {
@@ -774,7 +795,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 ui.close();
             }
             if it.parent.is_some() && ui.button(crate::i18n::tr("Move to Project Root")).clicked() {
-                actions.push(("project.move".into(), json!({"items": [id.0], "folder": null})));
+                actions.push(("project.move".into(), json!({"items": targets(app, *id, selected), "folder": null})));
                 ui.close();
             }
             if !it.is_folder() && ui.button(crate::i18n::tr("Add to Composition")).clicked() {
@@ -993,7 +1014,7 @@ fn label_index(l: Label) -> usize {
 
 /// The column header's context menu: show or hide the optional columns.
 fn column_menu(app: &mut EffectcraftApp, resp: &egui::Response) {
-    crate::widgets::context_menu(&resp, |ui| {
+    crate::widgets::context_menu(resp, |ui| {
         ui.label(egui::RichText::new(crate::i18n::tr("Columns")).weak());
         for (key, label, _) in COLUMNS {
             let mut on = app.ui.project_columns.iter().any(|c| c == key);

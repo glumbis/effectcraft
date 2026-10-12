@@ -287,7 +287,9 @@ impl SpatialSeg {
     /// along curved paths instead of piecewise linear per cell (#456).
     fn at_length(&self, s: f64) -> [f64; 3] {
         let len = self.length();
-        if len <= 0.0 {
+        // A path whose length overflowed (huge coordinates) or is NaN has no arc-length table to
+        // walk: `clamp` would panic on a NaN bound.
+        if !(len > 0.0 && len.is_finite()) {
             return self.p[0];
         }
         let s = s.clamp(0.0, len);
@@ -876,6 +878,30 @@ mod tests {
         // Auto-Bezier ends now have handles along the line; the chord is still hit exactly.
         let keys = vec![Keyframe::new(s(0.0), Value::Vec2([40.0, 50.0])), Keyframe::new(s(2.0), Value::Vec2([120.0, 50.0]))];
         assert_eq!(segment_value(&keys, 0, s(1.0), true), Value::Vec2([80.0, 50.0]));
+    }
+
+    /// #880: a motion path whose arc length overflows (huge coordinates, as the Position field
+    /// accepts) or is NaN evaluates without panicking: scrubbing over it crashed the app.
+    #[test]
+    fn overflowing_or_nan_motion_paths_evaluate() {
+        let paths = [
+            [[-1.7e308, 0.0], [1.7e308, 0.0], [-1.7e308, 5.0]],
+            [[0.0, 0.0], [f64::NAN, 10.0], [20.0, 0.0]],
+            [[f64::INFINITY, 0.0], [0.0, f64::NEG_INFINITY], [20.0, 0.0]],
+        ];
+        for path in paths {
+            let mut keys: Vec<Keyframe> = path.iter().enumerate().map(|(i, &v)| Keyframe::new(s(i as f64 * 2.0), Value::Vec2(v))).collect();
+            for eased in [false, true] {
+                if eased {
+                    keys = keys.into_iter().map(Keyframe::eased).collect();
+                }
+                for f in 0..=40 {
+                    let t = s(f as f64 * 0.1);
+                    assert!(evaluate(&keys, t, true).is_some());
+                    let _ = speed(&keys, t, true);
+                }
+            }
+        }
     }
 
     #[test]

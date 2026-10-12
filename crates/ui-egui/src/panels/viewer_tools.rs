@@ -403,7 +403,8 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
             _ => {
                 let img = crate::frames::to_color_image(&s.image);
                 let img = if plain { img } else { transformed(&img, opts.channel, opts.colorized, opts.exposure, dc) };
-                let tex = crate::frames::load_fitted(ctx, "viewer-snapshot", img, egui::TextureOptions::LINEAR);
+                let opts = super::viewer::zoom_texture_options(app.session.prefs.viewer_zoom_smooth());
+                let tex = crate::frames::load_fitted(ctx, "viewer-snapshot", img, opts);
                 ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
                 tex
             }
@@ -522,8 +523,8 @@ pub(crate) fn magnification_menu(
     auto_items: &str,
     zoom: f32,
     current: Option<f32>,
-    fit: f32,
-) -> Option<Option<f32>> {
+    fit_up: bool,
+) -> Option<(Option<f32>, bool)> {
     let t = app.tokens;
     let ppp = ui.ctx().pixels_per_point();
     let pop = format!("{id}-pop");
@@ -539,17 +540,20 @@ pub(crate) fn magnification_menu(
         .iter()
         .map(|m| {
             let on = match *m {
-                "Fit" => current.is_none(),
+                "Fit" => current.is_none() && !fit_up,
+                "Fit up to 100%" => current.is_none() && fit_up,
                 s => s.trim_end_matches('%').parse::<f32>().is_ok_and(|v| current.is_some() && (v - cur).abs() < 0.06),
             };
             (m.to_string(), on)
         })
         .collect();
     let i = popup(app, ui, &pop, r, &items, auto_items)?;
+    // `(zoom, fit up to 100 %)`: Fit and Fit up to 100% leave the zoom unset (it follows the
+    // panel size).
     match *MAGS.get(i)? {
-        "Fit" => Some(None),
-        "Fit up to 100%" => Some(Some(fit.min(1.0 / ppp))),
-        s => s.trim_end_matches('%').parse::<f32>().ok().map(|v| Some(v / 100.0 / ppp)),
+        "Fit" => Some((None, false)),
+        "Fit up to 100%" => Some((None, true)),
+        s => s.trim_end_matches('%').parse::<f32>().ok().map(|v| (Some(v / 100.0 / ppp), false)),
     }
 }
 
@@ -582,7 +586,7 @@ pub(crate) fn resolution_label(res: Resolution, scale: f64) -> String {
 /// transparency grid, mask and shape path visibility, region of interest, grid and guide
 /// options, show channel, reset exposure, exposure, take / show snapshot, Fast Previews, the 3D
 /// renderer and view, and the current time.
-pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, fit: f32, time: Tick, comp: &Comp) {
+pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, time: Tick, comp: &Comp) {
     let t = app.tokens;
     let p = ui.painter().clone();
     p.rect_filled(bar, 0.0, t.panel_bg);
@@ -598,7 +602,7 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
         egui::ScrollArea::horizontal().id_salt("viewer-controls").auto_shrink([false, false]).show(ui, |ui| {
             let row = Rect::from_min_size(ui.max_rect().min, vec2(bar.width(), 30.0));
             let first_control = app.auto.elements.len();
-            let width = bottom_bar_contents(app, ui, row, zoom, fit, time, comp);
+            let width = bottom_bar_contents(app, ui, row, zoom, time, comp);
             ui.allocate_rect(Rect::from_min_size(row.min, vec2(width, row.height())), Sense::hover());
             if let Some(focused) = ui.ctx().memory(|memory| memory.focused())
                 && app.auto.elements.get(first_control..).is_some_and(|controls| controls.iter().any(|control| control.response_id == Some(focused)))
@@ -611,7 +615,7 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     });
 }
 
-fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, fit: f32, time: Tick, comp: &Comp) -> f32 {
+fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, time: Tick, comp: &Comp) -> f32 {
     let t = app.tokens;
     let p = ui.painter().clone();
     let cy = bar.center().y;
@@ -620,8 +624,10 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
 
     // Magnification.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(80.0, 20.0));
-    if let Some(z) = magnification_menu(app, ui, r, "vw-mag", "viewer.magnification", "magnification", zoom, app.ui.viewer.zoom, fit) {
+    let fit_up = app.ui.viewer.fit_up_to_100;
+    if let Some((z, up)) = magnification_menu(app, ui, r, "vw-mag", "viewer.magnification", "magnification", zoom, app.ui.viewer.zoom, fit_up) {
         app.ui.viewer.pan = [0.0, 0.0];
+        app.ui.viewer.fit_up_to_100 = up;
         app.ui.viewer.zoom = z;
     }
     x = r.max.x + 4.0;
@@ -629,13 +635,13 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
     // Resolution / down-sample factor.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(84.0, 20.0));
     let scale = app.viewer_scale(zoom, ppp);
-    let response = widgets::dropdown(ui, r, &resolution_label(app.ui.viewer.res, scale), &t, egui::Id::new("vw-res"))
+    let res = app.viewer_res();
+    let response = widgets::dropdown(ui, r, &resolution_label(res, scale), &t, egui::Id::new("vw-res"))
         .on_hover_text(crate::i18n::tr("Resolution/Down Sample Factor Popup"));
     if response.clicked() {
         toggle_popup(ui, "vw-res-pop");
     }
     app.auto.add_response("viewer.resolution", &response, "Resolution/Down Sample Factor");
-    let res = app.ui.viewer.res;
     let items: Vec<(String, bool)> = vec![
         ("Full".into(), res == Resolution::Full),
         ("Half".into(), res == Resolution::Half),

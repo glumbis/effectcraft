@@ -123,6 +123,13 @@ pub trait FootageSource: Send + Sync {
     fn called_off(&self) -> bool {
         false
     }
+    /// Why `footage` shows no picture although its file is there: a read of it failed because
+    /// no decoder handles its codec, profile, chroma format or bit depth, or the stream is damaged
+    /// (e.g. "H.264 (High 4:2:2) isn't supported by the built-in decoder: ..."). `None` while it
+    /// decodes, and for sources that don't track failures. Stays set until the file is forgotten.
+    fn problem(&self, _footage: &Footage) -> Option<String> {
+        None
+    }
 }
 
 /// A render's view of a [`FootageSource`] whose frame reads can be called off with `cancel`
@@ -184,6 +191,12 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn called_off(&self) -> bool {
         self.cancel.load(Ordering::Relaxed) || self.inner.called_off()
+    }
+    fn problem(&self, footage: &Footage) -> Option<String> {
+        self.inner.problem(footage)
+    }
+    fn frame_with(&self, item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Option<Arc<Image>> {
+        self.read(|| self.inner.frame_with(item, footage, t, size, float))
     }
 }
 
@@ -477,6 +490,16 @@ pub trait FxTarget {
     fn gpu(&mut self, steps: &[FxStep]) -> bool;
     /// Run one CPU effect: `f` maps the buffer.
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf);
+    /// Grow the buffer to cover its whole layer rectangle (`size` layer pixels from its own
+    /// corner, the `layer_size` handed to effects), as [`effectcraft_effects::Buf::cover`].
+    /// Authored buffers (text, shapes) only span their painted content; this gives the stack
+    /// the room a sized source's buffer already has (#659).
+    fn cover(&mut self, size: [f64; 2]) {
+        self.cpu(&mut |mut buf| {
+            buf.cover(size);
+            buf
+        });
+    }
 }
 
 /// The CPU effect target (GPU chains go through [`Accelerator::effects`]: upload, readback).
@@ -838,15 +861,14 @@ impl<'a> Renderer<'a> {
         Region::Full
     }
 
-    /// Rasterisation scale of a layer's source: the output scale, or — for text layers, which are
-    /// always continuously rasterised, and Continuously Rasterize shape layers and vector footage —
-    /// the output scale times the layer's on-screen scale (quarter-octave steps, rounded up, so
-    /// vector content is drawn at its final size and stays sharp when scaled up).
+    /// Rasterisation scale of a layer's source: the output scale, or — for text and shape layers,
+    /// which are always continuously rasterised (#390, #751), and Continuously Rasterize vector
+    /// footage — the output scale times the layer's on-screen scale (quarter-octave steps, rounded
+    /// up, so vector content is drawn at its final size and stays sharp when scaled up).
     pub fn raster_scale(&self, ctx: &EvalCtx, layer: &Layer) -> f64 {
         let s = self.opts.scale;
         let continuous = match layer.source {
-            LayerSource::Text => true,
-            LayerSource::Shape => layer.switches.collapse,
+            LayerSource::Text | LayerSource::Shape => true,
             LayerSource::Footage { item } => {
                 layer.switches.collapse && matches!(self.project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if is_vector_footage(f))
             }
@@ -1097,6 +1119,15 @@ impl<'a> Renderer<'a> {
         let Some(fx) = layer.effects() else { return };
         let lt = layer.layer_time(ctx.time);
         let layer_size = ctx.effect_bounds(layer).0;
+        // #659: an authored layer's buffer spans only its painted content while the stack works
+        // on the layer's whole region (`layer_size`): give the buffer the room a sized source
+        // already has, so tiling or displacement can place pixels outside the content instead
+        // of losing them at its edge. Only when something will actually run, and not for an
+        // adjustment layer, whose buffer is the comp below and already spans it.
+        if !adjustment
+            && fx.groups().any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if effectcraft_effects::find(effect).is_some_and(|s| !effectcraft_effects::audio_fx::is_audio_effect(s.id)))) {
+            target.cover(layer_size);
+        }
         let mut mask_shapes = masks::shapes(ctx, layer);
         if origin != [0.0; 2] {
             for q in mask_shapes.iter_mut().flat_map(|m| m.points.iter_mut()) {

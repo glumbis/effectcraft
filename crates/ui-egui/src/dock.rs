@@ -1336,10 +1336,13 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
             }
         }
     }
-    // clicking anywhere in the panel focuses it
+    // clicking anywhere in the panel focuses it; a press on another of its tabs waits for that
+    // tab's click, which focuses the panel actually chosen (a text edit stays open in Character)
+    let at = ui.input(|i| i.pointer.interact_pos());
     if let Some(p) = active_panel
         && ui.rect_contains_pointer(g.rect)
         && ui.input(|i| i.pointer.any_pressed())
+        && !out.tabs.iter().any(|(q, r)| *q != p && at.is_some_and(|a| r.contains(a)))
     {
         out.actions.push(DockAction::Focus(p));
     }

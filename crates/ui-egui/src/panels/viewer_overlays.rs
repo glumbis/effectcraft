@@ -87,6 +87,15 @@ pub(crate) fn segment_at(paths: &[PathInfo], map: &ViewerMap, pos: Pos2, tol: f3
     best.map(|b| b.1)
 }
 
+/// The open path whose last vertex lies within `tol` points of `pos`: the Pen resumes it there.
+pub(crate) fn open_end_at(paths: &[PathInfo], map: &ViewerMap, pos: Pos2, tol: f32) -> Option<(LayerId, u64)> {
+    paths.iter().find_map(|p| {
+        let v = p.sp.vertices.last().filter(|_| !p.sp.closed)?;
+        let q = p.m.apply(gv2(v[0], v[1]));
+        (map.to_screen([q.x, q.y]).distance(pos) < tol).then_some((p.layer, p.uid))
+    })
+}
+
 /// A mask or shape path of a layer by group uid, evaluated at the context time.
 pub(crate) fn path_of(ectx: &EvalCtx, layer: LayerId, uid: u64) -> Option<PathInfo> {
     let l = ectx.comp.layer(layer)?;
@@ -638,5 +647,28 @@ pub(crate) fn update(
             None
         }
         Drag::Roi { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(vertices: Vec<[f64; 2]>, closed: bool) -> PathInfo {
+        let n = vertices.len();
+        let sp = ShapePath { vertices, in_tangents: vec![[0.0; 2]; n], out_tangents: vec![[0.0; 2]; n], closed, feather: Vec::new() };
+        PathInfo { layer: LayerId(3), uid: 7, m: Mat3::IDENTITY, sp, is_mask: true, feather: Vec::new() }
+    }
+
+    /// #912: clicking the last vertex of an open path with the Pen resumes that path.
+    #[test]
+    fn pen_resumes_an_open_path_at_its_last_vertex() {
+        let map = ViewerMap { origin: Pos2::ZERO, zoom: 1.0, comp: [100.0, 100.0], area: Rect::EVERYTHING };
+        let open = info(vec![[10.0, 10.0], [50.0, 10.0], [50.0, 50.0]], false);
+        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(52.0, 49.0), 8.0), Some((LayerId(3), 7)));
+        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(10.0, 10.0), 8.0), None, "first vertex");
+        assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(80.0, 80.0), 8.0), None, "far away");
+        let closed = info(vec![[10.0, 10.0], [50.0, 10.0], [50.0, 50.0]], true);
+        assert_eq!(open_end_at(&[closed], &map, egui::pos2(50.0, 50.0), 8.0), None, "closed path");
     }
 }

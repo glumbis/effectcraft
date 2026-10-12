@@ -382,6 +382,9 @@ fn set_switch(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "switch").ok_or_else(|| bad("layer.setSwitch", "missing `switch`"))?.to_string();
     let v = b_p(p, "value");
     let label = format!("Layer Switch ({name})");
+    if b_p(p, "others") == Some(true) {
+        return set_switch_others(s, cid, &ids, &name, v, &label);
+    }
     // `merge`: a switch dragged over several layers in the Timeline is one undo step.
     let r = s.edit(&label, merge_p(p), |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
@@ -395,6 +398,38 @@ fn set_switch(s: &mut Session, p: &Value) -> Result<Value> {
             last = target;
         }
         Ok(last)
+    })?;
+    Ok(json!(r))
+}
+
+/// `layer.setSwitch {others: true}` (Alt-click on an A/V feature in the Timeline): the named
+/// layers stand alone, shown / heard / soloed / unlocked while every other layer the switch
+/// applies to is the opposite; when they already do, the other layers come back. `value` sets
+/// the other layers directly.
+fn set_switch_others(s: &mut Session, cid: ItemId, ids: &[LayerId], name: &str, value: Option<bool>, label: &str) -> Result<Value> {
+    let r = s.edit(label, None, |proj, _| {
+        let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
+        // The state that sets a layer apart: unlocked for Lock, on for the rest.
+        let active = !matches!(name, "lock" | "locked");
+        // Track mattes keep their video off by design.
+        let mattes: Vec<LayerId> =
+            if matches!(name, "video" | "eye") { comp.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect() } else { Vec::new() };
+        let applies = |l: &Layer| match name {
+            "audio" => l.props.sub("audio").is_some(),
+            "lock" | "locked" => true,
+            _ => l.source.is_av() && !mattes.contains(&l.id),
+        };
+        let mut alone = true;
+        for l in comp.layers.iter().filter(|l| applies(l)) {
+            let Some(on) = switch_value(l, name) else { return Err(bad("layer.setSwitch", format!("unknown switch `{name}`"))) };
+            alone &= on == (ids.contains(&l.id) == active);
+        }
+        let others = value.unwrap_or(alone == active);
+        for l in comp.layers.iter_mut().filter(|l| applies(l)) {
+            let v = if ids.contains(&l.id) { active } else { others };
+            set_switch_value(l, name, v);
+        }
+        Ok(others)
     })?;
     Ok(json!(r))
 }
@@ -862,9 +897,13 @@ fn timing(s: &mut Session, p: &Value) -> Result<Value> {
     let fr = s.project.comp(cid).ok_or(EngineError::NoComp)?.frame_rate;
     let snap = |k: &str| f_p(p, k).map(|v| fr.snap_nearest(Tick::from_seconds_f64(v)));
     let (delta, start, inp, outp) = (snap("delta"), snap("start"), snap("in"), snap("out"));
+    // Relative trims: each layer moves its own in/out point by the same amount, so dragging an
+    // edge of several selected layers trims them all together (as in AE).
+    let (in_delta, out_delta) = (snap("inDelta"), snap("outDelta"));
     s.edit("Layer Timing", merge_p(p), |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let fd = comp.frame_duration();
+        let comp_dur = comp.duration;
         for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
             let shift = |l: &mut Layer, d: Tick| {
                 l.start_time += d;
@@ -895,6 +934,14 @@ fn timing(s: &mut Session, p: &Value) -> Result<Value> {
                     }
                     if let Some(o) = outp {
                         l.out_point = o.max(l.in_point + fd);
+                    }
+                    // Stops at the comp start/end (a point already past it doesn't jump onto
+                    // it), keeping at least one frame of layer.
+                    if let Some(d) = in_delta {
+                        l.in_point = (l.in_point + d).max(Tick::ZERO.min(l.in_point)).min(l.out_point - fd);
+                    }
+                    if let Some(d) = out_delta {
+                        l.out_point = (l.out_point + d).min(comp_dur.max(l.out_point)).max(l.in_point + fd);
                     }
                 }
             }
@@ -1538,7 +1585,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Layer Switch",
             [],
             None,
-            "{layers?, switch: video|audio|solo|lock|shy|collapse|quality|fx|frameBlend|motionBlur|adjustment|threeD|guide|preserveTransparency, value?, merge?}",
+            "{layers?, switch: video|audio|solo|lock|shy|collapse|quality|fx|frameBlend|motionBlur|adjustment|threeD|guide|preserveTransparency, value?, merge?, others? (the named layers alone: the other layers get the opposite state, or come back)}",
             has_layers,
             set_switch
         ),
@@ -1560,7 +1607,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Layer Timing",
             [],
             None,
-            "{layers?, op?: moveInToTime|moveOutToTime|trimInToTime|trimOutToTime, delta?, start?, in?, out?, merge?}",
+            "{layers?, op?: moveInToTime|moveOutToTime|trimInToTime|trimOutToTime, delta?, start?, in?, out?, inDelta?, outDelta? (seconds, per layer), merge?}",
             has_layers,
             timing
         ),

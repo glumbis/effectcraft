@@ -643,7 +643,8 @@ impl Interpretation {
             ),
         };
         it.invert_alpha = super::b_p(p, "invertAlpha");
-        it.loops = p.get("loop").and_then(Value::as_u64).map(|v| v.clamp(1, 9999) as u32);
+        // The Interpret Footage form sends numbers as floats (3.0), which `as_u64` rejects.
+        it.loops = f_p(p, "loop").filter(|x| x.is_finite()).map(|v| v.round().clamp(1.0, 9999.0) as u32);
         it.par = f_p(p, "pixelAspect").filter(|x| *x > 0.0);
         it.fields = match str_p(p, "fields") {
             Some(f) => Some(effectcraft_project::FieldOrder::parse(f).ok_or_else(|| bad(cmd, "fields: off|upper|lower"))?),
