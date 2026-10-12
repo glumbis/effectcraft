@@ -127,16 +127,21 @@ fn footage_context_menu_interprets_the_footage() {
         }
         h.run_steps(2);
     };
+    // The menu's Interpret Footage entry, not the panel's footer button of the same name.
+    let menu_entry = |h: &Harness<'_, EffectcraftApp>| {
+        let footer = center(h, "project.interpret");
+        h.query_all_by_label_contains("Interpret Footage").find(|n| !n.rect().contains(footer)).map(|n| n.rect())
+    };
     let at = center(&h, &format!("project.item.{}.name", solid.0));
     right_click(&mut h, at);
     assert_eq!(h.state().session.state.project_selection, vec![solid]);
-    assert!(h.query_by_label_contains("Interpret Footage").is_none(), "a solid isn't footage");
+    assert!(menu_entry(&h).is_none(), "a solid isn't footage");
     h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
     h.run_steps(2);
     let at = center(&h, &format!("project.item.{}.name", clip.0));
     right_click(&mut h, at);
     assert_eq!(h.state().session.state.project_selection, vec![clip], "right-click selects the item");
-    let sub = h.query_by_label_contains("Interpret Footage").expect("Interpret Footage in the menu").rect();
+    let sub = menu_entry(&h).expect("Interpret Footage in the menu");
     h.input_mut().events.push(Event::PointerMoved(sub.center()));
     h.run_steps(3);
     let main = h.query_by_label_contains("Main...").expect("Interpret Footage ▸ Main...").rect();
@@ -146,6 +151,32 @@ fn footage_context_menu_interprets_the_footage() {
     }
     click_at(&mut h, main.center());
     assert_eq!(h.state().dialog, Some(Dialog::Form), "the Interpret Footage dialog opened");
+}
+
+/// #360: the row menu's New Comp from Selection works on the whole selection, as File ▸ New
+/// Comp from Selection does: with several items selected it asks how in After Effects' New
+/// Composition from Selection dialog, and Multiple Compositions makes one per item.
+#[test]
+fn context_menu_new_comp_from_selection_uses_the_selection() {
+    let (mut h, _, comp, solid) = harness();
+    h.state_mut().session.state.project_selection = vec![comp, solid];
+    h.run_steps(2);
+    let at = center(&h, &format!("project.item.{}.name", solid.0));
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.step();
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE });
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(h.state().session.state.project_selection, vec![comp, solid], "the selection stays");
+    let item = h.query_by_label_contains("New Comp from Selection").expect("in the menu").rect();
+    click_at(&mut h, item.center());
+    assert_eq!(h.state().dialog, Some(Dialog::Form));
+    assert!(h.state().auto.find("form.field.single").is_some(), "the New Composition from Selection dialog");
+    let comps = h.state().session.project.comps().count();
+    h.state_mut().session.execute_checked("file.newCompFromSelection", json!({"single": false})).unwrap();
+    assert_eq!(h.state().session.project.comps().count(), comps + 2, "one per item");
 }
 
 /// Dragging from the Project panel's empty area draws a selection box that selects the rows it

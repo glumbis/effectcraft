@@ -37,6 +37,11 @@ pub enum ParamUi {
     Mask,
     Path,
     Text,
+    /// A file path (a string value) chosen with a "Choose…" button, offering files with these
+    /// extensions: Apply Color LUT's LUT, an OCIO config.
+    File {
+        filters: Vec<String>,
+    },
     Gradient,
     /// Not shown in Effect Controls / the timeline (internal data).
     Hidden,

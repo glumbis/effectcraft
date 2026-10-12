@@ -212,7 +212,7 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                 ui.label(tr("Width:"));
                 ui.horizontal(|ui| {
                     let (ow, oh) = (d.width, d.height);
-                    let r = ui.add(egui::DragValue::new(&mut d.width).range(4..=30000).suffix(" px"));
+                    let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.width).range(4..=30000).suffix(" px")));
                     auto.add("dialog.comp.width", r.rect, "Width");
                     let lbl = format!("Lock Aspect Ratio to {}", aspect_label(ow as f64, oh as f64));
                     let r = ui.checkbox(&mut d.lock_aspect, lbl);
@@ -224,7 +224,7 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                 ui.end_row();
                 ui.label(tr("Height:"));
                 let (ow, oh) = (d.width, d.height);
-                let r = ui.add(egui::DragValue::new(&mut d.height).range(4..=30000).suffix(" px"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.height).range(4..=30000).suffix(" px")));
                 auto.add("dialog.comp.height", r.rect, "Height");
                 if d.lock_aspect && oh != d.height && oh > 0 {
                     d.width = ((d.height as f64) * ow as f64 / oh as f64).round().max(4.0) as u32;
@@ -254,7 +254,7 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                 ui.label(tr("Frame Rate:"));
                 ui.horizontal(|ui| {
                     // Any rate can be typed; the list holds the common ones.
-                    let r = ui.add(egui::DragValue::new(&mut d.fps).range(1.0..=999.0).speed(0.01).max_decimals(3));
+                    let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.fps).range(1.0..=999.0).speed(0.01).max_decimals(3)));
                     auto.add("dialog.comp.frameRate", r.rect, "Frame Rate");
                     let r = egui::ComboBox::from_id_salt("comp-fps").width(18.0).selected_text("").show_ui(ui, |ui| {
                         for f in FRAME_RATES {
@@ -320,19 +320,19 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                 ui.label(egui::RichText::new(tr("Motion Blur")).strong());
                 ui.end_row();
                 ui.label(tr("Shutter Angle:"));
-                let r = ui.add(egui::DragValue::new(&mut d.shutter_angle).range(0.0..=720.0).suffix("°"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.shutter_angle).range(0.0..=720.0).suffix("°")));
                 auto.add("dialog.comp.shutterAngle", r.rect, "Shutter Angle");
                 ui.end_row();
                 ui.label(tr("Shutter Phase:"));
-                let r = ui.add(egui::DragValue::new(&mut d.shutter_phase).range(-360.0..=360.0).suffix("°"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.shutter_phase).range(-360.0..=360.0).suffix("°")));
                 auto.add("dialog.comp.shutterPhase", r.rect, "Shutter Phase");
                 ui.end_row();
                 ui.label(tr("Samples Per Frame:"));
-                let r = ui.add(egui::DragValue::new(&mut d.samples).range(2..=64));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.samples).range(2..=64)));
                 auto.add("dialog.comp.samples", r.rect, "Samples Per Frame");
                 ui.end_row();
                 ui.label(tr("Adaptive Sample Limit:"));
-                let r = ui.add(egui::DragValue::new(&mut d.adaptive_limit).range(16..=256));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.adaptive_limit).range(16..=256)));
                 auto.add("dialog.comp.adaptiveLimit", r.rect, "Adaptive Sample Limit");
                 ui.end_row();
             });
@@ -340,11 +340,13 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
         Tab::Renderer => {
             ui.horizontal(|ui| {
                 ui.label(tr("Renderer:"));
-                let r =
-                    egui::ComboBox::from_id_salt("comp-renderer").selected_text(if d.advanced_3d { "Advanced 3D" } else { "Classic 3D" }).show_ui(ui, |ui| {
+                let r = egui::ComboBox::from_id_salt("comp-renderer").selected_text(tr(if d.advanced_3d { "Advanced 3D" } else { "Classic 3D" })).show_ui(
+                    ui,
+                    |ui| {
                         ui.selectable_value(&mut d.advanced_3d, false, tr("Classic 3D"));
                         ui.selectable_value(&mut d.advanced_3d, true, tr("Advanced 3D"));
-                    });
+                    },
+                );
                 auto.add("dialog.comp.renderer", r.response.rect, "Renderer");
             });
         }

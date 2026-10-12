@@ -553,6 +553,7 @@ File
     Find Missing Effects | file.findMissing {"what":"effects"}
     Find Missing Fonts | file.findMissing {"what":"fonts"}
     Find Missing Footage | file.findMissing {"what":"footage"}
+    Relink Missing Footage... | file.relinkFootage
   Watch Folder... | file.watchFolder
   ---
   Scripts
@@ -692,6 +693,7 @@ Composition
     File... | comp.saveFrameAs
     Photoshop Layers... | comp.saveFrameAsPsd
     ProEXR... | comp.saveFrameAsExr
+  Copy Frame to Clipboard | comp.copyFrame
   Pre-render... | render.preRender
   Save Current Preview... | render.saveCurrentPreview
   ---
@@ -1020,6 +1022,14 @@ Animation
       Brightness | layer.addTextAnimator {"properties":["strokeBrightness"]}
       Opacity | layer.addTextAnimator {"properties":["strokeOpacity"]}
     Stroke Width | layer.addTextAnimator {"properties":["strokeWidth"]}
+    Front
+      Color | layer.addTextAnimator {"properties":["frontColor"]}
+    Bevel
+      Color | layer.addTextAnimator {"properties":["bevelColor"]}
+    Side
+      Color | layer.addTextAnimator {"properties":["sideColor"]}
+    Back
+      Color | layer.addTextAnimator {"properties":["backColor"]}
     ---
     Tracking | layer.addTextAnimator {"properties":["tracking"]}
     Line Anchor | layer.addTextAnimator {"properties":["lineAnchor"]}

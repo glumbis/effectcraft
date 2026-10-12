@@ -186,6 +186,16 @@ fn scopes_read_the_comp_frame() {
 // ---------------------------------------------------------------- Footage panel
 
 #[test]
+fn footage_panel_overlay_keeps_full_length_past_the_comp_end() {
+    let (mut s, cid, _clip, item) = setup(32, 24, 8.0, |_| Image::filled(32, 24, [0.5, 0.5, 0.5, 1.0]));
+    s.execute("footage.open", json!({"item": item.0})).unwrap();
+    let r = s.execute("footage.overlayEdit", json!({"item": item.0, "in": 0.0, "out": 4.0, "at": 6.0})).unwrap();
+    let ov = LayerId(r["layer"].as_u64().unwrap());
+    let l = s.project.comp(cid).unwrap().layer(ov).unwrap();
+    assert_eq!((l.in_point.seconds(), l.out_point.seconds()), (6.0, 10.0));
+}
+
+#[test]
 fn footage_panel_overlay_and_ripple_insert() {
     let (mut s, cid, clip, item) = setup(32, 24, 8.0, |_| Image::filled(32, 24, [0.5, 0.5, 0.5, 1.0]));
     s.execute("footage.open", json!({"item": item.0})).unwrap();

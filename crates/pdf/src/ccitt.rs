@@ -493,10 +493,16 @@ fn pack(changes: &[usize], columns: usize, black_is_1: bool, out: &mut Vec<u8>) 
 }
 
 /// Decode CCITT fax data. Damaged data ends the image at the last good row (rows already
-/// decoded are kept); `None` only when no row decodes.
-pub fn decode(data: &[u8], p: &Params) -> Option<Vec<u8>> {
+/// decoded are kept); `None` when no row decodes or the output would exceed `max`.
+pub fn decode(data: &[u8], p: &Params, max: usize) -> Option<Vec<u8>> {
     let columns = p.columns.clamp(1, 1 << 16);
     let max_rows = if p.rows > 0 { p.rows.min(1 << 20) } else { 1 << 20 };
+    let row_bytes = columns.checked_add(7)? / 8;
+    // With `/Rows` the image is padded to that many rows (below), so its size is known up front.
+    let padded_len = if p.rows > 0 { max_rows.checked_mul(row_bytes)? } else { 0 };
+    if row_bytes > max || padded_len > max {
+        return None;
+    }
     let mut r = Reader { data, bit: 0 };
     let mut out = vec![];
     let mut refl: Vec<usize> = vec![];
@@ -530,14 +536,17 @@ pub fn decode(data: &[u8], p: &Params) -> Option<Vec<u8>> {
             if two_d { row_2d(&mut r, &refl, columns).ok() } else { row_1d(&mut r, columns) }
         };
         let Some(line) = line else { break };
+        // Unknown row counts are bounded as rows arrive, without returning a prefix.
+        if out.len().checked_add(row_bytes)? > max {
+            return None;
+        }
         pack(&line, columns, p.black_is_1, &mut out);
         refl = line;
         rows += 1;
     }
     // Rows missing from damaged or short data stay white.
     if p.rows > 0 && rows > 0 && rows < p.rows {
-        let row_bytes = columns.div_ceil(8);
-        out.resize(p.rows.min(1 << 20) * row_bytes, if p.black_is_1 { 0 } else { 0xFF });
+        out.resize(padded_len, if p.black_is_1 { 0 } else { 0xFF });
     }
     (rows > 0).then_some(out)
 }
@@ -726,14 +735,14 @@ pub(crate) mod tests {
             for k in [-1, 0, 1, 3] {
                 let data = encode(&img, k);
                 let p = Params { k, columns: cols, rows, ..Params::default() };
-                let out = decode(&data, &p).unwrap_or_else(|| panic!("{cols}×{rows} K {k}: no rows"));
+                let out = decode(&data, &p, 1 << 20).unwrap_or_else(|| panic!("{cols}×{rows} K {k}: no rows"));
                 assert_eq!(unpack(&out, cols, rows), img, "{cols}×{rows} K {k}");
                 // Rows unknown: stop at the end of the data / EOFB.
-                let out = decode(&data, &Params { rows: 0, ..p.clone() }).unwrap();
+                let out = decode(&data, &Params { rows: 0, ..p.clone() }, 1 << 20).unwrap();
                 assert_eq!(unpack(&out, cols, rows), img, "{cols}×{rows} K {k}, no /Rows");
                 // BlackIs1 inverts.
-                let inv = decode(&data, &Params { black_is_1: true, ..p }).unwrap();
-                assert!(inv.iter().zip(&decode(&data, &Params { k, columns: cols, rows, ..Params::default() }).unwrap()).all(|(a, b)| a ^ b == 0xFF));
+                let inv = decode(&data, &Params { black_is_1: true, ..p }, 1 << 20).unwrap();
+                assert!(inv.iter().zip(&decode(&data, &Params { k, columns: cols, rows, ..Params::default() }, 1 << 20).unwrap()).all(|(a, b)| a ^ b == 0xFF));
             }
         }
     }
@@ -769,9 +778,9 @@ pub(crate) mod tests {
         ];
         for (i, (k, data)) in cases.iter().enumerate() {
             let p = Params { k: *k, columns: 61, rows: 23, black_is_1: true, end_of_line: *k >= 0, ..Params::default() };
-            let out = decode(&hex(data), &p).unwrap();
+            let out = decode(&hex(data), &p, 1 << 20).unwrap();
             assert_eq!(out, raw, "case {i} (K {k})");
-            let out = decode(&hex(data), &Params { rows: 0, ..p }).unwrap();
+            let out = decode(&hex(data), &Params { rows: 0, ..p }, 1 << 20).unwrap();
             assert_eq!(out, raw, "case {i} (K {k}), no /Rows");
         }
     }
@@ -781,7 +790,7 @@ pub(crate) mod tests {
         let img = pattern(64, 20, 9);
         let data = encode(&img, -1);
         for cut in [0, 1, data.len() / 3, data.len() - 3] {
-            let out = decode(&data[..cut], &Params { k: -1, columns: 64, rows: 20, ..Params::default() });
+            let out = decode(&data[..cut], &Params { k: -1, columns: 64, rows: 20, ..Params::default() }, 1 << 20);
             if let Some(out) = out {
                 assert_eq!(out.len(), 20 * 8);
             }
@@ -791,8 +800,8 @@ pub(crate) mod tests {
             *b ^= (i * 37) as u8;
         }
         for k in [-1, 0, 2] {
-            let _ = decode(&garbage, &Params { k, columns: 64, rows: 20, ..Params::default() });
-            let _ = decode(&garbage, &Params { k, columns: 1, rows: 0, ..Params::default() });
+            let _ = decode(&garbage, &Params { k, columns: 64, rows: 20, ..Params::default() }, 1 << 20);
+            let _ = decode(&garbage, &Params { k, columns: 1, rows: 0, ..Params::default() }, 1 << 20);
         }
     }
 }

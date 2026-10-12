@@ -215,8 +215,22 @@ pub fn viewer_hook(
         return;
     }
     // Interaction over the image.
-    let resp = ui.interact(map.area, egui::Id::new("viewer-camera-tracker"), Sense::click_and_drag());
+    // While Space (Hand tool) is held the overlay only hovers, so the viewer underneath gets the pan drag.
+    let sense = if super::space_hand(&ctx) { Sense::hover() } else { Sense::click_and_drag() };
+    let resp = ui.interact(map.area, egui::Id::new("viewer-camera-tracker"), sense);
     app.auto.add("viewer.cameraTracker", map.area, "3D Camera Tracker points");
+    // The overlay is on top of the viewer, so a middle-button drag lands here: pan the viewer like the Hand tool.
+    if resp.dragged_by(egui::PointerButton::Middle) {
+        let pid = egui::Id::new("viewer-camera-tracker-pan");
+        if resp.drag_started() {
+            let start_pan = app.ui.viewer.pan;
+            ui.data_mut(|d| d.insert_temp(pid, start_pan));
+        }
+        if let (Some(start_pan), Some(d)) = (ui.data(|m| m.get_temp::<[f32; 2]>(pid)), resp.total_drag_delta()) {
+            app.ui.viewer.pan = [start_pan[0] + d.x, start_pan[1] + d.y];
+        }
+        return;
+    }
     for (id, sp, r) in hits.iter().take(400) {
         app.auto.add(&format!("viewer.cameraTracker.point.{id}"), Rect::from_center_size(*sp, vec2(r * 2.0 + 4.0, r * 2.0 + 4.0)), "track point");
     }
@@ -282,7 +296,7 @@ pub fn viewer_hook(
         ui.data_mut(|d| d.insert_temp(cid, pts));
     }
     let base = json!({"layer": a.layer.0, "effect": a.uid});
-    resp.context_menu(|ui| {
+    crate::widgets::context_menu(&resp, |ui| {
         let pts: Vec<u32> = ui.data(|d| d.get_temp(cid)).unwrap_or_default();
         let with = |kind: Option<&str>, multiple: bool| {
             let mut q = base.clone();

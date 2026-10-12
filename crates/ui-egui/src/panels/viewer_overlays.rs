@@ -98,7 +98,9 @@ pub(crate) fn path_of(ectx: &EvalCtx, layer: LayerId, uid: u64) -> Option<PathIn
     Some(PathInfo { layer, uid, m, sp, is_mask, feather: Vec::new() })
 }
 
-fn flatten(sp: &ShapePath, m: &Mat3, map: &ViewerMap) -> Vec<Pos2> {
+/// The path on screen: `sp` through `m` and the viewer map, flattened, with the closing point
+/// repeated for a closed path.
+pub(crate) fn flatten(sp: &ShapePath, m: &Mat3, map: &ViewerMap) -> Vec<Pos2> {
     let k = effectcraft_engine::render::kurbo_path(sp);
     let mut pts: Vec<Pos2> = vec![];
     kurbo::flatten(k.iter(), 0.5, |el| match el {
@@ -246,6 +248,32 @@ pub(crate) struct KeyHit {
     pub p2c: Mat3,
 }
 
+/// A frame on a motion path (one of its dots): where the Pen and Add Vertex tools add a
+/// keyframe.
+#[derive(Clone, Copy)]
+pub(crate) struct PathFrame {
+    pub layer: LayerId,
+    pub prop: u64,
+    /// Layer time of the frame.
+    pub time: Tick,
+    pub pos: Pos2,
+}
+
+/// The keyframe dot on a motion path under `pos`.
+pub(crate) fn motion_key_at(hits: &[KeyHit], pos: Pos2) -> Option<KeyHit> {
+    hits.iter().rev().find(|h| h.tangent.is_none() && h.pos.distance(pos) < 6.0).copied()
+}
+
+/// The motion-path frame nearest `pos` (within a few points) where a keyframe can be added: not
+/// on a keyframe dot already there.
+pub(crate) fn motion_frame_at(frames: &[PathFrame], hits: &[KeyHit], pos: Pos2) -> Option<PathFrame> {
+    if motion_key_at(hits, pos).is_some() {
+        return None;
+    }
+    let near = frames.iter().filter(|f| f.pos.distance(pos) < 5.0).min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos)))?;
+    (!hits.iter().any(|h| h.tangent.is_none() && h.layer == near.layer && h.prop == near.prop && h.time == near.time)).then_some(*near)
+}
+
 /// Parent space → comp matrix of a 2D layer at the context time.
 pub(crate) fn parent_to_comp(ectx: &EvalCtx, l: &Layer) -> Mat3 {
     match l.parent.and_then(|p| ectx.comp.layer(p)) {
@@ -259,7 +287,17 @@ pub(crate) fn parent_to_comp(ectx: &EvalCtx, l: &Layer) -> Mat3 {
 
 /// Draw the position motion path of a selected 2D layer: frame dots along the path, keyframe
 /// squares (filled when selected) and spatial Bezier tangent handles. Works through parents.
-pub(crate) fn motion_path(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap, ectx: &EvalCtx, l: &Layer, col: Color32, hits: &mut Vec<KeyHit>) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn motion_path(
+    app: &mut EffectcraftApp,
+    painter: &egui::Painter,
+    map: &ViewerMap,
+    ectx: &EvalCtx,
+    l: &Layer,
+    col: Color32,
+    hits: &mut Vec<KeyHit>,
+    frames: &mut Vec<PathFrame>,
+) {
     let Some(pos) = l.transform().and_then(|tr| tr.get("position")) else { return };
     if pos.keys.len() < 2 || l.is_3d() {
         return;
@@ -276,7 +314,9 @@ pub(crate) fn motion_path(app: &mut EffectcraftApp, painter: &egui::Painter, map
     let mut pts = vec![];
     let mut lt = lt0;
     while lt <= lt1 && pts.len() < 20_000 {
-        pts.push(to_scr(pos.value_at(lt).as_vec3()));
+        let q = to_scr(pos.value_at(lt).as_vec3());
+        frames.push(PathFrame { layer: l.id, prop: pos.uid, time: lt, pos: q });
+        pts.push(q);
         lt += fd;
     }
     pts.push(to_scr(pos.value_at(lt1).as_vec3()));

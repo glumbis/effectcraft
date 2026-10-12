@@ -26,7 +26,7 @@ dialog shows the run it found (and any missing frames) with these options:
 
 | Option | What it does |
 |---|---|
-| **PNG Sequence** (EXR, TIFF, JPG… after the file type) | On: the whole run imports as one sequence. Off: just the picked file imports, as a still. |
+| **PNG Sequence** (EXR, TIFF, JPG… after the file type) | On: the whole run imports as one sequence. Off (the default, as in After Effects): the picked files import as stills. |
 | **Force alphabetical order** | Imports every image of that type in the folder in name order, whatever the numbering, and plays the files one after another (gaps in the numbering don't count). Use it for files that aren't numbered consistently. |
 | **Frame rate (fps)** | The sequence's frame rate. The default comes from Settings ▸ Import ▸ Sequence Footage (30 fps). |
 
@@ -34,10 +34,14 @@ Other ways in:
 
 - **Pick part of a run** (Shift-click the first and the last frame in the file dialog) to import
   just that range as one sequence.
-- **Pick or drop every frame** of the run: it arrives as one sequence, not one item per frame.
+- **Pick every frame** of the run with the Sequence option on: it arrives as one sequence, not
+  one item per frame.
 - **Drop a folder**: its media files import, and each numbered run in it becomes a sequence.
-- **In the browser** (the web app) there are no folders to look in, so pick or drop all the
-  frames of the sequence at once.
+  Alt-drag the folder to import its files one by one.
+- **Dropped files** import as stills, one item each, as in After Effects; drop the folder (or use
+  File ▸ Import ▸ File… with the Sequence option) for a sequence.
+- **In the browser** (the web app) there are no folders to look in, so pick all the frames of
+  the sequence at once with the Sequence option on.
 
 Stills of any format EffectCraft reads can form a sequence: PNG, JPEG, TIFF, OpenEXR, BMP and
 WebP. Layered and vector documents (PSD, SVG, PDF) import one by one.
@@ -48,8 +52,11 @@ Effects does, so every other frame stays at its number. Render or copy the missi
 folder and choose File ▸ Reload Footage to fill the gaps.
 
 Agents: `file.import {"paths": ["/shots/shot_0001.png"], "sequence": true, "frameRate": 24}`.
-`sequence` is on by default; `"sequence": false` imports the file as a still, and
-`"alphabetical": true` is Force Alphabetical Order.
+Without `sequence`, a numbered file brings its whole run and a folder's numbered runs import as
+sequences, except dropped files (`"drag": true`), which import as stills as in After Effects.
+`"sequence": true` is the Sequence option (one file brings its whole run), `"sequence": false`
+imports stills and a folder's files one by one, and `"alphabetical": true` is Force Alphabetical
+Order.
 
 ## Interpret Footage
 
@@ -93,3 +100,22 @@ vectors, positions and IDs are never the picture. EXtractoR reads every other la
   "sequence": false}` for one frame).
 - **File ▸ Reload Footage** (Ctrl+Alt+L) reads the files again. A sequence picks up frames
   added to its folder (a render still in progress) and keeps its interpretation.
+
+**File ▸ Dependencies ▸ Relink Missing Footage…** searches a chosen folder and its subfolders
+for missing source files on the desktop. It relinks unique exact filenames whose decoded type,
+dimensions, codec and audio/video flags agree with the saved footage (movies and audio also
+require matching native frame rate and frame count). The Progress panel reports completion;
+the result includes each candidate's high or low confidence and reason. Confidence is a metadata
+heuristic, not proof of identical contents. Duplicate filenames remain unresolved even if only
+one decodes successfully; use Replace Footage to choose them manually.
+
+Relinking preserves item names, interpretation, layer timing and the saved sequence range, and
+the entire operation is one undo step. Sequences require every saved frame in the new folder;
+extra frames do not extend the range. Existing files are untouched. Layer-specific/page-specific
+footage, models and embedded data are left unresolved. Symlinks are skipped, unreadable folders
+fail the search without edits, and searches are limited to 100,000 entries. Browser folder
+relinking is unavailable.
+
+Agents: `file.relinkFootage {"folder": "/moved/shots", "dryRun": true, "wait": true}` returns
+a report without edits. Omit `dryRun` to apply unique high-confidence matches. Without `wait`,
+the command returns a cancellable job; `jobs.wait` / `jobs.list` expose its report.

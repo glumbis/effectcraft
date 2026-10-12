@@ -8,6 +8,7 @@
 
 pub mod build;
 pub mod essential;
+pub mod limits;
 pub mod props;
 pub mod render_queue;
 pub mod render_templates;
@@ -219,6 +220,23 @@ pub struct ProjectSettings {
     /// sRGB; Rec. 2100 PQ / HLG give HDR output.
     #[serde(default)]
     pub output_space: Option<ColorSpace>,
+    /// Working Gamma, 2.2 or 2.4 (`app.project.workingGamma`): with no working space, the curve
+    /// Interpret As Linear Light footage is encoded with and Blend Colors Using 1.0 Gamma
+    /// linearizes with: the sRGB curve at 2.2, a pure 2.4 power curve at 2.4. Ignored with a
+    /// working space (as in After Effects).
+    #[serde(default = "gamma_22")]
+    pub working_gamma: f64,
+}
+
+fn gamma_22() -> f64 {
+    2.2
+}
+
+impl ProjectSettings {
+    /// Working Gamma is 2.4 (anything else reads as 2.2).
+    pub fn working_gamma_24(&self) -> bool {
+        (self.working_gamma - 2.4).abs() < 0.05
+    }
 }
 
 impl Default for ProjectSettings {
@@ -236,6 +254,7 @@ impl Default for ProjectSettings {
             color_engine: ColorEngine::Adobe,
             hdr: HdrMode::Clip,
             output_space: None,
+            working_gamma: 2.2,
         }
     }
 }
@@ -1228,7 +1247,9 @@ impl Project {
             _ => None,
         }
     }
-    pub fn add_item(&mut self, name: &str, label: Label, parent: Option<ItemId>, kind: ItemKind) -> ItemId {
+    /// Adds an item; its size, frame rate and the like are brought within [`limits`] first.
+    pub fn add_item(&mut self, name: &str, label: Label, parent: Option<ItemId>, mut kind: ItemKind) -> ItemId {
+        limits::repair_kind(name, &mut kind, &mut vec![]);
         let id = ItemId(self.alloc());
         self.items.insert(id, Item { id, name: name.into(), label, comment: String::new(), parent, kind, proxy: None });
         id
@@ -1318,12 +1339,22 @@ impl Project {
         serde_json::to_string(self).unwrap_or_default()
     }
     pub fn from_json(s: &str) -> Result<Project, ProjectError> {
+        Project::from_json_repaired(s).map(|(p, _)| p)
+    }
+    /// [`Project::from_json`], also returning one line per value that was out of [`limits`] and
+    /// was corrected (a composition of a billion pixels, a zero frame rate…), so a corrupt or
+    /// hostile file still opens, within bounds, and the user can be told what changed.
+    pub fn from_json_repaired(s: &str) -> Result<(Project, Vec<String>), ProjectError> {
         let mut p: Project = serde_json::from_str(s).map_err(|e| ProjectError::Invalid(e.to_string()))?;
         if p.schema > SCHEMA_VERSION {
             return Err(ProjectError::Invalid(format!("project schema {} is newer than this version supports ({SCHEMA_VERSION})", p.schema)));
         }
         p.fix_next_id();
-        Ok(p)
+        let mut notes = vec![];
+        for item in p.items.values_mut() {
+            limits::repair_item(item, &mut notes);
+        }
+        Ok((p, notes))
     }
 }
 

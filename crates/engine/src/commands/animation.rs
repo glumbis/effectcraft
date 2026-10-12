@@ -312,6 +312,18 @@ fn reveal(s: &mut Session, p: &Value) -> Result<Value> {
         let (w, h) = effectcraft_render::source_size(&s.project, l);
         let anchor = [w as f64 / 2.0, h as f64 / 2.0];
         let center = [comp.width as f64 / 2.0, comp.height as f64 / 2.0];
+        // Properties at the top of the layer's tree (Time Remap): enabled time remapping is a
+        // modification in itself.
+        for pr in l.props.props() {
+            let hit = match kind.as_str() {
+                "keyframes" => pr.is_animated(),
+                "animation" => pr.is_animated() || pr.has_expression(),
+                _ => pr.match_id == "timeRemap" || modified(pr, "", anchor, center),
+            };
+            if hit {
+                out.push(json!({"layer": lid.0, "prop": pr.uid}));
+            }
+        }
         for top in l.props.groups() {
             let hit = |pr: &Property| match kind.as_str() {
                 "keyframes" => pr.is_animated(),

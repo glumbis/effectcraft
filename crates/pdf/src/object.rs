@@ -304,9 +304,29 @@ pub fn parse_num(w: &[u8]) -> Option<f64> {
 
 // ------------------------------------------------------------------ filters
 
+/// The most bytes one stream filter may decode to. Deflate expands up to about 1000:1, so
+/// unbounded, a few MB of PDF ask for gigabytes and a failed allocation aborts the process. The
+/// largest image `image::decode` accepts (64 Mi pixels) of four 16-bit components is 512 MiB;
+/// 1 GiB leaves room for more components and is PdfCraft's ceiling for one stream. 32-bit
+/// targets (the web build) get a quarter: their whole address space is 4 GiB, and the inflater's
+/// growing buffer can reserve about twice the limit.
+const MAX_INFLATED: usize = if cfg!(target_pointer_width = "32") { 256 << 20 } else { 1 << 30 };
+
+/// The tighter bound for object streams, which [`File::parse`] decodes eagerly (all of them,
+/// before any page is chosen). They hold only other objects' dictionaries, arrays, numbers and
+/// strings, so real ones are far smaller; PdfCraft uses 256 MiB for the object and
+/// cross-reference streams it decodes while loading. A quarter on 32-bit targets, as above.
+const MAX_OBJECT_STREAM: usize = if cfg!(target_pointer_width = "32") { 64 << 20 } else { 256 << 20 };
+
 /// Decode a stream's data through its `/Filter` chain. Unknown filters (images: DCT, JPX, CCITT,
 /// JBIG2) give `None`.
 pub fn decode_stream(file: &File, d: &Dict, raw: &[u8]) -> Option<Vec<u8>> {
+    decode_stream_within(file, d, raw, MAX_INFLATED)
+}
+
+/// [`decode_stream`] with every filter's output bounded by `max` bytes. Exceeding the
+/// bound gives `None`, never a truncated prefix; predictors share the same bound.
+pub fn decode_stream_within(file: &File, d: &Dict, raw: &[u8], max: usize) -> Option<Vec<u8>> {
     let filters: Vec<String> = match d.get("Filter").map(|f| file.resolve(f)) {
         None => vec![],
         Some(Obj::Name(n)) => vec![n.clone()],
@@ -321,20 +341,23 @@ pub fn decode_stream(file: &File, d: &Dict, raw: &[u8]) -> Option<Vec<u8>> {
     let mut data = raw.to_vec();
     for (i, f) in filters.iter().enumerate() {
         data = match f.as_str() {
-            "FlateDecode" | "Fl" => inflate(&data)?,
-            "ASCIIHexDecode" | "AHx" => ascii_hex(&data),
-            "ASCII85Decode" | "A85" => ascii85(&data),
+            "FlateDecode" | "Fl" => inflate(&data, max)?,
+            "ASCIIHexDecode" | "AHx" => ascii_hex(&data, max)?,
+            "ASCII85Decode" | "A85" => ascii85_within(&data, max)?,
             "LZWDecode" | "LZW" => {
-                lzw(&data, parms.get(i).and_then(|p| p.as_ref()).and_then(|p| p.get("EarlyChange")).and_then(Obj::num).unwrap_or(1.0) != 0.0)
+                lzw(&data, parms.get(i).and_then(|p| p.as_ref()).and_then(|p| p.get("EarlyChange")).and_then(Obj::num).unwrap_or(1.0) != 0.0, max)?
             }
-            "RunLengthDecode" | "RL" => run_length(&data),
-            "CCITTFaxDecode" | "CCF" => crate::ccitt::decode(&data, &ccitt_params(file, parms.get(i).and_then(|p| p.as_ref())))?,
+            "RunLengthDecode" | "RL" => run_length(&data, max)?,
+            "CCITTFaxDecode" | "CCF" => crate::ccitt::decode(&data, &ccitt_params(file, parms.get(i).and_then(|p| p.as_ref())), max)?,
             _ => return None,
         };
+        if data.len() > max {
+            return None;
+        }
         if let Some(Some(p)) = parms.get(i)
             && matches!(f.as_str(), "FlateDecode" | "Fl" | "LZWDecode" | "LZW")
         {
-            data = predict(&data, p);
+            data = predict(&data, p, max)?;
         }
     }
     Some(data)
@@ -358,25 +381,60 @@ fn ccitt_params(file: &File, d: Option<&Dict>) -> crate::ccitt::Params {
     p
 }
 
-pub fn inflate(data: &[u8]) -> Option<Vec<u8>> {
-    miniz_oxide::inflate::decompress_to_vec_zlib(data).ok().or_else(|| miniz_oxide::inflate::decompress_to_vec(data).ok()).or_else(|| {
-        // Truncated streams: keep what inflates.
-        let mut d = miniz_oxide::inflate::stream::InflateState::new_boxed(miniz_oxide::DataFormat::Zlib);
-        let mut out = vec![0u8; data.len() * 8 + 1024];
-        let r = miniz_oxide::inflate::stream::inflate(&mut d, data, &mut out, miniz_oxide::MZFlush::Finish);
-        (r.bytes_written > 0).then(|| out[..r.bytes_written].to_vec())
-    })
+/// Inflate zlib data (or raw deflate) to at most `max` bytes. A stream that inflates to more is
+/// undecodable (`None`), not salvaged as a truncated one.
+pub fn inflate(data: &[u8], max: usize) -> Option<Vec<u8>> {
+    use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_with_limit, decompress_to_vec_zlib_with_limit};
+    for attempt in [decompress_to_vec_zlib_with_limit, decompress_to_vec_with_limit] {
+        match attempt(data, max) {
+            Ok(v) => return Some(v),
+            Err(e) if e.status == TINFLStatus::HasMoreOutput => return None,
+            Err(_) => {}
+        }
+    }
+    // Truncated streams: keep what inflates.
+    let mut d = miniz_oxide::inflate::stream::InflateState::new_boxed(miniz_oxide::DataFormat::Zlib);
+    let mut out = vec![0u8; salvage_len(data.len(), max)];
+    let r = miniz_oxide::inflate::stream::inflate(&mut d, data, &mut out, miniz_oxide::MZFlush::Finish);
+    (r.bytes_written > 0).then(|| out[..r.bytes_written].to_vec())
 }
 
-fn ascii_hex(data: &[u8]) -> Vec<u8> {
-    let mut hex: Vec<u8> = data.iter().copied().take_while(|c| *c != b'>').filter(u8::is_ascii_hexdigit).collect();
-    if hex.len() % 2 == 1 {
-        hex.push(b'0');
+/// The buffer [`inflate`] salvages a truncated stream of `data_len` bytes into: eight times that
+/// and 1 KiB, at most `max`. The zlib attempt already stopped within `max`, so the bound loses
+/// nothing, while without it a Flate filter after another could ask for eight times `max`.
+pub fn salvage_len(data_len: usize, max: usize) -> usize {
+    data_len.saturating_mul(8).saturating_add(1024).min(max)
+}
+
+fn ascii_hex(data: &[u8], max: usize) -> Option<Vec<u8>> {
+    let mut out = vec![];
+    let mut high = None;
+    for c in data.iter().copied().take_while(|c| *c != b'>').filter(u8::is_ascii_hexdigit) {
+        if let Some(h) = high.take() {
+            if out.len() >= max {
+                return None;
+            }
+            out.push((h << 4) | hexv(c));
+        } else {
+            high = Some(hexv(c));
+        }
     }
-    hex.chunks(2).map(|p| (hexv(p[0]) << 4) | hexv(p[1])).collect()
+    if let Some(h) = high {
+        if out.len() >= max {
+            return None;
+        }
+        out.push(h << 4);
+    }
+    Some(out)
 }
 
 pub fn ascii85(data: &[u8]) -> Vec<u8> {
+    // The PostScript reader uses this unbounded entry point. No Vec can hold more
+    // than usize::MAX bytes, so its output cannot exceed this bound.
+    ascii85_within(data, usize::MAX).unwrap_or_default()
+}
+
+fn ascii85_within(data: &[u8], max: usize) -> Option<Vec<u8>> {
     let mut out = vec![];
     let mut group = [0u32; 5];
     let mut n = 0;
@@ -389,11 +447,19 @@ pub fn ascii85(data: &[u8]) -> Vec<u8> {
         i += 1;
         match c {
             b'~' => break,
-            b'z' if n == 0 => out.extend_from_slice(&[0; 4]),
+            b'z' if n == 0 => {
+                if out.len().checked_add(4)? > max {
+                    return None;
+                }
+                out.extend_from_slice(&[0; 4]);
+            }
             b'!'..=b'u' => {
                 group[n] = (c - b'!') as u32;
                 n += 1;
                 if n == 5 {
+                    if out.len().checked_add(4)? > max {
+                        return None;
+                    }
                     let v = group.iter().fold(0u32, |a, &d| a.wrapping_mul(85).wrapping_add(d));
                     out.extend_from_slice(&v.to_be_bytes());
                     n = 0;
@@ -403,16 +469,19 @@ pub fn ascii85(data: &[u8]) -> Vec<u8> {
         }
     }
     if n > 1 {
+        if out.len().checked_add(n - 1)? > max {
+            return None;
+        }
         for g in group.iter_mut().skip(n) {
             *g = 84;
         }
         let v = group.iter().fold(0u32, |a, &d| a.wrapping_mul(85).wrapping_add(d));
         out.extend_from_slice(&v.to_be_bytes()[..n - 1]);
     }
-    out
+    Some(out)
 }
 
-fn lzw(data: &[u8], early: bool) -> Vec<u8> {
+fn lzw(data: &[u8], early: bool, max: usize) -> Option<Vec<u8>> {
     let mut out = vec![];
     let mut table: Vec<Vec<u8>> = (0..=255u16).map(|b| vec![b as u8]).collect();
     table.push(vec![]);
@@ -432,7 +501,7 @@ fn lzw(data: &[u8], early: bool) -> Vec<u8> {
                     prev = None;
                     continue;
                 }
-                257 => return out,
+                257 => return Some(out),
                 _ => {}
             }
             let entry = if code < table.len() {
@@ -442,10 +511,16 @@ fn lzw(data: &[u8], early: bool) -> Vec<u8> {
                 e.push(p[0]);
                 e
             } else {
-                return out;
+                return Some(out);
             };
+            if out.len().checked_add(entry.len())? > max {
+                return None;
+            }
             out.extend_from_slice(&entry);
-            if let Some(p) = prev {
+            // PDF codes have at most 12 bits. Freeze a full table until a clear code.
+            if let Some(p) = prev
+                && table.len() < 4096
+            {
                 let mut e = p;
                 e.push(entry[0]);
                 table.push(e);
@@ -457,43 +532,61 @@ fn lzw(data: &[u8], early: bool) -> Vec<u8> {
             }
         }
     }
-    out
+    Some(out)
 }
 
-fn run_length(data: &[u8]) -> Vec<u8> {
+fn run_length(data: &[u8], max: usize) -> Option<Vec<u8>> {
     let mut out = vec![];
     let mut i = 0;
     while i < data.len() {
         let l = data[i] as usize;
         i += 1;
         if l < 128 {
-            out.extend_from_slice(&data[i.min(data.len())..(i + l + 1).min(data.len())]);
-            i += l + 1;
+            let end = i.saturating_add(l + 1).min(data.len());
+            let literal = data.get(i..end)?;
+            if out.len().checked_add(literal.len())? > max {
+                return None;
+            }
+            out.extend_from_slice(literal);
+            i = end;
         } else if l > 128 {
             if let Some(&b) = data.get(i) {
+                if out.len().checked_add(257 - l)? > max {
+                    return None;
+                }
                 out.extend(std::iter::repeat_n(b, 257 - l));
             }
-            i += 1;
+            i = i.saturating_add(1);
         } else {
             break;
         }
     }
-    out
+    Some(out)
 }
 
 /// PNG / TIFF predictors (`/Predictor`, `/Colors`, `/BitsPerComponent`, `/Columns`).
-fn predict(data: &[u8], p: &Dict) -> Vec<u8> {
+fn predict(data: &[u8], p: &Dict, max: usize) -> Option<Vec<u8>> {
+    if data.len() > max {
+        return None;
+    }
     let g = |k: &str, d: f64| p.get(k).and_then(Obj::num).unwrap_or(d) as usize;
     let pred = g("Predictor", 1.0);
     if pred < 10 {
-        return data.to_vec();
+        return Some(data.to_vec());
     }
-    let bpp = (g("Colors", 1.0) * g("BitsPerComponent", 8.0)).div_ceil(8).max(1);
-    let row = (g("Columns", 1.0) * g("Colors", 1.0) * g("BitsPerComponent", 8.0)).div_ceil(8);
+    // A row that is zero bytes wide, overflows, or is not shorter than the data leaves no
+    // complete row: nothing comes out, as it always did for the first and last, and the row
+    // buffer (sized from `/Columns`) is not allocated.
+    let Some(pixel_bits) = g("Colors", 1.0).checked_mul(g("BitsPerComponent", 8.0)) else { return Some(vec![]) };
+    let Some(bpp) = pixel_bits.checked_add(7).map(|n| (n / 8).max(1)) else { return Some(vec![]) };
+    let Some(row) = g("Columns", 1.0).checked_mul(pixel_bits).and_then(|n| n.checked_add(7)).map(|n| n / 8).filter(|&n| n > 0 && n < data.len()) else {
+        return Some(vec![]);
+    };
+    let stride = row.checked_add(1)?;
     let mut out = Vec::with_capacity(data.len());
     let mut prev = vec![0u8; row];
-    for chunk in data.chunks(row + 1) {
-        if chunk.len() < row + 1 {
+    for chunk in data.chunks(stride) {
+        if chunk.len() < stride {
             break;
         }
         let ft = chunk[0];
@@ -524,7 +617,7 @@ fn predict(data: &[u8], p: &Dict) -> Vec<u8> {
         out.extend_from_slice(&cur);
         prev = cur;
     }
-    out
+    Some(out)
 }
 
 // ------------------------------------------------------------------ the file
@@ -655,7 +748,7 @@ impl File {
             })
             .collect();
         for (d, raw) in streams {
-            let Some(dec) = decode_stream(&f, &d, &raw) else { continue };
+            let Some(dec) = decode_stream_within(&f, &d, &raw, MAX_OBJECT_STREAM) else { continue };
             let n = d.get("N").and_then(Obj::num).unwrap_or(0.0) as usize;
             let first = d.get("First").and_then(Obj::num).unwrap_or(0.0) as usize;
             let mut lx = Lexer::new(&dec, 0);

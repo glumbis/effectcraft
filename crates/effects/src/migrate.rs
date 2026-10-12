@@ -236,6 +236,9 @@ fn refresh(pr: &mut Property, ps: &ParamSpec, spec: &EffectSpec) {
         }
         // A parameter that became internal (superseded by a new one) is hidden.
         (_, ParamUi::Hidden) => pr.ui = ParamUi::Hidden,
+        // A path typed as text, or set only by commands, that got a Choose… button (Apply Color
+        // LUT's LUT, the OCIO files, #514).
+        (ParamUi::Hidden | ParamUi::Text, ParamUi::File { .. }) => pr.ui = ps.ui.clone(),
         // Same kind of value: take the spec's hints (units, ranges).
         (a, b) if std::mem::discriminant(a) == std::mem::discriminant(b) || is_numeric_ui(a) && is_numeric_ui(b) => pr.ui = ps.ui.clone(),
         _ => {}
@@ -492,6 +495,23 @@ mod tests {
         assert_eq!(pr.name, popup.name);
         assert_eq!(pr.value, Value::Enum(options.len() as u32 - 1));
         assert_eq!(pr.ui, popup.ui);
+    }
+
+    /// #514: Apply Color LUT's LUT was hidden (set only by commands) and the OCIO files were
+    /// plain text; old projects get the Choose… file parameter, keeping the path.
+    #[test]
+    fn hidden_and_text_paths_become_file_parameters() {
+        for (fx, pid, old) in [("ec.utility.applylut", "lut", ParamUi::Hidden), ("ec.color.ociofile", "file", ParamUi::Text)] {
+            let mut next = 1;
+            let (spec, mut g) = instance(fx, &mut next);
+            let pr = g.get_mut(pid).unwrap();
+            pr.ui = old;
+            pr.value = Value::Str("/luts/look.cube".into());
+            assert!(upgrade_instance(spec, &mut g, &mut Ids(&mut next), [100.0, 100.0]), "{fx}");
+            let pr = g.get(pid).unwrap();
+            assert!(matches!(&pr.ui, ParamUi::File { filters } if filters.iter().any(|f| f == "cube")), "{fx}: {:?}", pr.ui);
+            assert_eq!(pr.value, Value::Str("/luts/look.cube".into()));
+        }
     }
 
     #[test]

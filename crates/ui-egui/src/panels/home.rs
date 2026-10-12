@@ -15,6 +15,7 @@ use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde::Serialize;
 use serde_json::json;
 
+use crate::i18n::{tr, tr_args};
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -87,13 +88,13 @@ pub fn format_utc(secs: i64) -> String {
 /// date after a week).
 pub fn format_ago(now: i64, then: i64) -> String {
     let d = now.saturating_sub(then);
-    let plural = |n: i64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    let plural = |n: i64, one: &str, many: &str| tr_args(if n == 1 { one } else { many }, &[&n]);
     match d {
-        i64::MIN..60 => "Just now".to_string(),
-        60..3_600 => plural(d / 60, "minute"),
-        3_600..86_400 => plural(d / 3_600, "hour"),
-        86_400..172_800 => "Yesterday".to_string(),
-        172_800..604_800 => plural(d / 86_400, "day"),
+        i64::MIN..60 => tr("Just now").to_string(),
+        60..3_600 => plural(d / 60, "{} minute ago", "{} minutes ago"),
+        3_600..86_400 => plural(d / 3_600, "{} hour ago", "{} hours ago"),
+        86_400..172_800 => tr("Yesterday").to_string(),
+        172_800..604_800 => plural(d / 86_400, "{} day ago", "{} days ago"),
         _ => format_utc(then).get(..10).unwrap_or_default().to_string(),
     }
 }
@@ -112,14 +113,14 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// The Kind column: what a recent file is, by its extension.
+/// The Kind column: what a recent file is, by its extension, in the interface language.
 fn kind_of(path: &str) -> &'static str {
-    match std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+    tr(match std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("ecproj") => "EffectCraft project",
         Some("aep" | "aepx") => "After Effects project",
         Some("json" | "lottie") => "Lottie animation",
         _ => "Project",
-    }
+    })
 }
 
 /// The config-store name of a project's thumbnail.
@@ -237,7 +238,7 @@ fn rail_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, rail:
     let mut y = rail.min.y + 20.0;
     for (label, id, primary) in [("New Project", "file.newProject", true), ("Open Project…", "file.open", false)] {
         let r = Rect::from_min_size(pos2(x0, y), vec2(w, 34.0));
-        if widgets::text_button(ui, r, label, primary, &t, egui::Id::new(("home", id))).clicked() {
+        if widgets::text_button(ui, r, tr(label), primary, &t, egui::Id::new(("home", id))).clicked() {
             actions.push((id, json!({})));
         }
         app.auto.add(&format!("home.{id}"), r, label);
@@ -261,7 +262,7 @@ fn rail_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, rail:
         }
         let col = if on { t.tab_text_active } else { t.text_dim };
         icons::paint(p, Rect::from_center_size(pos2(r.min.x + 20.0, r.center().y), vec2(16.0, 16.0)), icon, col);
-        p.text(pos2(r.min.x + 40.0, r.center().y), Align2::LEFT_CENTER, label, Tokens::medium(13.0), col);
+        p.text(pos2(r.min.x + 40.0, r.center().y), Align2::LEFT_CENTER, tr(label), Tokens::medium(13.0), col);
         app.auto.add(&format!("home.tab.{}", label.to_ascii_lowercase()), r, label);
         if resp.clicked() {
             app.ui.home_learn = k == 2;
@@ -281,7 +282,7 @@ fn rail_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, rail:
     let foot_h = 22.0 + links.len() as f32 * 30.0 + 22.0 + sib_rows * 26.0;
     let mut cy = (rail.max.y - 16.0 - foot_h).max(y + 16.0);
     p.line_segment([pos2(x0, cy - 10.0), pos2(x0 + w, cy - 10.0)], Stroke::new(1.0, t.separator));
-    p.text(pos2(x0, cy + 6.0), Align2::LEFT_CENTER, crate::i18n::tr("Community"), Tokens::semibold(12.0), t.text_dim);
+    p.text(pos2(x0, cy + 6.0), Align2::LEFT_CENTER, tr("Community"), Tokens::semibold(12.0), t.text_dim);
     cy += 22.0;
     for (icon, label, cmd) in links {
         let r = Rect::from_min_size(pos2(x0, cy), vec2(w, 26.0));
@@ -294,14 +295,14 @@ fn rail_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, rail:
         }
         let col = if discord { Color32::WHITE } else { t.text };
         icons::paint(p, Rect::from_center_size(pos2(r.min.x + 16.0, r.center().y), vec2(13.0, 13.0)), icon, col);
-        p.text(pos2(r.min.x + 30.0, r.center().y), Align2::LEFT_CENTER, label, Tokens::medium(12.0), col);
+        p.text(pos2(r.min.x + 30.0, r.center().y), Align2::LEFT_CENTER, tr(label), Tokens::medium(12.0), col);
         app.auto.add(&format!("home.{cmd}"), r, label);
         if resp.clicked() {
             let _ = app.session.execute(cmd, json!({}));
         }
         cy += 30.0;
     }
-    p.text(pos2(x0, cy + 8.0), Align2::LEFT_CENTER, crate::i18n::tr("More ArtCraft apps"), Tokens::ui(11.0), t.text_faint);
+    p.text(pos2(x0, cy + 8.0), Align2::LEFT_CENTER, tr("More ArtCraft apps"), Tokens::ui(11.0), t.text_faint);
     cy += 20.0;
     let sw = (w - 6.0) / 2.0;
     for (i, (name, slug)) in sib.iter().enumerate() {
@@ -328,12 +329,12 @@ fn home_page(
     let t = app.tokens;
     let (x0, w) = (area.min.x, area.width());
     let mut y = area.min.y;
-    p.text(pos2(x0, y + 14.0), Align2::LEFT_CENTER, crate::i18n::tr("Welcome to EffectCraft"), Tokens::semibold(26.0), t.tab_text_active);
+    p.text(pos2(x0, y + 14.0), Align2::LEFT_CENTER, tr("Welcome to EffectCraft"), Tokens::semibold(26.0), t.tab_text_active);
     y += 40.0;
     p.text(
         pos2(x0, y + 8.0),
         Align2::LEFT_CENTER,
-        format!("Motion graphics and visual effects · version {}", env!("CARGO_PKG_VERSION")),
+        tr_args("Motion graphics and visual effects · version {}", &[&env!("CARGO_PKG_VERSION")]),
         Tokens::ui(12.5),
         t.text_dim,
     );
@@ -355,7 +356,7 @@ fn home_page(
         let ir = Rect::from_center_size(pos2(r.min.x + 30.0, r.center().y), vec2(32.0, 32.0));
         p.rect_filled(ir, 7.0, t.accent.gamma_multiply(0.18));
         icons::paint(p, ir.shrink(8.0), icon, t.accent);
-        p.with_clip_rect(r.shrink(2.0)).text(pos2(ir.max.x + 12.0, r.center().y), Align2::LEFT_CENTER, label, Tokens::medium(12.5), t.text);
+        p.with_clip_rect(r.shrink(2.0)).text(pos2(ir.max.x + 12.0, r.center().y), Align2::LEFT_CENTER, tr(label), Tokens::medium(12.5), t.text);
         app.auto.add(&format!("home.{id}"), r, label);
         if resp.clicked() {
             if id == "templates" {
@@ -369,18 +370,18 @@ fn home_page(
     y += 64.0 + 36.0;
 
     // Recent: heading, filter, clear.
-    p.text(pos2(x0, y + 12.0), Align2::LEFT_CENTER, crate::i18n::tr("Recent"), Tokens::semibold(17.0), t.tab_text_active);
+    p.text(pos2(x0, y + 12.0), Align2::LEFT_CENTER, tr("Recent"), Tokens::semibold(17.0), t.tab_text_active);
     let entries = recent_entries(&app.session.prefs);
     let fid = egui::Id::new("home-filter");
     let mut filter: String = ctx.data(|d| d.get_temp(fid)).unwrap_or_default();
     let fr = Rect::from_min_size(pos2(x0 + w - 240.0, y), vec2(240.0, 26.0));
-    widgets::search_field(ui, fr, &mut filter, "Filter recent files", &t);
+    widgets::search_field(ui, fr, &mut filter, tr("Filter recent files"), &t);
     app.auto.add("home.filter", fr, "Filter recent files");
     ctx.data_mut(|d| d.insert_temp(fid, filter.clone()));
     if !entries.is_empty() {
         let cr = Rect::from_min_size(pos2(fr.min.x - 96.0, y + 3.0), vec2(84.0, 20.0));
         let resp = ui.interact(cr, egui::Id::new("home-clear-recent"), Sense::click());
-        p.text(cr.right_center(), Align2::RIGHT_CENTER, crate::i18n::tr("Clear list"), Tokens::ui(11.5), if resp.hovered() { t.text } else { t.text_faint });
+        p.text(cr.right_center(), Align2::RIGHT_CENTER, tr("Clear list"), Tokens::ui(11.5), if resp.hovered() { t.text } else { t.text_faint });
         app.auto.add("home.clearRecent", cr, "Clear Recent Projects");
         if resp.clicked() {
             actions.push(("file.clearRecent", json!({})));
@@ -390,7 +391,7 @@ fn home_page(
     // Column headings (Name / Opened / Size / Kind, as in After Effects).
     let (opened_x, size_x, kind_x) = (x0 + w * 0.52, x0 + w * 0.68, x0 + w * 0.80);
     for (label, x) in [("NAME", x0 + 76.0), ("OPENED", opened_x), ("SIZE", size_x), ("KIND", kind_x)] {
-        p.text(pos2(x, y), Align2::LEFT_CENTER, label, Tokens::medium(10.5), t.text_faint);
+        p.text(pos2(x, y), Align2::LEFT_CENTER, tr(label), Tokens::medium(10.5), t.text_faint);
     }
     y += 12.0;
     p.line_segment([pos2(x0, y), pos2(x0 + w, y)], Stroke::new(1.0, t.separator));
@@ -406,8 +407,8 @@ fn home_page(
         } else {
             ("No recent files match the filter", "Try another name or folder.")
         };
-        p.text(c + vec2(0.0, 40.0), Align2::CENTER_CENTER, head, Tokens::semibold(14.0), t.text);
-        p.text(c + vec2(0.0, 62.0), Align2::CENTER_CENTER, sub, Tokens::ui(12.0), t.text_faint);
+        p.text(c + vec2(0.0, 40.0), Align2::CENTER_CENTER, tr(head), Tokens::semibold(14.0), t.text);
+        p.text(c + vec2(0.0, 62.0), Align2::CENTER_CENTER, tr(sub), Tokens::ui(12.0), t.text_faint);
     }
     let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     let row_h = 48.0;
@@ -439,7 +440,7 @@ fn home_page(
             Tokens::medium(13.0),
             if e.exists { t.tab_text_active } else { t.text_dim },
         );
-        let sub = if e.exists { e.folder.clone() } else { format!("{} (missing)", e.folder) };
+        let sub = if e.exists { e.folder.clone() } else { format!("{} {}", e.folder, crate::i18n::tr("(missing)")) };
         name_clip.text(pos2(tr.max.x + 6.0, r.center().y + 9.0), Align2::LEFT_CENTER, sub, Tokens::ui(11.0), t.text_faint);
         let cell = |x: f32, x1: f32, text: String| {
             p.with_clip_rect(Rect::from_min_max(pos2(x, r.min.y), pos2(x1 - 8.0, r.max.y))).text(
@@ -532,6 +533,21 @@ mod tests {
         assert_eq!(format_ago(now, now + 100), "Just now");
         assert_eq!((format_size(900), format_size(13_000), format_size(3_500_000)), ("900 B".into(), "13 KB".into(), "3.3 MB".into()));
         assert_eq!((kind_of("/a/B.ecproj"), kind_of("c.AEP"), kind_of("x")), ("EffectCraft project", "After Effects project", "Project"));
+    }
+
+    /// The Home screen's own text goes through the interface catalog (#574): the Opened and Kind
+    /// columns read in Chinese, and English stays English.
+    #[test]
+    fn home_text_follows_the_interface_language() {
+        let now = 1_790_000_000;
+        crate::i18n::set_current("zh-hans");
+        let zh = (format_ago(now, now - 5), format_ago(now, now - 3 * 3_600), format_ago(now, now - 90_000), kind_of("/a/B.ecproj"));
+        crate::i18n::set_current("zh-hant");
+        let tw = (format_ago(now, now - 60), kind_of("x"));
+        crate::i18n::set_current("en");
+        assert_eq!(zh, ("刚刚".into(), "3 小时前".into(), "昨天".into(), "EffectCraft 项目"));
+        assert_eq!(tw, ("1 分鐘前".into(), "專案"));
+        assert_eq!(tr("Filter recent files"), "Filter recent files");
     }
 
     #[test]

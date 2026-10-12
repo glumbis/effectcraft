@@ -45,25 +45,44 @@
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © the EffectCraft authors. MIT OR Apache-2.0.</string>
 
-  <!-- Effectcraft's own format. -->
+  <!-- Projects open from Finder (double-click, Open With, Dock); src/apple_events.rs. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>EffectCraft Project</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Owner</string>
+      <key>CFBundleTypeIconFile</key>
+      <string>EffectCraft</string>
+      <key>LSItemContentTypes</key>
+      <array><string>ai.storyteller.effectcraft.document</string></array>
+    </dict>
+  </array>
+  <!-- EffectCraft's own format: the project (.ecproj) and its XML copy (.ecprojx). -->
   <key>UTExportedTypeDeclarations</key>
   <array>
     <dict>
       <key>UTTypeIdentifier</key>
       <string>ai.storyteller.effectcraft.document</string>
       <key>UTTypeDescription</key>
-      <string>EffectCraft Document</string>
+      <string>EffectCraft Project</string>
       <key>UTTypeConformsTo</key>
       <array>
         <string>public.data</string>
-        <string>public.image</string>
+        <string>public.content</string>
       </array>
       <key>UTTypeIconFile</key>
       <string>EffectCraft</string>
       <key>UTTypeTagSpecification</key>
       <dict>
         <key>public.filename-extension</key>
-        <array><string>pcraft</string></array>
+        <array>
+          <string>ecproj</string>
+          <string>ecprojx</string>
+        </array>
         <key>public.mime-type</key>
         <array><string>application/x-effectcraft</string></array>
       </dict>

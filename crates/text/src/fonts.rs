@@ -58,6 +58,8 @@ pub struct FaceInfo {
     /// be requested the way After Effects scripts name fonts.
     pub full_name: String,
     pub postscript: Option<String>,
+    /// The face has variation axes (an `fvar` table), read from the table directory at scan time.
+    pub variable: bool,
 }
 
 /// Something that can list fonts (system folders, a web font picker, a project's font folder…).
@@ -94,8 +96,15 @@ impl DirectorySource {
                 dirs.push(h.join(".fonts"));
             }
         }
+        dirs.extend(extra_dirs(std::env::var_os("EFFECTCRAFT_FONT_DIRS").as_deref()));
         Self { dirs }
     }
+}
+
+/// Extra font folders from `EFFECTCRAFT_FONT_DIRS` (a path list, `:`-separated, `;` on Windows), so a
+/// tool can hand EffectCraft its own font library without installing the fonts system-wide.
+fn extra_dirs(var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    var.map(|v| std::env::split_paths(v).filter(|p| !p.as_os_str().is_empty()).collect()).unwrap_or_default()
 }
 
 fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
@@ -119,6 +128,7 @@ impl FontSource for DirectorySource {
             walk(d, 0, &mut files);
         }
         files.sort();
+        files.dedup();
         let mut out = Vec::new();
         for f in files {
             let Ok(mut file) = std::fs::File::open(&f) else { continue };
@@ -142,6 +152,7 @@ fn info_from(n: FaceNames, data: FaceData, origin: &'static str) -> FaceInfo {
         native_family: n.native_family,
         full_name: n.full_name,
         postscript: n.postscript,
+        variable: n.variable,
     }
 }
 
@@ -393,6 +404,13 @@ pub fn all_faces() -> Vec<Arc<Face>> {
 pub fn native_families() -> std::collections::BTreeMap<String, String> {
     scan_system();
     all_faces().into_iter().filter_map(|f| Some((f.info.family.clone(), f.info.native_family.clone()?))).collect()
+}
+
+/// Families with at least one variable face (variation axes), for the font menu's Variable
+/// Fonts filter. Scans the system fonts first if that hasn't happened yet.
+pub fn variable_families() -> std::collections::BTreeSet<String> {
+    scan_system();
+    all_faces().into_iter().filter(|f| f.info.variable).map(|f| f.info.family.clone()).collect()
 }
 
 /// Families with their style names, sorted by family; styles in weight order. This is what font
@@ -823,6 +841,14 @@ fn system_fallback(c: char, style: &str) -> Option<FaceId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_font_dirs_come_from_a_path_list() {
+        assert!(extra_dirs(None).is_empty());
+        let v = std::env::join_paths(["/a/fonts", "/b/more"]).unwrap_or_default();
+        assert_eq!(extra_dirs(Some(&v)), vec![PathBuf::from("/a/fonts"), PathBuf::from("/b/more")]);
+        assert!(extra_dirs(Some(std::ffi::OsStr::new(""))).is_empty());
+    }
 
     #[test]
     fn bundled_families_and_resolution() {

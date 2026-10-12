@@ -64,7 +64,7 @@ fn group_of(n: &DockNode, p: PanelKind) -> Option<Vec<PanelKind>> {
     match n {
         DockNode::Split { a, b, .. } => group_of(a, p).or_else(|| group_of(b, p)),
         DockNode::Tabs { panels, .. } => panels.contains(&p).then(|| panels.clone()),
-        DockNode::Stack { entries } => entries.iter().any(|e| e.panel == p).then(|| entries.iter().map(|e| e.panel).collect()),
+        DockNode::Stack { entries } => entries.iter().find(|e| e.contains(p)).map(|e| e.panels.clone()),
     }
 }
 
@@ -209,7 +209,7 @@ fn stacked_panel_gaps_resize_the_panels() {
         match n {
             DockNode::Split { a, b, .. } => height(a, p).or_else(|| height(b, p)),
             DockNode::Tabs { .. } => None,
-            DockNode::Stack { entries } => entries.iter().find(|e| e.panel == p).map(|e| e.height),
+            DockNode::Stack { entries } => entries.iter().find(|e| e.contains(p)).map(|e| e.height),
         }
     }
     let (preview, props) = (rect(&h, "panel.Preview"), rect(&h, "panel.Properties"));
@@ -297,4 +297,71 @@ fn project_empty_area_double_click_and_dropped_files_import() {
     h.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(png.clone().into())));
     h.run_steps(2);
     assert_eq!(imports(&h), 2, "the dropped file was imported");
+}
+
+/// Issue #306: dragging the viewer/Timeline divider far up made a nested split shorter than its
+/// two 20 pt minimums, and `f32::clamp` panicked with crossed bounds, closing the app.
+#[test]
+fn dragging_the_viewer_timeline_divider_far_up_does_not_crash() {
+    let (mut h, _, _) = harness();
+    // The horizontal gutter right above the Timeline.
+    let tl = rect(&h, "panel.Timeline");
+    let gutter = |h: &Harness<'_, EffectcraftApp>| {
+        h.state()
+            .auto
+            .previous
+            .iter()
+            .filter(|e| e.id.starts_with("dock.gutter.") && e.rect[2] > e.rect[3])
+            .map(|e| (e.id.clone(), egui::Rect::from_min_size(pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3]))))
+            .filter(|(_, g)| g.x_range().contains(tl.center().x) && g.max.y <= tl.min.y + 1.0)
+            .min_by(|a, b| (tl.min.y - a.1.max.y).total_cmp(&(tl.min.y - b.1.max.y)))
+            .expect("the gutter above the Timeline")
+    };
+    let (id, g) = gutter(&h);
+    drag(&mut h, g.center(), g.center() - egui::vec2(0.0, 2000.0));
+    let g2 = rect(&h, &id);
+    assert!(g2.center().y < g.center().y - 100.0, "the divider moved up: {g:?} → {g2:?}");
+    // And back down past the bottom.
+    drag(&mut h, g2.center(), g2.center() + egui::vec2(0.0, 3000.0));
+    h.run_steps(2);
+}
+
+/// Issue #301: clicking anywhere on a stacked panel's header bar expands/collapses it, not only
+/// its name; the panel menu button keeps its own click.
+#[test]
+fn a_stacked_panels_whole_header_bar_toggles_it() {
+    let (mut h, _, _) = harness();
+    let open = |h: &Harness<'_, EffectcraftApp>| h.state().ui.dock.is_visible(PanelKind::Preview);
+    assert!(open(&h));
+    let bar = rect(&h, "panel.header.Preview");
+    let tab = rect(&h, "panel.tab.Preview");
+    assert!(bar.min.x >= tab.max.x - 1.0 && bar.width() > 40.0, "{bar:?} {tab:?}");
+    click_n(&mut h, pos2(bar.max.x - 6.0, bar.center().y), 1);
+    assert!(!open(&h), "a click at the bar's right end collapses Preview");
+    let bar = rect(&h, "panel.header.Preview");
+    click_n(&mut h, bar.center(), 1);
+    assert!(open(&h), "and expands it again");
+    let menu = rect(&h, "panel.menu.Preview");
+    click_n(&mut h, menu.center(), 1);
+    assert!(open(&h), "the panel menu button doesn't toggle the panel");
+}
+
+/// #302: a panel dropped onto a stacked panel becomes a tab in that panel's frame (it was
+/// inserted as a stacked panel of its own below it); its tabs switch the frame's panel.
+#[test]
+fn a_tab_dropped_on_a_stacked_panel_joins_its_frame() {
+    let (mut h, _, _) = harness();
+    let dock = |h: &Harness<'_, EffectcraftApp>| h.state().ui.dock.clone();
+    let fx = rect(&h, "panel.tab.EffectControls");
+    let props = rect(&h, "panel.Properties");
+    drag(&mut h, fx.center(), props.center());
+    assert_eq!(group_of(&dock(&h), PanelKind::Properties), Some(vec![PanelKind::Properties, PanelKind::EffectControls]));
+    assert!(dock(&h).is_visible(PanelKind::EffectControls) && !dock(&h).is_visible(PanelKind::Properties));
+    // The frame's other tab shows Properties again, the frame stays open.
+    let tab = rect(&h, "panel.tab.Properties");
+    click_n(&mut h, tab.center(), 1);
+    assert!(dock(&h).is_visible(PanelKind::Properties) && !dock(&h).is_visible(PanelKind::EffectControls));
+    // The layout (saved workspaces) round-trips.
+    let s = serde_json::to_string(&dock(&h)).unwrap();
+    assert_eq!(serde_json::from_str::<DockNode>(&s).unwrap(), dock(&h));
 }

@@ -508,7 +508,8 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
         ui.horizontal(|ui| {
             let r = ui.checkbox(&mut d.blur_on, crate::i18n::tr("Blur"));
             app.auto.add("dialog.trackOptions.blurOn", r.rect, "Blur");
-            let r = ui.add_enabled(d.blur_on, egui::DragValue::new(&mut d.opts.blur).speed(0.1).range(0.5..=50.0).suffix(" pixels"));
+            let r =
+                ui.add_enabled(d.blur_on, crate::widgets::drag_value(egui::DragValue::new(&mut d.opts.blur).speed(0.1).range(0.5..=50.0).suffix(" pixels")));
             app.auto.add("dialog.trackOptions.blur", r.rect, "Blur pixels");
             let r = ui.checkbox(&mut d.opts.enhance, crate::i18n::tr("Enhance"));
             app.auto.add("dialog.trackOptions.enhance", r.rect, "Enhance");
@@ -539,7 +540,7 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
                 .response;
             app.auto.add("dialog.trackOptions.action", r.rect, "If Confidence is Below action");
             ui.label(crate::i18n::tr("If Confidence is Below"));
-            let r = ui.add(egui::DragValue::new(&mut d.opts.threshold).speed(0.5).range(0.0..=100.0).suffix(" %"));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.opts.threshold).speed(0.5).range(0.0..=100.0).suffix(" %")));
             app.auto.add("dialog.trackOptions.threshold", r.rect, "Confidence threshold");
         });
         (ok, cancel) = ok_cancel(ui, app, t, "dialog.trackOptions");

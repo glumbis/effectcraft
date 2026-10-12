@@ -216,6 +216,7 @@ fn composite_mode(m: u32) -> BlendMode {
 fn point(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let pr = ctx.params;
     let mut p = Params::default();
+    let mut original = None;
     match id {
         "ec.utility.cineon" => {
             // utility::Cineon's offset and knee, in the CPU's f32.
@@ -246,6 +247,11 @@ fn point(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
             p.f[0] = pr.color("highlightColor");
         }
         "ec.channel.cccomposite" => {
+            if let Some(source) = ctx.env.host.and_then(|h| h.original()) {
+                let fitted = effectcraft_effects::util::fit_buffer(source, b.img.width, b.img.height, b.offset, b.scale);
+                original = Some(e.g.upload_image(&fitted)?);
+            }
+            p.u[1][0] = original.is_some() as u32;
             let m = pr.e("compositeOriginal");
             let mode = if m == 1 { BlendMode::Normal } else { composite_mode(m) };
             p.u[0] = [6, (m == 1) as u32, mode_id(mode), pr.b("rgbOnly") as u32];
@@ -267,7 +273,7 @@ fn point(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         }
         _ => return None,
     }
-    run(e, "fp2_point", &p, b, None, None)
+    run(e, "fp2_point", &p, b, original.as_ref(), None)
 }
 
 // ---------------------------------------------------------------- CC Block Load (stylize3)
@@ -469,6 +475,10 @@ fn wire_removal(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let half = (ctx.params.f("thickness") * b.scale * 0.5).max(0.0);
     if half <= 0.0 {
         return Some(b);
+    }
+    // Frame Offset reads another frame from the effect host: that renders on the CPU.
+    if ctx.params.e("removalStyle") == 1 && ctx.params.f("frameOffset").round() != 0.0 && ctx.env.host.is_some() {
+        return None;
     }
     let slope = (ctx.params.f("slope") / 100.0).clamp(0.0, 1.0) as f32;
     let mirror = (ctx.params.f("mirrorBlend") / 100.0).clamp(0.0, 1.0) as f32;

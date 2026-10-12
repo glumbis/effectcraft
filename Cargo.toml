@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/*"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -98,6 +98,8 @@ bytemuck = "1"
 pollster = "0.4"
 
 # ui
+# Shared frontend components; keep this dependency above the engine boundary.
+craft-ui = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "5c874d51eeb3de70e735c8ce87a59a7dedd47675", features = ["serde"] }
 egui = "0.36"
 eframe = { version = "0.36", default-features = false }
 egui_kittest = "0.36"

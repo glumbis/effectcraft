@@ -129,7 +129,7 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
 
     // ---- Bottom buttons.
     ui.horizontal_wrapped(|ui| {
-        let r = ui.menu_button(tr("Add Formatting"), |ui| {
+        let r = crate::widgets::menu_button(ui, tr("Add Formatting"), |ui| {
             if ui.button(tr("Add Group")).clicked() {
                 actions.push(("essential.addGroup".into(), json!({"comp": cid.0})));
                 ui.close();
@@ -143,7 +143,7 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
         // The selected property as a Font control (Source Text) or a uniform Scale slider.
         let has_sel = !app.session.state.selected_props.is_empty();
         let r = ui.add_enabled_ui(has_sel, |ui| {
-            ui.menu_button(tr("Add Selected As"), |ui| {
+            crate::widgets::menu_button(ui, tr("Add Selected As"), |ui| {
                 for (label, as_type) in [("Font Control", "font"), ("Uniform Scale", "scale")] {
                     if ui.button(label).clicked() {
                         actions.push(("essential.addProperty".into(), json!({"as": as_type})));
@@ -270,7 +270,7 @@ fn link_menu(app: &mut EffectcraftApp, ui: &mut egui::Ui, cid: ItemId, c: &EgCon
         _ => vec![],
     };
     let has_sel = !app.session.state.selected_props.is_empty();
-    let r = ui.menu_button(RichText::new("⋯").size(10.0), |ui| {
+    let r = crate::widgets::menu_button(ui, RichText::new("⋯").size(10.0), |ui| {
         if ui.button(tr("Add Mirror")).clicked() {
             actions.push(("essential.addMirror".into(), json!({"comp": cid.0, "control": c.id, "group": group})));
             ui.close();
@@ -344,11 +344,10 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
         }
         ControlType::Color => {
             let c = v.as_color();
-            let mut rgba = egui::Rgba::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
-            let r = egui::widgets::color_picker::color_edit_button_rgba(ui, &mut rgba, egui::widgets::color_picker::Alpha::Opaque);
+            let mut rgb = [c[0], c[1], c[2]];
+            let r = crate::widgets::srgb_color_button(ui, &mut rgb);
             if r.changed() {
-                let u = rgba.to_rgba_unmultiplied();
-                out = Some(json!([u[0], u[1], u[2], u[3]]));
+                out = Some(json!([rgb[0], rgb[1], rgb[2], c[3]]));
             }
             r.rect
         }
@@ -375,10 +374,41 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             });
             r.response.rect
         }
+        // Scale keeps its Constrain Proportions link, on by default, as in After Effects (#338).
+        // The link is the property's own, shared with the Timeline's chain link.
+        ControlType::Point if p.match_id == "scale" && matches!(p.ui, ParamUi::Percent) => {
+            let comps = v.components();
+            let linked = !app.ui.timeline.unlinked.contains(&p.uid);
+            let (lr, link) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+            let t = app.tokens;
+            crate::icons::paint(ui.painter(), lr, crate::icons::Icon::Link, if linked { t.accent } else { t.text_faint });
+            let link = link.on_hover_text(tr("Constrain Proportions"));
+            app.auto.add(&format!("{auto}.link"), lr, "Constrain Proportions");
+            if link.clicked() && !app.ui.timeline.unlinked.remove(&p.uid) {
+                app.ui.timeline.unlinked.insert(p.uid);
+            }
+            let mut rect = lr;
+            for (d, &old) in comps.iter().enumerate() {
+                let mut x = old;
+                let r = ui.add(egui::DragValue::new(&mut x).speed(0.5).suffix(if d + 1 == comps.len() { "%" } else { "" }).max_decimals(1));
+                app.auto.add(&format!("{auto}.{d}"), r.rect, &p.name);
+                rect = rect.union(r.rect);
+                if r.changed() {
+                    // Alt edits one value of a linked pair, as in the Timeline.
+                    let next = if linked && !ui.input(|i| i.modifiers.alt) {
+                        widgets::constrained(&comps, d, x)
+                    } else {
+                        comps.iter().enumerate().map(|(e, &c)| if e == d { x } else { c }).collect()
+                    };
+                    out = Some(json!(next));
+                }
+            }
+            rect
+        }
         ControlType::Point => {
             let mut a = v.as_vec2();
-            let r1 = ui.add(egui::DragValue::new(&mut a[0]).speed(1.0).max_decimals(1));
-            let r2 = ui.add(egui::DragValue::new(&mut a[1]).speed(1.0).max_decimals(1));
+            let r1 = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut a[0]).speed(1.0).max_decimals(1)));
+            let r2 = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut a[1]).speed(1.0).max_decimals(1)));
             if r1.changed() || r2.changed() {
                 out = Some(json!(a));
             }
@@ -386,7 +416,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
         }
         ControlType::Angle => {
             let mut a = v.as_f64();
-            let r = ui.add(egui::DragValue::new(&mut a).speed(1.0).suffix("°").max_decimals(1));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut a).speed(1.0).suffix("°").max_decimals(1)));
             if r.changed() {
                 out = Some(json!(a));
             }
@@ -415,7 +445,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
                     }
                 }
             });
-            let r3 = ui.add(egui::DragValue::new(&mut d.size).speed(0.5).range(1.0..=2000.0).suffix(" px").max_decimals(1));
+            let r3 = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.size).speed(0.5).range(1.0..=2000.0).suffix(" px").max_decimals(1)));
             app.auto.add(&format!("{auto}.font"), r1.response.rect, "Font");
             app.auto.add(&format!("{auto}.style"), r2.response.rect, "Style");
             app.auto.add(&format!("{auto}.size"), r3.rect, "Size");
@@ -428,7 +458,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             // One percentage for every axis.
             let comps = v.components();
             let mut x = comps.first().copied().unwrap_or(100.0);
-            let r = ui.add(egui::DragValue::new(&mut x).speed(0.5).suffix("%").max_decimals(1));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut x).speed(0.5).suffix("%").max_decimals(1)));
             if r.changed() {
                 out = Some(json!(vec![x; comps.len().max(1)]));
             }
@@ -438,7 +468,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             let mut x = v.as_f64();
             let r = match p.ui {
                 ParamUi::Slider { slider_min, slider_max, .. } => ui.add(egui::Slider::new(&mut x, slider_min..=slider_max).max_decimals(2)),
-                _ => ui.add(egui::DragValue::new(&mut x).speed(0.5).max_decimals(2)),
+                _ => ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut x).speed(0.5).max_decimals(2))),
             };
             if r.changed() {
                 out = Some(json!(x));

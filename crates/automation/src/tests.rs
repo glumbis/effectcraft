@@ -36,6 +36,28 @@ fn call_json(s: &mut McpServer, name: &str, args: Value) -> Value {
 }
 
 #[test]
+fn property_group_error_points_to_layer_inspection() {
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Main"}}));
+    let l = call_json(&mut s, "execute_command", json!({"command": "layer.newText", "params": {"text": "Hi"}}))["layer"].clone();
+    call_json(&mut s, "execute_command", json!({"command": "comp.renderer", "params": {"renderer": "advanced3d"}}));
+    for tool in ["get_property", "set_property", "add_keyframe"] {
+        let mut args = json!({"layer": l, "path": "geometryOptions", "time": 0});
+        if tool != "get_property" {
+            args["value"] = json!(0);
+        }
+        let (content, err) = call(&mut s, tool, args);
+        assert!(err, "{tool}: {content:?}");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("is a property group"), "{tool}: {text}");
+        assert!(text.contains("get_layer"), "{tool}: {text}");
+    }
+    let tree = call_json(&mut s, "get_layer", json!({"layer": l, "flat": true}));
+    assert!(tree["properties"].as_array().unwrap().iter().any(|p| p["path"] == "geometryOptions/extrusionDepth"));
+    assert!(call_json(&mut s, "get_property", json!({"layer": l, "path": "geometryOptions/extrusionDepth"}))["value"].is_number());
+}
+
+#[test]
 fn initialize_and_list_tools() {
     let mut s = server();
     let r = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}));
@@ -135,6 +157,21 @@ fn headless_workflow() {
     let mid = call_json(&mut s, "get_property", json!({"layer": l, "path": "transform/position", "time": 1.0}));
     assert!((mid["value"][0].as_f64().unwrap() - 160.0).abs() < 1.0, "{mid}");
 
+    // Comp-time keys on an offset layer (#257): the key lands where the Timeline shows it.
+    call_json(&mut s, "execute_command", json!({"command": "layer.timing", "params": {"layer": l, "start": 1.0}}));
+    let p = call_json(
+        &mut s,
+        "add_keyframe",
+        json!({"layer": l, "path": "transform/scale", "keys": [{"time": 1.5, "value": [50, 50]}, {"time": 2.5, "value": [100, 100]}], "timeBase": "comp", "interpolation": "hold"}),
+    );
+    let times: Vec<f64> = p["keys"].as_array().unwrap().iter().map(|k| k["time"].as_f64().unwrap()).collect();
+    // Comp times snap to the comp's frames (29.97 fps) before becoming layer time.
+    assert!((times[0] - 0.5).abs() < 0.02 && (times[1] - 1.5).abs() < 0.02, "layer-time keys: {times:?}");
+    assert_eq!(p["keys"][0]["out"], "Hold", "the comp-time keys were selected for the interpolation");
+    call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/scale", "value": [75, 75], "time": 3.0, "timeBase": "comp"}));
+    let p = call_json(&mut s, "get_property", json!({"layer": l, "path": "transform/scale"}));
+    assert!(p["keys"].as_array().unwrap().iter().any(|k| (k["time"].as_f64().unwrap() - 2.0).abs() < 0.02), "{p}");
+
     // Expression via set_property.
     let p = call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/rotation", "expression": "time * 90"}));
     assert_eq!(p["expression"], "time * 90");
@@ -211,7 +248,7 @@ fn stdio_loop() {
     .map(|v| v.to_string() + "\n")
     .collect::<String>();
     let mut out = Vec::new();
-    s.serve(input.as_bytes(), &mut out).unwrap();
+    s.serve(std::io::Cursor::new(input), &mut out).unwrap();
     let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[1]["id"], 2);
@@ -229,7 +266,7 @@ fn headless_autosave_on_eof_preserves_unsaved_project() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_command", "arguments": {"command": "layer.newText", "params": {"text": "Unsaved title"}}}}),
     ].iter().map(|v| v.to_string() + "\n").collect::<String>();
     let mut output = Vec::new();
-    s.serve(input.as_bytes(), &mut output).unwrap();
+    s.serve(std::io::Cursor::new(input), &mut output).unwrap();
     let path = s.backend().session().unwrap().autosave.last_path.clone();
     assert!(path.is_some(), "disconnect discarded the dirty project without an auto-save");
     let path = path.unwrap();
@@ -269,7 +306,9 @@ fn autosave_is_durable_before_reply_and_queries_do_not_rotate() {
     drop(s); // Abrupt process loss has no EOF cleanup; the checkpoint already exists.
     let mut restarted = server().with_autosave(&dir).unwrap();
     let init = rpc(&mut restarted, 1, "initialize", json!({}));
-    assert!(init["instructions"].as_str().unwrap().contains(path));
+    // The instructions carry the auto-save state as JSON, where a Windows path's backslashes
+    // are escaped.
+    assert!(init["instructions"].as_str().unwrap().contains(&Value::from(path).to_string()));
     assert_eq!(init["_meta"]["effectcraftAutoSave"]["previousSessions"][0]["autosave"], path);
     call_json(&mut restarted, "open_project", json!({"path": path}));
     assert_eq!(call_json(&mut restarted, "get_project", json!({}))["items"][0]["name"], "Durable");
@@ -349,6 +388,30 @@ fn autosave_marks_saved_or_undone_work_clean_without_losing_its_path() {
     let mut next = server().with_autosave(&dir).unwrap();
     assert!(autosave_status(&mut next)["previousSessions"].as_array().unwrap().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A reply that cannot be written ends `serve` with the write error, even while stdin stays open
+/// (the client is gone but never closed its end): the reader thread must not be waited for.
+#[test]
+fn broken_output_returns_while_stdin_stays_open() {
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (in_r, mut in_w) = std::io::pipe().unwrap();
+    writeln!(in_w, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})).unwrap();
+    let (done_tx, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(server().serve(BufReader::new(in_r), Broken));
+    });
+    let result = done.recv_timeout(std::time::Duration::from_secs(10)).expect("serve must return while stdin is still open");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+    drop(in_w);
 }
 
 #[test]
@@ -618,6 +681,12 @@ fn list_fonts_lists_families_with_styles() {
     assert!(matched.len() < fams.len(), "the query filters: {one}");
     let mono = matched.iter().find(|f| f["family"] == "JetBrains Mono").unwrap_or_else(|| panic!("{one}"));
     assert!(mono["styles"].as_array().unwrap().contains(&json!("Regular")), "{one}");
+    assert_eq!(mono["variable"], false, "{one}");
+    // `variable` keeps only the variable fonts (the font menu's filter); the static bundled
+    // families drop out.
+    let var = call_json(&mut s, "list_fonts", json!({"variable": true}));
+    let listed = var["families"].as_array().unwrap();
+    assert!(listed.iter().all(|f| f["variable"] == true && f["family"] != "Inter"), "{var}");
 }
 
 /// Trained models over MCP (Roto Brush and face tracking): listed with their authors and
@@ -897,6 +966,61 @@ impl effectcraft_engine::Exporter for SlowExporter {
     }
 }
 
+/// docs/mcp.md "Requests during a render": while a blocking render runs, every way of starting a
+/// second render is refused (blocking, `wait: false`, inside a batch), and edits are applied to
+/// the project without changing the running job, which renders the snapshot it started with.
+#[test]
+fn second_render_is_refused_and_edits_apply_during_a_render() {
+    let dir = std::env::temp_dir().join(format!("effectcraft-mcp-busy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (in_r, mut in_w) = std::io::pipe().unwrap();
+    let (out_r, out_w) = std::io::pipe().unwrap();
+    let server = std::thread::spawn(move || {
+        let session = Session { exporter: Some(std::sync::Arc::new(SlowExporter)), ..Default::default() };
+        McpServer::new(Backend::headless(session)).serve(BufReader::new(in_r), out_w).unwrap();
+    });
+    let mut lines = BufReader::new(out_r).lines();
+    let mut next = || -> Value { serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap() };
+    let mut send = |v: Value| writeln!(in_w, "{v}").unwrap();
+    let call =
+        |id: u64, name: &str, arguments: Value| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": arguments}});
+    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}));
+    next();
+    send(call(2, "command_run", json!({"id": "comp.new", "params": {"width": 64, "height": 64, "duration": 1}})));
+    assert_eq!(next()["result"]["isError"], false);
+    let a = dir.join("a.mp4").to_string_lossy().to_string();
+    send(call(3, "command_run", json!({"id": "renderQueue.add", "params": {"output": a}})));
+    assert_eq!(next()["result"]["isError"], false);
+    send(call(4, "command_run", json!({"id": "renderQueue.render"})));
+    send(call(5, "command_run", json!({"id": "renderQueue.render", "params": {"wait": false}})));
+    send(call(6, "command_run", json!({"id": "renderQueue.render"})));
+    send(call(7, "command_batch", json!({"steps": [{"id": "renderQueue.render", "params": {"wait": false}}]})));
+    send(call(8, "command_run", json!({"id": "comp.new", "params": {"name": "Added while rendering", "width": 32, "height": 32, "duration": 1}})));
+    let mut replies = std::collections::HashMap::new();
+    while !replies.contains_key(&4) {
+        let m = next();
+        replies.insert(m["id"].as_u64().unwrap(), m);
+    }
+    for id in [5, 6, 7] {
+        let m = &replies[&id];
+        assert_eq!(m["result"]["isError"], true, "a second render is refused: {m}");
+        let text = m["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("already in progress") || text.contains("is rendering"), "{m}");
+    }
+    assert_eq!(replies[&8]["result"]["isError"], false, "edits are applied during a render");
+    let done = &replies[&4];
+    assert_eq!(done["result"]["isError"], false, "{done}");
+    let v: Value = serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["items"][0]["statusLabel"], "Done", "{v}");
+    send(call(9, "doc_inspect", json!({})));
+    let doc = next();
+    assert!(doc.to_string().contains("Added while rendering"), "{doc}");
+    drop(in_w);
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// docs/mcp.md "Progress and cancellation" over the stdio loop: a blocking `renderQueue.render`
 /// reports `notifications/progress` for its token, other requests are answered while it renders,
 /// and `notifications/cancelled` stops it, deletes the partial file and sends no response.
@@ -991,7 +1115,6 @@ fn render_progress_and_cancel() {
     assert!(!b.exists(), "partial output deleted");
     assert!(std::path::Path::new(&a).exists(), "completed earlier queue item is retained");
     assert_eq!(v["items"][1]["statusLabel"], "User Stopped", "{v}");
-    drop(send);
     drop(in_w);
     server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1063,4 +1186,75 @@ fn command_tools_accept_id_as_an_alias() {
     call_json(&mut s, "execute_command", json!({"id": "comp.new", "params": {"name": "Alias", "width": 64, "height": 36}}));
     let (_, err) = call(&mut s, "execute_command", json!({}));
     assert!(err, "neither key is an error");
+}
+
+/// #500: `--automation-read-root` / `--automation-write-root` confine the files an agent reads
+/// and writes: inside the roots works, outside (or relative, `..`, through a symbolic link, by
+/// a batch step, by Save to the project's own file, from a script) is refused.
+#[test]
+fn automation_roots_confine_file_access() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-mcp-confine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (read, write, outside) = (base.join("in"), base.join("out"), base.join("elsewhere"));
+    for d in [&read, &write, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let p = |d: &std::path::Path, f: &str| d.join(f).to_string_lossy().into_owned();
+    // Unconfined (the default): anywhere.
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "A", "width": 64, "height": 64}}));
+    call_json(&mut s, "save_project", json!({"path": p(&outside, "free.ecproj")}));
+    call_json(&mut s, "save_project", json!({"path": p(&read, "source.ecproj")}));
+
+    let mut s = server();
+    s.backend().confine(Confinement::new(std::slice::from_ref(&read), std::slice::from_ref(&write)).unwrap());
+    let denied = |s: &mut McpServer, name: &str, args: Value| {
+        let (c, err) = call(s, name, args.clone());
+        assert!(err, "{name} {args} should be refused: {c:?}");
+        c[0]["text"].as_str().unwrap_or_default().to_string()
+    };
+    // Reading: inside a read root, not outside.
+    call_json(&mut s, "open_project", json!({"path": p(&read, "source.ecproj")}));
+    let msg = denied(&mut s, "open_project", json!({"path": p(&outside, "free.ecproj")}));
+    assert!(msg.contains("outside the automation roots"), "{msg}");
+    // Writing: inside a write root only; not into a read root, not relative, not with `..`.
+    call_json(&mut s, "save_project", json!({"path": p(&write, "saved.ecproj")}));
+    assert!(write.join("saved.ecproj").is_file());
+    denied(&mut s, "save_project", json!({"path": p(&read, "copy.ecproj")}));
+    denied(&mut s, "save_project", json!({"path": "relative.ecproj"}));
+    denied(&mut s, "save_project", json!({"path": p(&write, "../elsewhere/up.ecproj")}));
+    denied(&mut s, "execute_command", json!({"command": "comp.saveFrameAs", "params": {"path": p(&outside, "f.png")}}));
+    // Any other absolute path a command is given.
+    denied(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"output": p(&outside, "movie.mp4")}}));
+    // A batch step.
+    let steps = json!([{"command": "comp.new", "params": {"name": "B"}}, {"command": "file.saveAs", "params": {"path": p(&outside, "b.ecproj")}}]);
+    denied(&mut s, "batch", json!({"steps": steps}));
+    let steps = json!([{"command": "file.saveAs", "params": {"path": "$1.path"}}]);
+    denied(&mut s, "batch", json!({"steps": steps}));
+    // Save (and Increment and Save) write the open project's own file: it must be writable.
+    call_json(&mut s, "open_project", json!({"path": p(&read, "source.ecproj")}));
+    denied(&mut s, "save_project", json!({}));
+    denied(&mut s, "execute_command", json!({"command": "file.incrementAndSave"}));
+    // Rendering the queue writes its items' outputs (by default beside the project).
+    call_json(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"comp": "A"}}));
+    let queue = call_json(&mut s, "execute_command", json!({"command": "renderQueue.list"}));
+    assert!(queue["items"][0]["outputPath"].as_str().is_some_and(|o| o.starts_with(&*read.to_string_lossy())), "{queue}");
+    let msg = denied(&mut s, "execute_command", json!({"command": "renderQueue.render"}));
+    assert!(msg.contains("cannot write"), "{msg}");
+    call_json(&mut s, "open_project", json!({"path": p(&write, "saved.ecproj")}));
+    call_json(&mut s, "save_project", json!({}));
+    // Through a symbolic link out of a root.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, write.join("link")).unwrap();
+        denied(&mut s, "save_project", json!({"path": p(&write.join("link"), "escaped.ecproj")}));
+        assert!(!outside.join("escaped.ecproj").exists());
+    }
+    // Scripts can read and write anything: refused.
+    denied(&mut s, "run_script", json!({"code": "1 + 1"}));
+    denied(&mut s, "execute_command", json!({"command": "file.runScript", "params": {"path": p(&read, "x.jsx")}}));
+    // Writes to the files the agent named: none outside.
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "only the unconfined save");
+    let _ = std::fs::remove_dir_all(&base);
 }

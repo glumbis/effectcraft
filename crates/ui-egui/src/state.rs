@@ -566,6 +566,10 @@ pub struct UiState {
     /// Floating panels of the saved workspaces.
     #[serde(default)]
     pub saved_floating: std::collections::BTreeMap<String, Vec<crate::dock::Floating>>,
+    /// Floating groups shown in their own native window instead of over the dock (Move Panel
+    /// to New Window), so they can be placed on another monitor.
+    #[serde(default)]
+    pub panel_windows: Vec<crate::dock::PanelWindow>,
     /// The panel maximized to fill the dock area (`~`), if any.
     #[serde(default)]
     pub maximized: Option<PanelKind>,
@@ -655,6 +659,14 @@ pub struct UiState {
     /// Layer panel View: number of effects rendered (None = through the last Paint effect).
     #[serde(default)]
     pub layer_view: Option<usize>,
+    /// Layer panel magnification in points per layer pixel (None = fit), set by its
+    /// magnification menu, View ▸ Zoom In / Zoom Out while it is focused, the mouse wheel and the
+    /// Zoom tool.
+    #[serde(default)]
+    pub layer_zoom: Option<f32>,
+    /// Layer panel pan offset in points from the centred position (Hand tool, Space-drag).
+    #[serde(default)]
+    pub layer_pan: [f32; 2],
     /// Wiggler / Smoother / Motion Sketch settings.
     #[serde(default)]
     pub anim_tools: AnimToolsState,
@@ -680,6 +692,7 @@ impl Default for UiState {
             saved_workspaces: Default::default(),
             floating: vec![],
             saved_floating: Default::default(),
+            panel_windows: vec![],
             maximized: None,
             locked_tabs: BTreeSet::new(),
             viewers: Default::default(),
@@ -717,6 +730,8 @@ impl Default for UiState {
             tracker_source: None,
             layer_panel: None,
             layer_view: None,
+            layer_zoom: None,
+            layer_pan: [0.0, 0.0],
             anim_tools: AnimToolsState::default(),
             mini_flowchart: None,
             flowchart: Default::default(),

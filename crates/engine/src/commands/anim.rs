@@ -6,7 +6,7 @@ use effectcraft_project::{LayerId, Property, Uid};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::prop::prop_ref;
+use super::prop::{KeyTimeBase, key_time, key_timing, prop_ref};
 use super::{CommandSpec, bad, comp_id, f_p, has_comp, has_keys, layers_p, merge_p, str_p, time_p};
 use crate::{EngineError, KeyClip, KeyRef, Result, Session, cmd, query};
 
@@ -105,7 +105,7 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     if plan.is_empty() {
         return Err(bad("keys.paste", "no compatible property to paste into (select a property of the same type)"));
     }
-    s.edit("Paste Keyframes", None, |proj, st| {
+    s.edit("Paste Keyframes", merge_p(p), |proj, st| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let mut sel = vec![];
         for (lid, uid, ci) in &plan {
@@ -206,11 +206,13 @@ fn nudge(s: &mut Session, p: &Value) -> Result<Value> {
 /// Edit one key directly: move it in time and/or set its value (Graph Editor drags).
 fn set_key(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = prop_ref(s, p, "keys.set")?;
-    let t = Tick::from_seconds_f64(f_p(p, "time").ok_or_else(|| bad("keys.set", "missing `time` (layer time of the key)"))?);
-    let new_t = f_p(p, "newTime").map(Tick::from_seconds_f64);
+    let base = KeyTimeBase::from_params(p, "keys.set")?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+    let t = key_time(layer, comp.frame_rate, p, "time", base, "keys.set", false)?.ok_or_else(|| bad("keys.set", "missing `time` (layer time by default)"))?;
+    let new_t = key_time(layer, comp.frame_rate, p, "newTime", base, "keys.set", true)?;
     let value = p.get("value").cloned();
-    let fr = s.project.comp(cid).map(|c| c.frame_rate);
-    s.edit("Edit Keyframe", merge_p(p), |proj, st| {
+    let nt = s.edit("Edit Keyframe", merge_p(p), |proj, st| {
         let l = super::layer_mut(proj, cid, lid)?;
         let pr = l.props.find_mut(uid).ok_or_else(|| bad("keys.set", "no property"))?;
         let i = nearest_key(&pr.keys, t).ok_or_else(|| bad("keys.set", "the property has no keyframes"))?;
@@ -221,10 +223,10 @@ fn set_key(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let mut nt = old_t;
         if let Some(n) = new_t {
-            nt = fr.map(|r| r.snap_nearest(n)).unwrap_or(n);
+            nt = n;
             // Keys can't pass their neighbours or share a time.
-            let lo = if i > 0 { pr.keys[i - 1].time.0 + 1 } else { i64::MIN };
-            let hi = if i + 1 < pr.keys.len() { pr.keys[i + 1].time.0 - 1 } else { i64::MAX };
+            let lo = if i > 0 { pr.keys[i - 1].time.0.saturating_add(1) } else { i64::MIN };
+            let hi = if i + 1 < pr.keys.len() { pr.keys[i + 1].time.0.saturating_sub(1) } else { i64::MAX };
             nt = Tick(nt.0.clamp(lo, hi));
             pr.keys[i].time = nt;
         }
@@ -233,8 +235,10 @@ fn set_key(s: &mut Session, p: &Value) -> Result<Value> {
         for k in st.selected_keys.iter_mut().filter(|k| k.layer == lid && k.prop == uid && k.time == old_t) {
             k.time = nt;
         }
-        Ok(json!({"time": nt.seconds()}))
-    })
+        Ok(nt)
+    })?;
+    let layer = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
+    Ok(key_timing(layer, nt))
 }
 
 fn nearest_key(keys: &[Keyframe], t: Tick) -> Option<usize> {
@@ -449,7 +453,15 @@ pub fn specs() -> Vec<CommandSpec> {
             s,
             &json!({"frames": -10})
         )),
-        cmd!("keys.set", "Edit Keyframe", [], None, "{layer?, path|prop, time (layer s), newTime?, value?, merge?}", has_comp, set_key),
+        cmd!(
+            "keys.set",
+            "Edit Keyframe",
+            [],
+            None,
+            "{layer?, path|prop, time (layer s by default), newTime? (same base), timeBase?: layer|comp, value?, merge?}",
+            has_comp,
+            set_key
+        ),
         cmd!("keys.selectEqual", "Select Equal Keyframes", [], None, "{}", has_keys, |s, _| select_related(s, "equal")),
         cmd!("keys.selectPrevious", "Select Previous Keyframes", [], None, "{}", has_keys, |s, _| select_related(s, "previous")),
         cmd!("keys.selectFollowing", "Select Following Keyframes", [], None, "{}", has_keys, |s, _| select_related(s, "following")),

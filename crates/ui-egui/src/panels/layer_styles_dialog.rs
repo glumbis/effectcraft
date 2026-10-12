@@ -103,17 +103,17 @@ fn control(ui: &mut egui::Ui, p: &Property, v: &KV) -> Option<Value> {
                 ParamUi::Slider { slider_min, slider_max, decimals, .. } => {
                     ui.add(egui::Slider::new(&mut y, *slider_min..=*slider_max).clamping(egui::SliderClamping::Never).max_decimals(*decimals as usize))
                 }
-                ParamUi::Percent => ui.add(egui::DragValue::new(&mut y).speed(0.5).suffix("%")),
-                ParamUi::Angle => ui.add(egui::DragValue::new(&mut y).speed(0.5).suffix("°")),
-                ParamUi::Pixels => ui.add(egui::DragValue::new(&mut y).speed(0.25).suffix(" px")),
-                _ => ui.add(egui::DragValue::new(&mut y).speed(0.1)),
+                ParamUi::Percent => ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut y).speed(0.5).suffix("%"))),
+                ParamUi::Angle => ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut y).speed(0.5).suffix("°"))),
+                ParamUi::Pixels => ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut y).speed(0.25).suffix(" px"))),
+                _ => ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut y).speed(0.1))),
             };
             (r.changed() && y != *x).then(|| json!(y))
         }
         (KV::Color(c), _) => {
-            let mut rgba = egui::Rgba::from_rgba_unmultiplied(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32);
-            let changed = egui::color_picker::color_edit_button_rgba(ui, &mut rgba, egui::color_picker::Alpha::Opaque).changed();
-            changed.then(|| json!([rgba.r(), rgba.g(), rgba.b()]))
+            let mut rgb = [c[0] as f32, c[1] as f32, c[2] as f32];
+            let changed = crate::widgets::srgb_color_button(ui, &mut rgb).changed();
+            changed.then(|| json!(rgb))
         }
         (KV::Gradient(_), _) => {
             ui.label(egui::RichText::new(tr("Edit in the Timeline")).weak());

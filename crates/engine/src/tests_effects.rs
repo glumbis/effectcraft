@@ -111,6 +111,29 @@ fn reset_effect_restores_defaults_in_one_undo_step() {
 }
 
 #[test]
+fn reset_restores_parameters_inside_twirl_down_groups() {
+    let (mut s, a, _) = comp_with_two_solids();
+    // Fractal and Scribble keep most parameters in groups (`mandelbrot/…`, `edgeOptions/…`).
+    for (effect, changes) in [
+        ("Fractal", [("setChoice", json!(1)), ("mandelbrot/mandelbrotX", json!(1.25)), ("fractalColor/hue", json!(90.0))]),
+        ("Scribble", [("scribble", json!(2)), ("edgeOptions/edgeWidth", json!(33.0)), ("strokeOptions/spacing", json!(9.0))]),
+    ] {
+        let fx = apply(&mut s, a, effect);
+        let group = |s: &Session| layer(s, a).effects().unwrap().groups().find(|g| g.uid == fx).unwrap().clone();
+        let defaults: Vec<_> = changes.iter().map(|(id, _)| group(&s).prop(id).unwrap().value.clone()).collect();
+        for (id, v) in &changes {
+            let uid = group(&s).prop(id).unwrap().uid;
+            s.execute("prop.set", json!({"layer": a, "prop": uid, "value": v})).unwrap();
+            assert_ne!(group(&s).prop(id).unwrap().value, defaults[changes.iter().position(|(i, _)| i == id).unwrap()], "{effect} {id} changed");
+        }
+        s.execute("effect.reset", json!({"layer": a, "effect": fx})).unwrap();
+        for ((id, _), d) in changes.iter().zip(&defaults) {
+            assert_eq!(&group(&s).prop(id).unwrap().value, d, "{effect} {id} back to its default");
+        }
+    }
+}
+
+#[test]
 fn reset_keys_animated_params_at_the_cti() {
     let (mut s, a, _) = comp_with_two_solids();
     let blur = apply(&mut s, a, "Gaussian Blur");

@@ -204,6 +204,8 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 _ => None,
             })
         });
+        // The shortcut field must not also type the key it just recorded (Alt+R came out as `rAlt+R`).
+        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })));
         if let Some((k, m)) = got {
             st.recording = false;
             if k != egui::Key::Escape
@@ -586,6 +588,41 @@ mod tests {
         }
         assert_eq!(split("Cmd+Shift+K"), ([false, true, false, true], "K".into()));
         assert_eq!(split("Cmd++"), ([false, true, false, false], "+".into()));
+        // The plus key, with and without modifiers, parses back (typed by hand or recorded).
+        for txt in ["+", "Cmd++", "Alt++"] {
+            assert_eq!(crate::menus::parse_shortcut(txt).map(|(_, k)| k), Some(egui::Key::Plus), "{txt}");
+        }
+        assert_eq!(crate::menus::parse_shortcut("Alt+R").map(|(m, k)| (m.alt, k)), Some((true, egui::Key::R)));
         assert_eq!(split("F9"), ([false; 4], "F9".into()));
+    }
+
+    fn frame(app: &mut EffectcraftApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        app.auto.begin_frame();
+        let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| crate::panels::dialogs::show(app, ui.ctx()));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn recording_a_shortcut_does_not_also_type_the_key_into_the_field() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
+        open(&mut app);
+        app.dialog_state.shortcuts.selected = app.session.shortcuts().bindables.first().map(|b| b.key.clone());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let [x, y, w, h] = app.auto.find("shortcuts.record").expect("shortcut field").rect;
+        let at = pos2(x + w / 2.0, y + h / 2.0);
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at), click(true)]);
+        frame(&mut app, &ctx, vec![click(false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.dialog_state.shortcuts.recording);
+        // Alt+R arrives as the key and as the typed text `r`.
+        let key = egui::Event::Key { key: egui::Key::R, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::ALT };
+        frame(&mut app, &ctx, vec![key, egui::Event::Text("r".into())]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.dialog_state.shortcuts.pending, "Alt+R");
     }
 }

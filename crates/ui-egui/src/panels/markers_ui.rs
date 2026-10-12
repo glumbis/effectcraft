@@ -128,11 +128,11 @@ pub fn dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     super::dialogs::modal(ctx, &title, vec2(520.0, 560.0), t, |ui| {
         egui::Grid::new("marker-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label(tr("Time:"));
-            let r = ui.add(egui::DragValue::new(&mut d.time).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.time).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3)));
             app.auto.add("dialog.marker.time", r.rect, "Time");
             ui.end_row();
             ui.label(tr("Duration:"));
-            let r = ui.add(egui::DragValue::new(&mut d.duration).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.duration).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3)));
             app.auto.add("dialog.marker.duration", r.rect, "Duration");
             ui.end_row();
             ui.label(tr("Comment:"));
@@ -337,7 +337,7 @@ fn marker(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: 
         ctx.data_mut(|d| d.remove::<(Option<u64>, usize, bool)>(drag_state_id()));
         app.session.history.merge_key = None;
     }
-    resp.context_menu(|ui| {
+    crate::widgets::context_menu(&resp, |ui| {
         let run = |ui: &mut egui::Ui, label: &str, cmd: &str, params: Value, app: &mut EffectcraftApp| {
             if ui.button(label).clicked() {
                 if cmd == "dialog" {

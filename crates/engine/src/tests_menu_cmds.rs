@@ -3,6 +3,7 @@
 
 use effectcraft_keyframe::Value as KV;
 use effectcraft_project::{FrameBlend, ItemKind, MatteKind, Quality, Sampling};
+use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use crate::{EngineError, Event, Session};
@@ -103,6 +104,152 @@ fn transform_dialog_values_and_center_anchor() {
     assert_eq!(layer(&s, a).auto_orient, effectcraft_project::AutoOrient::AlongPath);
 }
 
+/// Inclusive bounds of samples whose alpha is above one half, plus the frame size and the count.
+fn opaque_bounds(s: &Session, t: Tick) -> (u32, u32, i64, i64, i64, i64, u32) {
+    let img = s.render(s.active_comp_id().unwrap(), t, Default::default());
+    let mut n = 0u32;
+    let mut x0 = i64::MAX;
+    let mut y0 = i64::MAX;
+    let mut x1 = i64::MIN;
+    let mut y1 = i64::MIN;
+    for y in 0..img.height as i64 {
+        for x in 0..img.width as i64 {
+            if img.get(x, y)[3] > 0.5 {
+                n += 1;
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    (img.width, img.height, x0, y0, x1, y1, n)
+}
+
+#[test]
+fn separated_position_follows_canvas_resize_and_crop() {
+    let square = |separated: bool| {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "Test", "width": 100, "height": 100, "frameRate": 10, "duration": 2})).unwrap();
+        let a = s.execute("layer.newSolid", json!({"name": "Square", "color": "#ffffff", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setTransform", json!({"layer": a, "prop": "position", "value": [40, 50]})).unwrap();
+        if separated {
+            s.execute("prop.separateDimensions", json!({"layer": a, "value": true})).unwrap();
+        }
+        (s, a)
+    };
+    let placed = |s: &Session, a: u64, t: f64, x: f64, y: f64| {
+        let l = layer(s, a);
+        let tr = l.transform().unwrap();
+        let at = Tick::from_seconds_f64(t);
+        if tr.get("positionX").is_some() {
+            assert!((tr.get("positionX").unwrap().value_at(at).as_f64() - x).abs() < 1e-6);
+            assert!((tr.get("positionY").unwrap().value_at(at).as_f64() - y).abs() < 1e-6);
+        }
+        let p = tr.get("position").unwrap().value_at(at).as_vec3();
+        assert!((p[0] - x).abs() < 1e-6 && (p[1] - y).abs() < 1e-6, "combined {p:?}");
+    };
+
+    let (mut combined, a) = square(false);
+    let (mut separated, b) = square(true);
+    assert_eq!(opaque_bounds(&combined, Tick::ZERO), opaque_bounds(&separated, Tick::ZERO));
+    combined.execute("comp.settings", json!({"width": 200})).unwrap();
+    separated.execute("comp.settings", json!({"width": 200})).unwrap();
+    placed(&separated, b, 0.0, 90.0, 50.0);
+    placed(&combined, a, 0.0, 90.0, 50.0);
+    assert_eq!(opaque_bounds(&separated, Tick::ZERO), (200, 100, 85, 45, 94, 54, 100));
+    assert_eq!(opaque_bounds(&combined, Tick::ZERO), opaque_bounds(&separated, Tick::ZERO));
+
+    let (mut separated, b) = square(true);
+    separated.execute("view.setRegionOfInterest", json!({"rect": [10, 20, 70, 70]})).unwrap();
+    separated.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    placed(&separated, b, 0.0, 30.0, 30.0);
+    assert_eq!(opaque_bounds(&separated, Tick::ZERO), (70, 70, 25, 25, 34, 34, 100));
+
+    let (mut separated, b) = square(true);
+    separated.execute("layer.select", json!({"layers": [b]})).unwrap();
+    separated.execute("comp.cropToLayerBounds", json!({})).unwrap();
+    let bounds = opaque_bounds(&separated, Tick::ZERO);
+    assert_eq!((bounds.0, bounds.1, bounds.6), (10, 10, 100));
+    assert!(bounds.2 == 0 && bounds.3 == 0, "the square fills the cropped frame: {bounds:?}");
+
+    // Two Position keys keep their spacing after the same canvas offset.
+    let (mut separated, b) = square(true);
+    separated.execute("edit.undo", json!({})).unwrap();
+    separated.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "time": 0, "value": [40, 50]})).unwrap();
+    separated.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "time": 1, "value": [60, 50]})).unwrap();
+    separated.execute("prop.separateDimensions", json!({"layer": b, "value": true})).unwrap();
+    separated.execute("comp.settings", json!({"width": 200})).unwrap();
+    placed(&separated, b, 0.0, 90.0, 50.0);
+    placed(&separated, b, 1.0, 110.0, 50.0);
+    assert_eq!(opaque_bounds(&separated, Tick::ZERO).2, 85);
+    assert_eq!(opaque_bounds(&separated, Tick::from_seconds_f64(1.0)).2, 105);
+
+    let (mut separated, b) = square(true);
+    separated.execute("edit.undo", json!({})).unwrap();
+    separated.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "time": 0, "value": [40, 50]})).unwrap();
+    separated.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "time": 1, "value": [60, 50]})).unwrap();
+    separated.execute("prop.separateDimensions", json!({"layer": b, "value": true})).unwrap();
+    separated.execute("view.setRegionOfInterest", json!({"rect": [10, 20, 70, 70]})).unwrap();
+    separated.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    placed(&separated, b, 0.0, 30.0, 30.0);
+    placed(&separated, b, 1.0, 50.0, 30.0);
+    assert_eq!(opaque_bounds(&separated, Tick::ZERO), (70, 70, 25, 25, 34, 34, 100));
+    assert_eq!(opaque_bounds(&separated, Tick::from_seconds_f64(1.0)), (70, 70, 45, 25, 54, 34, 100));
+}
+
+/// Pixel-centre of the opaque samples, so a 10×10 solid centred on (11, 22) reports (11, 22).
+fn opaque_centroid(s: &Session) -> (f64, f64, u32) {
+    let img = s.render(s.active_comp_id().unwrap(), Tick::ZERO, Default::default());
+    let mut n = 0u32;
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    for y in 0..img.height {
+        for x in 0..img.width {
+            if img.get(x as i64, y as i64)[3] > 0.5 {
+                n += 1;
+                sx += x as f64 + 0.5;
+                sy += y as f64 + 0.5;
+            }
+        }
+    }
+    assert!(n > 0, "the layer rendered nothing");
+    (sx / n as f64, sy / n as f64, n)
+}
+
+#[test]
+fn separated_position_set_transform_moves_the_layer() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Scene", "width": 100, "height": 100, "frameRate": 30, "duration": 2})).unwrap();
+    let a = s.execute("layer.newSolid", json!({"name": "Square", "color": "#ff0000", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
+    let (x, y, n) = opaque_centroid(&s);
+    assert_eq!(n, 100);
+    assert!((x - 50.0).abs() < 0.6 && (y - 50.0).abs() < 0.6, "starts centred, centroid ({x}, {y})");
+
+    s.execute("prop.separateDimensions", json!({"layer": a, "value": true})).unwrap();
+    s.execute("layer.setTransform", json!({"layers": [a], "prop": "position", "value": [11, 22]})).unwrap();
+    let l = layer(&s, a);
+    let tr = l.transform().unwrap();
+    assert!((tr.get("positionX").unwrap().value.as_f64() - 11.0).abs() < 1e-6);
+    assert!((tr.get("positionY").unwrap().value.as_f64() - 22.0).abs() < 1e-6);
+    assert_eq!(tr.get("position").unwrap().value, KV::Vec3([11.0, 22.0, 0.0]));
+    let (x, y, n) = opaque_centroid(&s);
+    assert_eq!(n, 100);
+    assert!((x - 11.0).abs() < 0.6 && (y - 22.0).abs() < 0.6, "separated position renders at ({x}, {y})");
+
+    s.execute("edit.undo", json!({})).unwrap();
+    let (x, y, _) = opaque_centroid(&s);
+    assert!((x - 50.0).abs() < 0.6 && (y - 50.0).abs() < 0.6, "undo puts it back at ({x}, {y})");
+
+    // Combined Position, the control, still moves.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(layer(&s, a).transform().unwrap().get("positionX").is_none());
+    s.execute("layer.setTransform", json!({"prop": "position", "value": [11, 22]})).unwrap();
+    let (x, y, n) = opaque_centroid(&s);
+    assert_eq!(n, 100);
+    assert!((x - 11.0).abs() < 0.6 && (y - 22.0).abs() < 0.6, "combined position renders at ({x}, {y})");
+}
+
 #[test]
 fn mask_menu_on_existing_masks() {
     let mut s = comp();
@@ -199,6 +346,53 @@ fn keyframe_clipboard_paste_and_paste_reversed() {
     assert_eq!((keys[0].value.as_f64(), keys[1].value.as_f64()), (0.0, 100.0));
 }
 
+/// #493: Edit ▸ Copy with a property selected copies that property (its value when it isn't
+/// animated, its keys when it is), and Paste sets the same property of the selected layer, as
+/// in After Effects, instead of copying the whole layer.
+#[test]
+fn copy_a_selected_property_pastes_onto_the_same_property() {
+    let mut s = comp();
+    let a = solid(&mut s, "#ff0000");
+    let b = solid(&mut s, "#00ff00");
+    let n_layers = s.active_comp().unwrap().layers.len();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/position", "value": [10, 20]})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/rotation", "value": 30})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "path": "transform/position"})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    assert!(s.state.clipboard.is_empty(), "the layer isn't copied");
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    let undo = s.history.undo.len();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.len(), n_layers);
+    assert_eq!(layer(&s, b).props.prop("transform/position").unwrap().value.as_vec3()[..2], [10.0, 20.0]);
+    assert_eq!(layer(&s, b).props.prop("transform/rotation").unwrap().value.as_f64(), 0.0, "only the copied property");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_ne!(layer(&s, b).props.prop("transform/position").unwrap().value.as_vec3()[..2], [10.0, 20.0]);
+    assert_eq!(s.history.undo.len(), undo);
+    // The Transform group with an animated Opacity: its keys (at the CTI) and the other values,
+    // in one undo step.
+    s.execute("prop.toggleAnimation", json!({"layer": a, "path": "transform/opacity"})).unwrap();
+    s.execute("time.set", json!({"time": 1.0})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/opacity", "value": 0})).unwrap();
+    let transform = layer(&s, a).props.sub("transform").unwrap().uid;
+    s.execute("prop.select", json!({"layer": a, "prop": transform})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    let undo = s.history.undo.len();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(s.history.undo.len(), undo + 1);
+    let l = layer(&s, b);
+    let keys = &l.props.prop("transform/opacity").unwrap().keys;
+    assert_eq!(keys.len(), 2);
+    assert!((keys[0].time.seconds() - 2.0).abs() < 1e-6 && keys[1].value.as_f64() == 0.0);
+    assert_eq!(l.props.prop("transform/rotation").unwrap().value.as_f64(), 30.0);
+    assert_eq!(s.active_comp().unwrap().layers.len(), n_layers);
+    s.execute("edit.undo", json!({})).unwrap();
+    let l = layer(&s, b);
+    assert!(l.props.prop("transform/opacity").unwrap().keys.is_empty() && l.props.prop("transform/rotation").unwrap().value.as_f64() == 0.0);
+}
+
 #[test]
 fn property_links_and_expression_only() {
     let mut s = comp();
@@ -251,6 +445,82 @@ fn lift_and_extract_work_area() {
     let mut spans: Vec<(f64, f64)> = c.layers.iter().map(|l| (l.in_point.seconds(), l.out_point.seconds())).collect();
     spans.sort_by(|x, y| x.0.total_cmp(&y.0));
     assert!((spans[1].0 - 2.0).abs() < 1e-6 && (spans[1].1 - 8.0).abs() < 1e-6, "{spans:?}");
+}
+
+/// A project saved with an inverted work area (by an older build) is edited without a panic:
+/// `clamp` with crossed bounds would abort.
+#[test]
+fn an_inverted_saved_work_area_takes_an_end_edit() {
+    let mut s = comp();
+    let cid = s.active_comp_id().unwrap();
+    std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().work_area = (Tick::from_seconds_f64(9.0), Tick::from_seconds_f64(2.0));
+    s.execute("comp.workArea", json!({"end": 1.0})).unwrap();
+    s.execute("comp.workArea", json!({"start": 50.0})).unwrap();
+    let c = s.active_comp().unwrap();
+    assert!(c.work_area.0 >= Tick::ZERO && c.work_area.0 + c.frame_duration() <= c.work_area.1 && c.work_area.1 <= c.duration);
+}
+
+#[test]
+fn work_area_stays_ordered_when_the_start_passes_the_end() {
+    let ordered = |s: &Session| {
+        let c = s.active_comp().unwrap();
+        let fd = c.frame_duration();
+        assert!(c.duration >= fd, "duration {}", c.duration.seconds());
+        assert!(c.work_area.0 >= Tick::ZERO);
+        assert!(c.work_area.0 + fd <= c.work_area.1, "start {} end {}", c.work_area.0.seconds(), c.work_area.1.seconds());
+        assert!(c.work_area.1 <= c.duration);
+        (c.duration, c.work_area)
+    };
+    let one_frame_at_two = |s: &Session| {
+        let end = Tick::from_seconds_f64(2.0);
+        (end - s.active_comp().unwrap().frame_duration(), end)
+    };
+
+    let mut s = comp();
+    s.execute("comp.workArea", json!({"end": 2.0})).unwrap();
+    s.execute("comp.workArea", json!({"start": 8.0})).unwrap();
+    assert_eq!(ordered(&s).1, one_frame_at_two(&s));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(ordered(&s).1, (Tick::ZERO, Tick::from_seconds_f64(2.0)));
+
+    s.execute("comp.workArea", json!({"start": 0.0, "end": 2.0})).unwrap();
+    s.execute("comp.trimToWorkArea", json!({})).unwrap();
+    assert_eq!(ordered(&s), (Tick::from_seconds_f64(2.0), (Tick::ZERO, Tick::from_seconds_f64(2.0))));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(ordered(&s).0, Tick::from_seconds_f64(10.0));
+
+    let mut s = comp();
+    s.execute("comp.workArea", json!({"start": 9.0, "end": 10.0})).unwrap();
+    let before = ordered(&s);
+    s.execute("comp.settings", json!({"duration": 2.0})).unwrap();
+    let (dur, wa) = ordered(&s);
+    assert_eq!(dur, Tick::from_seconds_f64(2.0));
+    assert_eq!(wa, one_frame_at_two(&s));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(ordered(&s), before);
+
+    let mut s = comp();
+    s.execute("comp.workArea", json!({"end": 2.0})).unwrap();
+    s.execute("time.set", json!({"time": 8.0})).unwrap();
+    s.execute("comp.workArea", json!({"set": "begin"})).unwrap();
+    assert_eq!(ordered(&s).1, one_frame_at_two(&s));
+    let path = tmp("WorkArea.ecproj");
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    s.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!(ordered(&s).1, one_frame_at_two(&s));
+
+    // A project that already has an inverted interval must not trim into a negative duration.
+    let mut s = comp();
+    let cid = s.state.active_comp.unwrap();
+    {
+        let c = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap();
+        c.work_area = (Tick::from_seconds_f64(8.0), Tick::from_seconds_f64(2.0));
+    }
+    let err = s.execute("comp.trimToWorkArea", json!({})).unwrap_err();
+    assert!(err.to_string().contains("work area"), "{err}");
+    let c = s.active_comp().unwrap();
+    assert_eq!(c.duration, Tick::from_seconds_f64(10.0));
+    assert_eq!(c.work_area, (Tick::from_seconds_f64(8.0), Tick::from_seconds_f64(2.0)));
 }
 
 #[test]

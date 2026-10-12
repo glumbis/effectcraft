@@ -1,9 +1,13 @@
 //! Branching history: undo then a new step keeps the undone line as a branch; the tree lists
 //! every state; jumping to any state (on any branch) restores it and keeps everything else.
 
+use std::sync::Arc;
+
+use effectcraft_project::Project;
 use serde_json::{Value, json};
 
 use crate::Session;
+use crate::history::{Branch, History};
 
 fn names(s: &Session) -> Vec<String> {
     s.project.comps().next().map(|(_, c)| c.layers.iter().map(|l| l.name.clone()).collect()).unwrap_or_default()
@@ -189,4 +193,47 @@ fn a_session_restored_with_unsaved_changes_stays_modified() {
     solid(&mut s, "A");
     s.execute("edit.undo", json!({})).unwrap();
     assert!(s.is_dirty(), "undo doesn't reach a saved state");
+}
+
+#[test]
+fn dropped_redo_parent_does_not_discard_reachable_branches() {
+    let state = || Arc::new(Project::default());
+    let current = state();
+    let futures: Vec<_> = (0..5).map(|_| state()).collect();
+    let reachable = state();
+    let mut history = History {
+        redo: futures.iter().rev().map(|p| ("future".into(), p.clone())).collect(),
+        branches: vec![
+            Branch { parent: current.clone(), steps: vec![("reachable".into(), reachable.clone())] },
+            Branch { parent: futures[4].clone(), steps: vec![("orphan1".into(), state()), ("orphan2".into(), state())] },
+        ],
+        ..Default::default()
+    };
+    history.trim(2, &current);
+    assert_eq!(history.redo.len(), 2);
+    assert_eq!(history.branches.len(), 1);
+    assert!(Arc::ptr_eq(&history.branches[0].steps[0].1, &reachable));
+    assert_eq!(history.branch_states(), 1);
+    assert!(history.tree(&current).iter().any(|node| node.label == "reachable"));
+}
+
+#[test]
+fn evicted_branch_parent_does_not_discard_other_reachable_branches() {
+    let state = || Arc::new(Project::default());
+    let current = state();
+    let parent = state();
+    let reachable = state();
+    let mut history = History {
+        branches: vec![
+            Branch { parent: current.clone(), steps: vec![("parent".into(), parent.clone())] },
+            Branch { parent: current.clone(), steps: vec![("reachable".into(), reachable.clone())] },
+            Branch { parent, steps: vec![("orphan1".into(), state()), ("orphan2".into(), state())] },
+        ],
+        ..Default::default()
+    };
+    history.trim(2, &current);
+    assert_eq!(history.branches.len(), 1);
+    assert!(Arc::ptr_eq(&history.branches[0].steps[0].1, &reachable));
+    assert_eq!(history.branch_states(), 1);
+    assert_eq!(history.tree(&current).len(), 2);
 }

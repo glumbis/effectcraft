@@ -60,6 +60,8 @@ pub struct DialogState {
     pub unsaved: super::unsaved::Pending,
     /// Deleting Project items in use: the deletion waiting on the prompt.
     pub delete_items: super::delete_items::Pending,
+    /// The Gradient Editor's draft and the property it edits.
+    pub gradient: super::gradient_editor::Draft,
 }
 
 pub fn open_new_comp(app: &mut EffectcraftApp) {
@@ -149,18 +151,34 @@ pub fn route_layer_settings(app: &mut EffectcraftApp, id: &str, params: &Value) 
     }
 }
 
+/// The room a modal dialog may take: the window less a margin.
+fn modal_space(ctx: &egui::Context) -> egui::Vec2 {
+    (ctx.content_rect().size() - vec2(48.0, 48.0)).max(vec2(120.0, 80.0))
+}
+
 pub(crate) fn modal(ctx: &egui::Context, title: &str, size: egui::Vec2, t: &Tokens, body: impl FnOnce(&mut egui::Ui)) {
-    let available = (ctx.content_rect().size() - vec2(48.0, 48.0)).max(vec2(120.0, 80.0));
-    let size = size.min(available);
+    let max_height = (modal_space(ctx).y - 84.0).max(40.0);
+    modal_fit(ctx, title, size, t, |ui, _| {
+        egui::ScrollArea::both().max_height(max_height).auto_shrink([false, true]).show(ui, body);
+    });
+}
+
+/// [`modal`] without its scroll area, for a dialog that keeps its buttons in view and scrolls
+/// only its content: `body` gets the height left under the title, with `size` kept within the
+/// window.
+pub(crate) fn modal_fit(ctx: &egui::Context, title: &str, size: egui::Vec2, t: &Tokens, body: impl FnOnce(&mut egui::Ui, f32)) {
+    let size = size.min(modal_space(ctx));
     egui::Modal::new(egui::Id::new(("modal", title)))
         .backdrop_color(Color32::from_black_alpha(120))
         .frame(egui::Frame::window(&ctx.style_of(ctx.theme())).fill(t.panel_bg).inner_margin(egui::Margin::same(18)))
         .show(ctx, |ui| {
             ui.set_width(size.x - 36.0);
             ui.set_min_height(size.y - 36.0);
-            ui.label(egui::RichText::new(title).font(Tokens::semibold(15.0)).color(t.tab_text_active));
+            // The id stays keyed on the untranslated source, so switching language cannot move it.
+            ui.label(egui::RichText::new(tr(title)).font(Tokens::semibold(15.0)).color(t.tab_text_active));
             ui.add_space(10.0);
-            egui::ScrollArea::both().max_height((available.y - 84.0).max(40.0)).auto_shrink([false, true]).show(ui, body);
+            let title_h = ui.cursor().top() - ui.min_rect().top();
+            body(ui, (size.y - 36.0 - title_h).max(40.0));
         });
 }
 
@@ -192,6 +210,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context) {
         Dialog::RenderTemplates => super::rq_templates::show(app, ctx, &t),
         Dialog::UnsavedChanges => super::unsaved::show(app, ctx, &t),
         Dialog::DeleteItems => super::delete_items::show(app, ctx, &t),
+        Dialog::GradientEditor => super::gradient_editor::show(app, ctx, &t),
     }
 }
 
@@ -291,7 +310,7 @@ fn about_main(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, cmd: &mut
         );
         let foreground = if discord { Color32::WHITE } else { t.text };
         icons::paint(p, Rect::from_center_size(pos2(r.min.x + 18.0, r.center().y), vec2(15.0, 15.0)), icon, foreground);
-        p.text(pos2(r.min.x + 36.0, r.center().y), Align2::LEFT_CENTER, label, Tokens::medium(12.5), foreground);
+        p.text(pos2(r.min.x + 36.0, r.center().y), Align2::LEFT_CENTER, tr(label), Tokens::medium(12.5), foreground);
         p.text(
             pos2(r.max.x - 12.0, r.center().y),
             Align2::RIGHT_CENTER,
@@ -360,14 +379,14 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             let (ow, oh) = (size[0], size[1]);
             ui.label(tr("Width:"));
             ui.horizontal(|ui| {
-                let r = ui.add(egui::DragValue::new(&mut size[0]).range(1..=30000).suffix(" px"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut size[0]).range(1..=30000).suffix(" px")));
                 auto.add("dialog.solid.width", r.rect, "Width");
                 let r = ui.checkbox(&mut lock, tr_args("Lock Aspect Ratio to {}", &[&(super::comp_settings::aspect_label(ow as f64, oh as f64))]));
                 auto.add("dialog.solid.lockAspect", r.rect, "Lock Aspect Ratio");
             });
             ui.end_row();
             ui.label(tr("Height:"));
-            let r = ui.add(egui::DragValue::new(&mut size[1]).range(1..=30000).suffix(" px"));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut size[1]).range(1..=30000).suffix(" px")));
             auto.add("dialog.solid.height", r.rect, "Height");
             ui.end_row();
             if lock && ow > 0 && oh > 0 {
@@ -418,8 +437,8 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         if editing.is_some() {
             ui.add_space(8.0);
             let r = ui
-                .add_enabled(shared, egui::Checkbox::new(&mut affect_all, "Affect all layers that use this solid"))
-                .on_disabled_hover_text("Only this layer uses this solid.");
+                .add_enabled(shared, egui::Checkbox::new(&mut affect_all, tr("Affect all layers that use this solid")))
+                .on_disabled_hover_text(tr("Only this layer uses this solid."));
             auto.add("dialog.solid.affectAll", r.rect, "Affect all layers that use this solid");
             if shared && !affect_all {
                 ui.label(egui::RichText::new(tr("This change will create a new solid for this layer.")).color(t.text_dim).size(11.0));

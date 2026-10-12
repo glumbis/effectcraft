@@ -344,7 +344,9 @@ pub(crate) fn audio_file(job: &Cx, comp: &Comp, aiff: bool, st: &mut State) -> R
     let mut reported = 0u64;
     while done < n {
         let k = block.min(n - done);
-        let t = Tick((((start + done as i64) as i128 * TICKS_PER_SECOND as i128) / sr as i128) as i64);
+        let sample = start + done as i64;
+        let t = Tick::from_units(sample, i64::from(sr));
+        let t = if t.to_units_floor(i64::from(sr)) < sample { Tick(t.0.saturating_add(1)) } else { t };
         pcm.extend(pcm_bytes(&mix(job, t, k, sr), fmt, aiff));
         done += k;
         let now = (done as u64 * total_frames / n.max(1) as u64).min(total_frames);

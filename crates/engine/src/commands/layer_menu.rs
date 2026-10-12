@@ -192,6 +192,32 @@ fn set_transform(s: &mut Session, p: &Value) -> Result<Value> {
         for lid in &ids {
             let l = layer_mut(proj, cid, *lid)?;
             let lt = l.layer_time(t);
+            // Separate Dimensions: the picture follows X/Y/Z Position, not the combined property.
+            if m == "position" && l.transform().is_some_and(|tr| tr.get("positionX").is_some()) {
+                let cur = l
+                    .transform()
+                    .map(|tr| {
+                        [
+                            tr.get("positionX").map(|p| p.value_at(lt).as_f64()).unwrap_or(0.0),
+                            tr.get("positionY").map(|p| p.value_at(lt).as_f64()).unwrap_or(0.0),
+                            tr.get("positionZ").map(|p| p.value_at(lt).as_f64()).unwrap_or(0.0),
+                        ]
+                    })
+                    .unwrap_or([0.0; 3]);
+                // Two numbers keep the current z.
+                let j = match &v {
+                    Value::Array(a) if a.len() == 2 => json!([a[0], a[1], cur[2]]),
+                    _ => v.clone(),
+                };
+                let nv = KV::Vec3(cur).coerce_json(&j).ok_or_else(|| bad("layer.setTransform", format!("can't use {v} for {label}")))?;
+                let xyz = nv.as_vec3();
+                let Some(tr) = l.transform_mut() else { continue };
+                super::layer::update_position(tr, lt, |_| xyz);
+                if let Some(pr) = tr.get_mut("position") {
+                    pr.set_value_at(lt, KV::Vec3(xyz));
+                }
+                continue;
+            }
             let Some(pr) = l.transform_mut().and_then(|tr| tr.get_mut(m)) else { continue };
             let cur = pr.value_at(lt);
             // Two numbers for a 3D value keep the current z.

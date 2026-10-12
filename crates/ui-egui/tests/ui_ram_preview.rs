@@ -125,3 +125,23 @@ fn prefetch_waits_while_edits_keep_coming() {
     let series = h.state().shown_series(ItemId(c));
     assert!(h.state().frames.cached_frames(&series).len() > 1, "prefetch resumed");
 }
+
+/// #595: at Third (and other resolutions that aren't a whole number of thousandths) the cache
+/// bars find the rendered frames. The series they count was rebuilt from the frame key's scale
+/// (333 → 0.333), whose render options hashed apart from the frames rendered at 0.3333….
+#[test]
+fn cached_frames_are_counted_at_one_third_resolution() {
+    use effectcraft_ui_egui::state::Resolution;
+    for res in [Resolution::Third, Resolution::Custom(7)] {
+        let mut s = Session::default();
+        let c = s.execute("comp.new", json!({"name": "Third", "width": 64, "height": 36, "duration": 1})).unwrap()["comp"].as_u64().unwrap();
+        s.execute("layer.newSolid", json!({"color": "#3080ff"})).unwrap();
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| EffectcraftApp::new(s));
+        h.state_mut().ui.viewer.res = res;
+        settle(&mut h);
+        let series = h.state().shown_series(ItemId(c));
+        assert_eq!(series.scale, (res.scale(1.0, 1.0) * 1000.0).round() as u32, "{res:?}");
+        assert!(shown_cached(&h, c), "{res:?}: the shown frame counts as cached");
+        assert!(!h.state().frames.cached_frames(&series).is_empty(), "{res:?}");
+    }
+}

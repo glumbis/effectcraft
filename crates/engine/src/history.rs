@@ -206,19 +206,26 @@ impl History {
         self.branches.push(Branch { parent: from.clone(), steps });
     }
 
-    /// Apply the undo-levels limit: drop the oldest working-line states, the branches that grew
-    /// from them, and the oldest branches when branches hold more states than `levels`.
+    /// Apply the undo-levels limit: keep the nearest past and future states on the working
+    /// line, drop branches whose parents were removed, and bound branch states separately.
     pub fn trim(&mut self, levels: usize, current: &Arc<Project>) {
         let levels = levels.max(1);
         if self.undo.len() > levels {
             let extra = self.undo.len() - levels;
             self.undo.drain(..extra);
         }
-        let mut total: usize = self.branches.iter().map(|b| b.steps.len()).sum();
-        while total > levels && !self.branches.is_empty() {
-            total -= self.branches.remove(0).steps.len();
+        if self.redo.len() > levels {
+            // The next redo is last: discard the farthest future states first.
+            let extra = self.redo.len() - levels;
+            self.redo.drain(..extra);
         }
+        // Orphans from truncated line states must not consume the reachable branch budget.
         self.prune(current);
+        while self.branch_states() > levels && !self.branches.is_empty() {
+            self.branches.remove(0);
+            // Removing a parent branch also removes its descendants before counting again.
+            self.prune(current);
+        }
     }
 
     /// Drop branches whose parent state is no longer in the history (`current` = the current

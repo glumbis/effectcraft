@@ -10,10 +10,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use effectcraft_ui_egui::audio::{AudioDevice, AudioFeed, AudioOutput};
+
+/// Device callback period: about 10 ms, clamped so Pulse/PipeWire/ALSA does not open a
+/// multi-hundred-millisecond default buffer that plays as silence at the start of preview (#554).
+fn preferred_buffer_frames(rate: u32) -> u32 {
+    (rate / 100).clamp(256, 2048)
+}
+
+/// Wait until the feeder has mixed a block, or until preview is stopped. Starting the stream
+/// before that fills the device with silence, so the first real samples are heard late (#554).
+fn wait_to_play(feed: &AudioFeed, stop: &mpsc::Receiver<()>) -> bool {
+    loop {
+        if feed.queued_frames() > 0 {
+            return true;
+        }
+        match stop.recv_timeout(Duration::from_millis(2)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
 
 pub struct CpalOut {
     out: AudioOutput,
@@ -131,21 +152,44 @@ impl AudioDevice for CpalOut {
                 };
                 let mut cfg: cpal::StreamConfig = sup.config();
                 cfg.sample_rate = cpal::SampleRate(rate);
-                let stream = match sup.sample_format() {
-                    cpal::SampleFormat::F32 => run::<f32>(&dev, &cfg, feed, latency, map),
-                    cpal::SampleFormat::I16 => run::<i16>(&dev, &cfg, feed, latency, map),
-                    cpal::SampleFormat::U16 => run::<u16>(&dev, &cfg, feed, latency, map),
-                    cpal::SampleFormat::I32 => run::<i32>(&dev, &cfg, feed, latency, map),
+                // A short period only where the default one is long (ALSA/PulseAudio on Linux, #554),
+                // and only within what the device reports it takes.
+                if cfg!(target_os = "linux") {
+                    let want = preferred_buffer_frames(rate);
+                    cfg.buffer_size = match sup.buffer_size() {
+                        cpal::SupportedBufferSize::Range { min, max } if *min <= *max => cpal::BufferSize::Fixed(want.clamp(*min, *max)),
+                        _ => cpal::BufferSize::Default,
+                    };
+                }
+                let build = |cfg: &cpal::StreamConfig| match sup.sample_format() {
+                    cpal::SampleFormat::F32 => run::<f32>(&dev, cfg, feed.clone(), latency.clone(), map),
+                    cpal::SampleFormat::I16 => run::<i16>(&dev, cfg, feed.clone(), latency.clone(), map),
+                    cpal::SampleFormat::U16 => run::<u16>(&dev, cfg, feed.clone(), latency.clone(), map),
+                    cpal::SampleFormat::I32 => run::<i32>(&dev, cfg, feed.clone(), latency.clone(), map),
                     f => Err(format!("unsupported sample format {f:?}")),
                 };
-                let stream = match stream.and_then(|s| s.play().map(|_| s).map_err(|e| e.to_string())) {
+                let stream = match build(&cfg) {
                     Ok(s) => s,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
+                    Err(_) => {
+                        // Some hosts reject a fixed period; a large default still plays, just later.
+                        cfg.buffer_size = cpal::BufferSize::Default;
+                        match build(&cfg) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(e));
+                                return;
+                            }
+                        }
                     }
                 };
                 let _ = ready_tx.send(Ok(()));
+                if !wait_to_play(&feed, &stop_rx) {
+                    return;
+                }
+                if let Err(e) = stream.play() {
+                    eprintln!("effectcraft: audio output: {e}");
+                    return;
+                }
                 let _ = stop_rx.recv();
                 drop(stream);
             })
@@ -172,5 +216,39 @@ impl AudioDevice for CpalOut {
 impl Drop for CpalOut {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_buffer_is_about_ten_milliseconds() {
+        assert_eq!(preferred_buffer_frames(48_000), 480);
+        assert_eq!(preferred_buffer_frames(8_000), 256);
+        assert_eq!(preferred_buffer_frames(192_000), 1920);
+    }
+
+    #[test]
+    fn wait_to_play_returns_once_the_feeder_has_samples() {
+        let feed = Arc::new(AudioFeed::default());
+        let (_tx, rx) = mpsc::channel();
+        let f = feed.clone();
+        let h = std::thread::spawn(move || wait_to_play(&f, &rx));
+        assert_eq!(feed.queued_frames(), 0);
+        std::thread::sleep(Duration::from_millis(20));
+        feed.push(&[0.1, 0.2]);
+        assert!(h.join().unwrap());
+        assert_eq!(feed.queued_frames(), 1);
+    }
+
+    #[test]
+    fn wait_to_play_stops_without_samples() {
+        let feed = AudioFeed::default();
+        let (tx, rx) = mpsc::channel();
+        let h = std::thread::spawn(move || wait_to_play(&feed, &rx));
+        tx.send(()).unwrap();
+        assert!(!h.join().unwrap());
     }
 }

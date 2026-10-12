@@ -243,6 +243,7 @@ fn keys_and_3d() {
     effect_case("ec.key.ccsimplewireremoval", &[]);
     effect_case("ec.key.ccsimplewireremoval", &[("removalStyle", e(0)), ("thickness", n(8.0)), ("slope", n(50.0))]);
     effect_case("ec.key.ccsimplewireremoval", &[("removalStyle", e(1)), ("mirrorBlend", n(60.0)), ("pointB", pt(60.0, 10.0))]);
+    effect_case("ec.key.ccsimplewireremoval", &[("removalStyle", e(1)), ("frameOffset", n(-2.0)), ("thickness", n(6.0))]);
     effect_case("ec.key.ccsimplewireremoval", &[("removalStyle", e(3)), ("mirrorBlend", n(30.0)), ("slope", n(20.0))]);
     effect_case("ec.obsolete.basic3d", &[("swivel", n(25.0))]);
     effect_case("ec.obsolete.basic3d", &[("tilt", n(-30.0)), ("swivel", n(10.0)), ("specularHighlight", on())]);

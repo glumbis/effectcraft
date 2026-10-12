@@ -14,7 +14,10 @@
 //! * **Blend Colors Using 1.0 Gamma**: only blending is linear. Each layer's finished pixels
 //!   are linearised just before they are transformed and blended, the comp accumulates in linear
 //!   and is encoded back to the working space when the comp is done (so precomps hand encoded
-//!   pixels to their parent). Without a working space the sRGB curve is used.
+//!   pixels to their parent). Without a working space the Working Gamma's curve is used (sRGB
+//!   at 2.2, a pure 2.4 power curve at 2.4); so is it for Interpret As Linear Light footage
+//!   and for float footage (OpenEXR, float TIFF), whose linear values are encoded once
+//!   ([`Pipe::float_curve`]).
 
 use effectcraft_color::{ColorSpace, Conversion};
 use effectcraft_project::{Footage, HdrMode, ProjectSettings};
@@ -36,6 +39,8 @@ pub struct Pipe {
     pub out: ColorSpace,
     /// HDR handling for standard-dynamic-range output.
     pub hdr: HdrMode,
+    /// Unmanaged with Working Gamma 2.4: the pure 2.4 power curve instead of sRGB's.
+    pub gamma24: bool,
 }
 
 impl Pipe {
@@ -49,12 +54,34 @@ impl Pipe {
             linear_blend: s.blend_linear && !linear,
             out: s.output_space.unwrap_or(ColorSpace::Srgb),
             hdr: s.hdr,
+            gamma24: s.working_space.is_none() && s.working_gamma_24(),
         }
     }
 
-    /// The space whose curve encodes working-space pixels (sRGB when unmanaged).
+    /// The space whose curve encodes working-space pixels (unmanaged: the Working Gamma's, sRGB
+    /// at 2.2 and Rec. 709's pure 2.4 power curve at 2.4).
     fn curve(&self) -> ColorSpace {
-        self.space.unwrap_or(ColorSpace::Srgb)
+        self.space.unwrap_or(if self.gamma24 { ColorSpace::Rec709 } else { ColorSpace::Srgb })
+    }
+
+    /// The space Interpret As Linear Light encodes footage `f` in: its colour profile, else sRGB
+    /// (managed; the working space converts from there) or the Working Gamma's curve (unmanaged).
+    pub fn linear_footage_space(&self, f: &Footage) -> ColorSpace {
+        f.color_profile.unwrap_or(if self.space.is_some() { ColorSpace::Srgb } else { self.curve() })
+    }
+
+    /// How float footage `f` (OpenEXR, float TIFF; linear light) is decoded: as stored when
+    /// Interpret As Linear Light encodes it afterwards (once, with
+    /// [`Pipe::linear_footage_space`]), else with the Working Gamma's curve when unmanaged and
+    /// the sRGB curve otherwise (the working space converts from there).
+    pub fn float_curve(&self, f: &Footage) -> crate::FloatCurve {
+        if f.linear_light_applies() { crate::FloatCurve::Linear } else { self.float_encoding() }
+    }
+
+    /// The curve float footage is encoded with when nothing interprets it afterwards: the
+    /// Working Gamma's when unmanaged (sRGB at 2.2, a pure 2.4 power curve at 2.4), else sRGB.
+    pub fn float_encoding(&self) -> crate::FloatCurve {
+        if self.space.is_none() && self.gamma24 { crate::FloatCurve::Gamma24 } else { crate::FloatCurve::Srgb }
     }
 
     /// Footage `f` from its colour profile (`None` = sRGB) → working space; nothing for
@@ -149,6 +176,7 @@ impl Pipe {
         k = k.wrapping_mul(31).wrapping_add(self.space.map_or(7, |s| s as u64 + 11));
         k = k.wrapping_mul(31).wrapping_add(self.linear as u64 * 2 + self.linear_blend as u64);
         k = k.wrapping_mul(31).wrapping_add(self.out as u64 * 4 + self.hdr as u64);
+        k = k.wrapping_mul(31).wrapping_add(self.gamma24 as u64);
         k
     }
 }
@@ -195,12 +223,20 @@ pub fn quantize(img: &mut Image, levels: f32) {
 #[allow(clippy::manual_clamp)] // max/min map NaN to 0; clamp would keep NaN
 #[inline(always)]
 fn quantize_px(p: &mut [f32; 4], levels: f32, inv: f32) {
-    let a = (p[3].max(0.0).min(1.0) * levels + 0.5) as u32 as f32 * inv;
+    let a = round_half_up(p[3].max(0.0).min(1.0) * levels) * inv;
     let hi = [a, a, a, a];
     for c in 0..3 {
-        p[c] = (p[c].max(0.0).min(hi[c]) * levels + 0.5) as u32 as f32 * inv;
+        p[c] = round_half_up(p[c].max(0.0).min(hi[c]) * levels) * inv;
     }
     p[3] = a;
+}
+
+/// `v` (0..=65 535) rounded half up. The same either way; the fastest on each target: x86-64's
+/// baseline converts to integers in one instruction but has no `floor` (SSE4.1), while in wasm
+/// `floor` is one instruction and converting back from `u32` several (about 1.5× faster there).
+#[inline(always)]
+fn round_half_up(v: f32) -> f32 {
+    if cfg!(target_arch = "wasm32") { (v + 0.5).floor() } else { (v + 0.5) as u32 as f32 }
 }
 
 /// [`quantize`] restricted to a rectangle (already clamped to the image), row-parallel.
@@ -267,4 +303,23 @@ pub fn output_hdr(img: &mut Image, to_linear: Option<Conversion>, mode: HdrMode,
         let o = encode.apply(c);
         *p = [o[0] * a, o[1] * a, o[2] * a, a];
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Both forms `round_half_up` picks between agree on everything quantising feeds it:
+    /// 0..=levels, exact halves included.
+    #[test]
+    fn rounding_forms_agree() {
+        for levels in [255.0f32, 32_768.0] {
+            for i in 0..=(levels as u32 * 16) {
+                let v = i as f32 / 16.0;
+                assert_eq!((v + 0.5).floor(), (v + 0.5) as u32 as f32, "{v}");
+            }
+            for i in 0..=100_000 {
+                let v = (i as f32 / 100_000.0) * levels;
+                assert_eq!((v + 0.5).floor(), (v + 0.5) as u32 as f32, "{v}");
+            }
+        }
+    }
 }

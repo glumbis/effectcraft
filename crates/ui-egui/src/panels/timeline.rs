@@ -14,6 +14,7 @@ use effectcraft_engine::time::Tick;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
+use crate::i18n::tr;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -57,11 +58,6 @@ fn classic_geometry_row(comp: &Comp, l: &Layer) -> bool {
     comp.renderer == effectcraft_engine::project::Renderer::Classic3D && l.is_3d() && matches!(l.source, LayerSource::Text | LayerSource::Shape)
 }
 
-/// Time navigator's visible-span bar and the work area bar.
-const NAV_BAR: Color32 = Color32::from_rgb(0x55, 0x55, 0x55);
-const WORK_AREA_BAR: Color32 = Color32::from_rgb(0x5c, 0x5c, 0x5c);
-/// Fill of the timeline's switch / A/V boxes (dark wells, as in After Effects).
-const SWITCH_BOX: Color32 = Color32::from_rgb(0x19, 0x19, 0x19);
 /// Background of the selected layer's name cell.
 const SELECTED_NAME_BG: Color32 = Color32::from_rgb(0xa6, 0xa6, 0xa6);
 
@@ -209,6 +205,29 @@ fn edge_scroll_speed(rows: Rect, y: f32, zone: f32) -> f32 {
         return 0.0;
     };
     (depth / zone).clamp(-3.0, 3.0) * 400.0
+}
+
+/// Autoscroll speed (points per second, left negative) of a ruler scrub held at `x`, past the
+/// left (`x0`) or right (`x1`) end of the visible time span: faster the further past.
+fn edge_scroll_speed_x(x0: f32, x1: f32, x: f32) -> f32 {
+    let depth = if x < x0 {
+        x - x0
+    } else if x > x1 {
+        x - x1
+    } else {
+        return 0.0;
+    };
+    (depth / 40.0).clamp(-3.0, 3.0) * 400.0 + depth.signum() * 100.0
+}
+
+/// The timeline's first visible time (`start`, showing `span` seconds of a `duration` comp)
+/// paged so the CTI at `cti` is in view: unchanged while it is, else the page that starts at
+/// the CTI (as After Effects pages the Timeline during a preview).
+fn page_to_cti(start: f64, span: f64, duration: f64, cti: f64) -> f64 {
+    if !(start.is_finite() && span.is_finite() && cti.is_finite()) || (cti >= start && cti <= start + span) {
+        return start;
+    }
+    cti.min(duration - span).max(0.0)
 }
 
 /// The text of an expression being edited when its pick whip was pressed, and the selection in
@@ -466,6 +485,21 @@ impl TMap {
     }
     pub fn t(&self, x: f32) -> f64 {
         self.start + (x - self.x0) as f64 / self.pps
+    }
+}
+
+/// A Timeline ruler tick label for comp frame `fno`: seconds:frames (`00:15f`, AE) or, when
+/// the project's Time Display Style is Frames, the frame number the current-time display shows
+/// (`00015`, counted from Start Numbering Frames At) (#710).
+fn ruler_label(fno: i64, fps_i: i64, settings: &effectcraft_engine::project::ProjectSettings) -> String {
+    if settings.time_display == effectcraft_engine::project::TimeDisplayStyle::Frames {
+        return format!("{:05}", fno.saturating_add(settings.frame_start));
+    }
+    let fps_i = fps_i.max(1);
+    if fno >= 60 * fps_i * 60 {
+        format!("{}:{:02}:{:02}f", fno / (fps_i * 60), (fno / fps_i) % 60, fno % fps_i)
+    } else {
+        format!("{:02}:{:02}f", fno / fps_i, fno % fps_i)
     }
 }
 
@@ -1188,6 +1222,34 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ctx = ui.ctx().clone();
     let Some(cid) = app.session.active_comp_id() else {
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, "(no composition)", Tokens::ui(12.0), t.text_faint);
+        // Dropping footage into an empty Timeline should create its first composition,
+        // just like dropping onto the Project panel's New Composition button (#649).
+        if let Some(crate::panels::DragPayload::Item(dragged)) = egui::DragAndDrop::payload::<crate::panels::DragPayload>(&ctx).as_deref()
+            && ui.rect_contains_pointer(rect)
+        {
+            let items: Vec<ItemId> = crate::panels::project_drop_items(app, *dragged)
+                .into_iter()
+                .map(ItemId)
+                .filter(|id| {
+                    app.session.project.item(*id).is_some_and(|item| match &item.kind {
+                        effectcraft_engine::project::ItemKind::Footage(footage) => footage.kind != effectcraft_engine::project::FootageKind::Data,
+                        effectcraft_engine::project::ItemKind::Solid(_) | effectcraft_engine::project::ItemKind::Comp(_) => true,
+                        _ => false,
+                    })
+                })
+                .collect();
+            if !items.is_empty() {
+                ui.painter().rect_stroke(rect.shrink(2.0), 0.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+                app.auto.add("timeline.newCompDrop", rect, "Drop footage to create a composition");
+                if ctx.input(|i| i.pointer.any_released()) {
+                    app.session.state.project_selection = items;
+                    if let Err(e) = crate::menus::invoke(app, &ctx, "file.newCompFromSelection", json!({})) {
+                        app.ui.status = e;
+                    }
+                    egui::DragAndDrop::clear_payload(&ctx);
+                }
+            }
+        }
         return;
     };
     let Some(comp) = app.session.project.comp_arc(cid) else { return };
@@ -1216,6 +1278,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let pps = app.ui.timeline.pps.unwrap_or(fit_pps);
     if app.ui.timeline.pps.is_none() {
         app.ui.timeline.start = 0.0;
+    } else if app.playback.playing {
+        // During playback the view pages to keep the CTI in sight (After Effects).
+        let span = ((graph_x1 - graph_x0 - 6.0) as f64 / pps).max(0.0);
+        app.ui.timeline.start = page_to_cti(app.ui.timeline.start, span, comp.duration.seconds(), app.session.time().seconds());
     }
     let tm = TMap { x0: graph_x0 + 6.0, start: app.ui.timeline.start, pps };
     ctx.data_mut(|d| d.insert_temp(tl_map_id(), (tm.x0, tm.start, tm.pps)));
@@ -1307,7 +1373,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let vis1 = (tm.t(graph_x1) / comp.duration.seconds()) as f32;
     let nav_vis =
         Rect::from_min_max(pos2(nav.min.x + nav.width() * vis0.clamp(0.0, 1.0), nav.min.y), pos2(nav.min.x + nav.width() * vis1.clamp(0.0, 1.0), nav.max.y));
-    p.rect_filled(nav_vis, 0.0, NAV_BAR);
+    p.rect_filled(nav_vis, 0.0, t.tl_nav_bar);
     for x in [nav_vis.min.x, nav_vis.max.x] {
         p.rect_filled(Rect::from_min_max(pos2(x - 3.0, nav.min.y - 1.0), pos2(x + 3.0, nav.max.y + 1.0)), 3.0, t.accent);
     }
@@ -1347,13 +1413,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let wa_row = Rect::from_min_max(pos2(graph_x0, top + header_h), pos2(rect.max.x, top + header_h + colhdr_h));
     let (wa0, wa1) = (comp.work_area.0.seconds(), comp.work_area.1.seconds());
     let wa = Rect::from_min_max(pos2(tm.x(wa0), wa_row.min.y + 3.0), pos2(tm.x(wa1), wa_row.max.y - 6.0));
-    p.with_clip_rect(wa_row).rect_filled(wa, 0.0, WORK_AREA_BAR);
+    p.with_clip_rect(wa_row).rect_filled(wa, 0.0, t.tl_work_area_bar);
     let shift = ui.input(|i| i.modifiers.shift);
     let bar = wa.intersect(wa_row);
     let bresp = ui.interact(bar, egui::Id::new("wa-bar"), Sense::click_and_drag());
     app.auto.add("timeline.workArea.bar", bar, "Work area");
     // Right-click: the work area's commands (After Effects).
-    bresp.context_menu(|ui| {
+    crate::widgets::context_menu(&bresp, |ui| {
         let mut chosen = None;
         for id in ["comp.trimToWorkArea", "edit.liftWorkArea", "edit.extractWorkArea"] {
             crate::menus::entry_for(app, ui, id, &mut chosen);
@@ -1462,11 +1528,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let x = tm.x(s);
         pr.line_segment([pos2(x, ruler.max.y - 10.0), pos2(x, ruler.max.y)], Stroke::new(1.0, t.tl_ruler_tick));
         let fno = (s / fd).round() as i64;
-        let label = if fno >= 60 * fps_i * 60 {
-            format!("{}:{:02}:{:02}f", fno / (fps_i * 60), (fno / fps_i) % 60, fno % fps_i)
-        } else {
-            format!("{:02}:{:02}f", fno / fps_i, fno % fps_i)
-        };
+        let label = ruler_label(fno, fps_i, &app.session.project.settings);
         pr.text(pos2(x + 3.0, ruler.max.y - 16.0), Align2::LEFT_CENTER, label, Tokens::ui(10.0), t.tl_ruler_text);
         for k in 1..5 {
             let xx = tm.x(s + secs_per_label * k as f64 / 5.0);
@@ -1481,7 +1543,24 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if ((rresp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down())) || rresp.clicked())
         && let Some(pt) = rresp.interact_pointer_pos()
     {
-        let mut secs = tm.t(pt.x).max(0.0);
+        let mut x = pt.x;
+        // Zoomed in, a scrub held past either end of the ruler scrolls the timeline that way
+        // (faster the further), with the CTI at the edge (After Effects).
+        let mut tm = tm;
+        if rresp.dragged() && app.ui.timeline.pps.is_some() {
+            let speed = edge_scroll_speed_x(tm.x0, graph_x1, x);
+            if speed != 0.0 {
+                let dt = f64::from(ui.input(|i| i.stable_dt).clamp(0.0, 0.1));
+                let span = f64::from(graph_x1 - tm.x0) / pps;
+                let cur = app.ui.timeline.start;
+                let hi = (comp.duration.seconds() - span).max(0.0).max(cur);
+                app.ui.timeline.start = (cur + f64::from(speed) * dt / pps).clamp(0.0, hi);
+                tm.start = app.ui.timeline.start;
+                ui.ctx().request_repaint();
+            }
+            x = x.clamp(tm.x0, graph_x1);
+        }
+        let mut secs = tm.t(x).max(0.0);
         // Shift-drag: snap to keyframes, in/out points, markers and the work area (8 px).
         if ui.input(|i| i.modifiers.shift) {
             let cands = snap_candidates(&comp, &build_rows(app, &comp));
@@ -1583,7 +1662,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let under = hresp.interact_pointer_pos().and_then(|pt| column_at(&cw, pt.x));
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-colhdr-under"), under.unwrap_or("")));
     }
-    hresp.context_menu(|ui| {
+    crate::widgets::context_menu(&hresp, |ui| {
         let under: &str = ctx.data(|d| d.get_temp(egui::Id::new("tl-colhdr-under"))).unwrap_or("");
         if !under.is_empty() && under != "name" && ui.button(crate::i18n::tr("Hide This")).clicked() {
             actions.push(("timeline.column".into(), json!({"column": under, "visible": false})));
@@ -1613,9 +1692,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let max_scroll = (total_h - rows_rect.height() + rh).max(0.0);
     if ui.rect_contains_pointer(rows_rect) {
         let (dy, dx, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x, i.modifiers.alt));
-        if zoom && dy.abs() > 0.0 {
+        // Ctrl/Cmd+wheel and a trackpad pinch reach egui as a zoom factor rather than a scroll
+        // (#428); like Alt+wheel they zoom time.
+        let pinch = ui.input(|i| i.zoom_delta()) as f64;
+        let at_x = ui.input(|i| i.pointer.hover_pos()).map(|p| p.x).unwrap_or(graph_x0);
+        if (pinch - 1.0).abs() > 1e-4 {
+            set_zoom(&mut app.ui.timeline, &comp, tm.pps * pinch, fit_pps, tm.t(at_x), (at_x - tm.x0) as f64);
+        } else if zoom && dy.abs() > 0.0 {
             // Alt+wheel zooms around the pointer, out until the whole comp shows.
-            let at_x = ui.input(|i| i.pointer.hover_pos()).map(|p| p.x).unwrap_or(graph_x0);
             set_zoom(&mut app.ui.timeline, &comp, tm.pps * (dy as f64 / 200.0).exp(), fit_pps, tm.t(at_x), (at_x - tm.x0) as f64);
         } else {
             let over_outline = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x < graph_x0);
@@ -1686,7 +1770,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 // (outline and time graph alike), not as alternating stripes.
                 let _ = ri;
                 lp.rect_filled(left, 0.0, if is_sel { t.row_selected } else { t.row_alt });
-                gp.rect_filled(Rect::from_min_max(pos2(graph_x0, r.min.y), r.max), 0.0, if is_sel { Color32::from_rgb(0x2a, 0x2a, 0x2a) } else { t.tl_bg });
+                gp.rect_filled(Rect::from_min_max(pos2(graph_x0, r.min.y), r.max), 0.0, if is_sel { t.tl_graph_selected } else { t.tl_bg });
                 lp.line_segment([pos2(rect.min.x, r.max.y - 0.5), pos2(graph_x0, r.max.y - 0.5)], Stroke::new(1.0, t.app_bg));
                 gp.line_segment([pos2(graph_x0, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0, t.app_bg));
                 // A/V features.
@@ -1702,7 +1786,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     if !applicable || !vis.av {
                         continue;
                     }
-                    lp.rect_filled(br.shrink(0.5), 1.0, SWITCH_BOX);
+                    lp.rect_filled(br.shrink(0.5), 1.0, t.switch_well);
                     layer_switch(ui, &t, r, br, icon, on, egui::Id::new(("av", layer.id.0, i)), layer.id.0, name, &mut actions);
                     app.auto.add(&format!("timeline.layer.{}.{name}", layer.id.0), br, name);
                 }
@@ -1828,7 +1912,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         continue;
                     }
                     let br = Rect::from_center_size(pos2(cw.switches + SW * i as f32 + SW / 2.0, cy), vec2(16.0, 16.0));
-                    lp.rect_filled(br.shrink(1.0), 1.0, SWITCH_BOX);
+                    lp.rect_filled(br.shrink(1.0), 1.0, t.switch_well);
                     layer_switch(ui, &t, r, br, icon, on, egui::Id::new(("sw", layer.id.0, i)), layer.id.0, name, &mut actions);
                     app.auto.add(&format!("timeline.layer.{}.switch.{name}", layer.id.0), br, name);
                 }
@@ -2183,7 +2267,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let en_r = Rect::from_center_size(pos2(cw.switches + 10.0, cy), vec2(16.0, 16.0));
                 let en = ui.interact(en_r, egui::Id::new(("expr-en", uid)), Sense::click()).on_hover_text(crate::i18n::tr("Enable Expression"));
                 lp.rect_stroke(en_r.shrink(1.0), 2.0, Stroke::new(1.0, t.separator), StrokeKind::Inside);
-                let expr_col = Color32::from_rgb(0xe8, 0x7c, 0x5c);
+                let expr_col = t.expr_text;
                 lp.text(
                     en_r.center(),
                     Align2::CENTER_CENTER,
@@ -2239,7 +2323,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 lp.text(lang_r.center(), Align2::CENTER_CENTER, "f", Tokens::semibold(10.0), if lang.hovered() { t.text } else { t.text_dim });
                 app.auto.add(&format!("timeline.prop.{uid}.exprLanguage"), lang_r, "Expression Language Menu");
                 let mut picked: Option<&'static str> = None;
-                egui::Popup::menu(&lang).show(|ui| {
+                egui::Popup::menu(&lang).style(crate::widgets::menu_style).show(|ui| {
                     for (cat, items) in effectcraft_engine::commands::expr_tools::language_menu() {
                         ui.menu_button(cat, |ui| {
                             widgets::menu_scroll(ui, |ui| {
@@ -2268,7 +2352,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 // The editor in the time-graph area.
                 ui.set_clip_rect(right_clip);
-                gp.rect_filled(Rect::from_min_max(pos2(graph_x0, r.min.y), r.max), 0.0, Color32::from_rgb(0x1a, 0x1a, 0x1a));
+                gp.rect_filled(Rect::from_min_max(pos2(graph_x0, r.min.y), r.max), 0.0, t.expr_bg);
                 let er = Rect::from_min_max(pos2(graph_x0 + 8.0, r.min.y + 3.0), pos2(rect.max.x - 14.0, r.max.y - 3.0));
                 let mut buf: String = ctx.data(|d| d.get_temp(buf_id)).unwrap_or_else(|| ex.text.clone());
                 if let Some(after) = ctx.data_mut(|d| d.remove_temp::<usize>(expr_refocus_id(*uid))) {
@@ -2387,13 +2471,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let is_tr_rot = layer.transform().and_then(|t| t.get("rotation")).is_some_and(|r| r.uid == prop.uid);
                 let base = if is_tr_rot && prop.name == "Rotation" && layer.is_3d() { "Z Rotation".to_string() } else { prop.name.clone() };
                 let pname = if prop.has_expression() { format!("{base}  =") } else { base };
-                lp.text(
-                    pos2(name_x, cy),
-                    Align2::LEFT_CENTER,
-                    &pname,
-                    Tokens::ui(12.0),
-                    if prop.has_expression() { Color32::from_rgb(0xe8, 0x7c, 0x5c) } else { t.text },
-                );
+                lp.text(pos2(name_x, cy), Align2::LEFT_CENTER, &pname, Tokens::ui(12.0), if prop.has_expression() { t.expr_text } else { t.text });
                 let name_rect = Rect::from_min_max(pos2(name_x, r.min.y), pos2(cw.switches - 2.0, r.max.y));
                 let name_resp = ui.interact(name_rect, egui::Id::new(("pname", uid)), Sense::click_and_drag());
                 app.auto.add(&format!("timeline.prop.{uid}.name"), name_rect, &prop.name);
@@ -2408,7 +2486,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if name_resp.clicked() {
                     actions.push(("prop.select".into(), json!({"layer": layer.id.0, "prop": uid, "add": ui.input(|i| i.modifiers.shift)})));
                 }
-                name_resp.context_menu(|ui| prop_menu(ui, &mut app.auto, cid, layer, prop, &mut actions));
+                crate::widgets::context_menu(&name_resp, |ui| prop_menu(ui, &mut app.auto, cid, layer, prop, &mut actions));
                 // Value editors.
                 let value = ectx.value(layer, prop);
                 let vx = (cw.switches + 4.0).max(name_x + 120.0);
@@ -2438,7 +2516,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         Align2::LEFT_CENTER,
                         format!("= {}", e.text.lines().next().unwrap_or("")),
                         Tokens::mono(11.0),
-                        Color32::from_rgb(0xe8, 0x7c, 0x5c),
+                        t.expr_text,
                     );
                 }
                 // Keyframes.
@@ -2500,7 +2578,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                 ui_actions.push(UiAct::SetTime(ct));
                             }
                         }
-                        kresp.context_menu(|ui| {
+                        crate::widgets::context_menu(&kresp, |ui| {
                             for (lbl, cmd, params) in [
                                 ("Edit Value…", "keys.set", json!({"layer": layer.id.0, "prop": uid, "time": k.time.seconds()})),
                                 ("-", "", json!({})),
@@ -2591,7 +2669,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add("timeline.empty", empty_rect, "Right-click to create a layer");
     }
     for (response, area) in [(&outline_empty, "outline"), (&empty, "graph")] {
-        response.context_menu(|ui| {
+        crate::widgets::context_menu(&response, |ui| {
             let menu = ui.menu_button(crate::i18n::tr("New"), |ui| {
                 for (key, label, command, params) in [
                     ("text", "Text", "layer.newText", json!({"text": "Text"})),
@@ -2958,9 +3036,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 rp.galley(tag.min, g, Color32::WHITE);
             }
             if released {
-                let (index, time) = (json!(index), json!(start.map(Tick::seconds)));
+                let time = json!(start.map(Tick::seconds));
                 match payload.as_ref() {
-                    crate::panels::DragPayload::Item(id) => actions.push(("layer.addItem".into(), json!({"item": id, "index": index, "time": time}))),
+                    crate::panels::DragPayload::Item(id) => {
+                        // Insert each selected item at the drop point, in selection order.
+                        for (offset, item) in crate::panels::project_drop_items(app, *id).into_iter().enumerate() {
+                            actions.push(("layer.addItem".into(), json!({"item": item, "index": index.saturating_add(offset), "time": time.clone()})));
+                        }
+                    }
                     crate::panels::DragPayload::Files(paths) => {
                         actions.push(("mediaBrowser.import".into(), json!({"paths": paths, "addToComp": true, "index": index, "time": time})))
                     }
@@ -3185,6 +3268,11 @@ const SHAPE_ADD_ITEMS: &[(&str, &str)] = &[
     ("gfill", "Gradient Fill"),
     ("gstroke", "Gradient Stroke"),
     ("-", ""),
+    ("frontColor", "Front: Color"),
+    ("bevelColor", "Bevel: Color"),
+    ("sideColor", "Side: Color"),
+    ("backColor", "Back: Color"),
+    ("-", ""),
     ("merge", "Merge Paths"),
     ("offset", "Offset Paths"),
     ("pucker", "Pucker & Bloat"),
@@ -3280,7 +3368,7 @@ fn text_anim_popups(
     let mut opts: Vec<String> = Vec::new();
     let mut acts: Vec<(String, serde_json::Value)> = Vec::new();
     if key == "animate" {
-        opts.push(if per_char { "Disable Per-character 3D" } else { "Enable Per-character 3D" }.into());
+        opts.push(tr(if per_char { "Disable Per-character 3D" } else { "Enable Per-character 3D" }).to_string());
         acts.push(("layer.enablePerChar3D".into(), json!({"layer": layer.id.0, "enabled": !per_char})));
         opts.push("-".into());
         acts.push((String::new(), json!(null)));
@@ -3371,7 +3459,7 @@ fn prop_menu(
 }
 
 fn layer_context_menu(resp: &egui::Response, layer: &Layer, actions: &mut Vec<(String, serde_json::Value)>) {
-    resp.context_menu(|ui| layer_menu(ui, &[layer.id.0], actions));
+    crate::widgets::context_menu(&resp, |ui| layer_menu(ui, &[layer.id.0], actions));
 }
 
 /// Shared layer actions for Timeline rows and Composition context menus.
@@ -3439,26 +3527,6 @@ fn fmt_num(v: f64, d: usize) -> String {
     format!("{v:.d$}")
 }
 
-/// Linked values after component `d` of `c` became `v`: the others scale by the same ratio
-/// (Constrain Proportions); from 0 the others that are 0 too follow the value.
-fn constrained(c: &[f64], d: usize, v: f64) -> Vec<f64> {
-    let Some(&old) = c.get(d) else { return c.to_vec() };
-    c.iter()
-        .enumerate()
-        .map(|(e, &x)| {
-            if e == d {
-                v
-            } else if old.abs() > 1e-9 {
-                x * v / old
-            } else if x.abs() <= 1e-9 {
-                v
-            } else {
-                x
-            }
-        })
-        .collect()
-}
-
 /// Inline value editor for a property row; pushes `prop.set` actions. Returns the rects of a
 /// multi-dimension value's fields, one per dimension (none for other values).
 fn value_editor(
@@ -3475,8 +3543,17 @@ fn value_editor(
     let uid = prop.uid;
     let mut dims = vec![];
     let merge = format!("scrub-{uid}");
+    // With several layers selected the edit applies to all of them (#491): a scrub by the same
+    // change, a typed value as it is.
+    let scrub = ui.ctx().dragged_id().is_some() && ui.input(|i| i.pointer.is_decidedly_dragging());
+    // Proportional Scrubbing (After Effects 26.2): Ctrl+Alt (Cmd+Opt) spreads the change over the
+    // selected layers by selection order, the first unchanged and the last by all of it.
+    let proportional = scrub && ui.input(|i| widgets::proportional_scrub(i.modifiers));
     let set = |actions: &mut Vec<(String, serde_json::Value)>, v: serde_json::Value| {
-        actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": v, "merge": merge})))
+        actions.push((
+            "prop.set".into(),
+            json!({"layer": layer.id.0, "prop": uid, "value": v, "merge": merge, "selected": true, "offset": scrub, "proportional": proportional}),
+        ))
     };
     let is_3d = layer.is_3d();
     let mut x = at.x;
@@ -3531,10 +3608,10 @@ fn value_editor(
                 dims.push(r);
                 if let Some(nv) = nv {
                     let mut nc = c.clone();
-                    // Alt edits one value of a linked pair.
-                    let shown = if linked && !ui.input(|i| i.modifiers.alt) { n.min(c.len()) } else { 1 };
+                    // Alt edits one value of a linked pair (Ctrl+Alt is a proportional scrub).
+                    let shown = if linked && !ui.input(|i| i.modifiers.alt && !widgets::proportional_scrub(i.modifiers)) { n.min(c.len()) } else { 1 };
                     let from = if shown == 1 { d } else { 0 };
-                    for (e, v) in constrained(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
+                    for (e, v) in widgets::constrained(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
                         if let Some(slot) = nc.get_mut(from + e) {
                             *slot = v;
                         }
@@ -3556,8 +3633,19 @@ fn value_editor(
             if resp.clicked() {
                 widgets::open_popup(ui, pop);
             }
+            // The eyedropper after the swatch samples the Composition panel (shape Fill and
+            // Stroke colours, text and effect colours), as in After Effects' Timeline (#633).
+            let er = Rect::from_center_size(pos2(r.max.x + 12.0, at.y), vec2(16.0, 16.0));
+            let active = app.ui.fx_pick.as_ref().is_some_and(|k| k.prop == uid && k.kind == "color");
+            if super::fx_widgets::eyedropper_button(ui, er, active, egui::Id::new(("tl-eye", uid)), &t)
+                .on_hover_text(crate::i18n::tr("Eyedropper: click, then click in the Composition panel"))
+                .clicked()
+            {
+                super::effect_controls::toggle_pick(app, "color", layer, prop);
+            }
+            app.auto.add(&format!("timeline.prop.{uid}.eyedropper"), er, &prop.name);
             let mut rgb = [c[0] as f32, c[1] as f32, c[2] as f32];
-            if crate::header::color_popup(ui, pop, r.left_bottom(), &mut rgb) {
+            if crate::widgets::color_popup(ui, pop, r.left_bottom(), &mut rgb) {
                 set(actions, json!([rgb[0], rgb[1], rgb[2], 1.0]));
             }
         }
@@ -3605,7 +3693,16 @@ fn value_editor(
             );
         }
         Value::Gradient(_) => {
-            p.text(pos2(x, at.y), Align2::LEFT_CENTER, crate::i18n::tr("Edit Gradient…"), Tokens::ui(12.0), t.hot_text);
+            // Opens the Gradient Editor at the current time (#612).
+            let r = p.text(pos2(x, at.y), Align2::LEFT_CENTER, crate::i18n::tr("Edit Gradient…"), Tokens::ui(12.0), t.hot_text);
+            let resp = ui.interact(r.expand(2.0), egui::Id::new(("gradient-edit", uid)), Sense::click());
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            app.auto.add(&format!("timeline.prop.{uid}.value"), r, &prop.name);
+            if resp.clicked() {
+                actions.push(("prop.editGradient".into(), json!({"layer": layer.id.0, "prop": uid})));
+            }
         }
         Value::Str(s) => {
             p.text(pos2(x, at.y), Align2::LEFT_CENTER, s.chars().take(30).collect::<String>(), Tokens::ui(12.0), t.text_dim);
@@ -3617,6 +3714,37 @@ fn value_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #710: with Time Display set to Frames the ruler labels are frame numbers (as under the
+    /// CTI, from Start Numbering Frames At); otherwise seconds:frames.
+    #[test]
+    fn ruler_labels_follow_the_time_display_style() {
+        use effectcraft_engine::project::{ProjectSettings, TimeDisplayStyle};
+        let mut st = ProjectSettings { time_display: TimeDisplayStyle::Timecode, frame_start: 0, ..ProjectSettings::default() };
+        assert_eq!(ruler_label(15, 30, &st), "00:15f");
+        assert_eq!(ruler_label(45, 30, &st), "01:15f");
+        assert_eq!(ruler_label(30 * 3600 + 31, 30, &st), "60:01:01f");
+        st.time_display = TimeDisplayStyle::Frames;
+        assert_eq!(ruler_label(0, 30, &st), "00000");
+        assert_eq!(ruler_label(45, 30, &st), "00045");
+        st.frame_start = 1;
+        assert_eq!(ruler_label(45, 30, &st), "00046");
+        assert_eq!(ruler_label(i64::MAX, 30, &st), format!("{:05}", i64::MAX));
+    }
+
+    /// #468: playback pages the view to the CTI; a scrub past either end scrolls that way.
+    #[test]
+    fn the_view_pages_to_the_cti() {
+        assert_eq!(page_to_cti(10.0, 5.0, 60.0, 12.0), 10.0, "in view: unchanged");
+        assert_eq!(page_to_cti(10.0, 5.0, 60.0, 16.0), 16.0, "past the right end: the page from the CTI");
+        assert_eq!(page_to_cti(10.0, 5.0, 60.0, 3.0), 3.0, "before the start");
+        assert_eq!(page_to_cti(10.0, 5.0, 60.0, 58.0), 55.0, "not past the comp's end");
+        assert_eq!(page_to_cti(10.0, 80.0, 60.0, 95.0), 0.0);
+        assert_eq!(page_to_cti(10.0, f64::NAN, 60.0, 95.0), 10.0);
+        assert_eq!(edge_scroll_speed_x(100.0, 500.0, 300.0), 0.0);
+        assert!(edge_scroll_speed_x(100.0, 500.0, 501.0) > 0.0 && edge_scroll_speed_x(100.0, 500.0, 99.0) < 0.0);
+        assert!(edge_scroll_speed_x(100.0, 500.0, 600.0) > edge_scroll_speed_x(100.0, 500.0, 520.0));
+    }
 
     /// A comp with two solids; "Box" has an animated Position and a Gaussian Blur.
     fn app() -> EffectcraftApp {
@@ -3777,6 +3905,28 @@ mod tests {
         app.ui.timeline.open_layers.insert(bx);
         let rows = labels(&app);
         assert!(rows.iter().any(|r| r.trim() == ">Transform"), "{rows:?}");
+    }
+
+    /// U and UU show Time Remap on a layer with time remapping enabled.
+    #[test]
+    fn u_and_uu_reveal_time_remap() {
+        let mut s = effectcraft_engine::Session::default();
+        let inner = s.execute("comp.new", json!({"name": "Inner", "width": 32, "height": 32, "duration": 2})).unwrap()["comp"].as_u64().unwrap();
+        s.execute("comp.new", json!({"name": "Main", "width": 64, "height": 64, "duration": 4})).unwrap();
+        let nested = s.execute("layer.addItem", json!({"item": inner})).unwrap()["layer"].as_u64().unwrap();
+        let mut app = EffectcraftApp::new(s);
+        let ctx = egui::Context::default();
+        crate::menus::invoke(&mut app, &ctx, "layer.enableTimeRemap", json!({"layers": [nested]})).unwrap();
+        app.session.execute("layer.select", json!({"layers": [nested]})).unwrap();
+        for uu in [false, true] {
+            app.ui.timeline.layer_reveal.clear();
+            app.last_reveal = uu.then(|| ("keyframes".into(), f64::MAX));
+            crate::menus::invoke(&mut app, &ctx, "anim.reveal", json!({"kind": "keyframes"})).unwrap();
+            assert_eq!(app.ui.timeline.layer_reveal.get(&nested), Some(&vec!["props".to_string()]), "UU: {uu}");
+            let rows = labels(&app);
+            let at = rows.iter().position(|r| r == "Inner").unwrap();
+            assert_eq!(rows[at + 1].trim(), "Time Remap", "UU: {uu}: {rows:?}");
+        }
     }
 
     /// Enabling time remapping twirls the layer open on Time Remap (#157); disabling it reveals

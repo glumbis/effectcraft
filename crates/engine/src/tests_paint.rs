@@ -203,6 +203,28 @@ fn first_puppet_pin_leaves_the_layer_still() {
     }
 }
 
+/// #318: a pin added to an already-bent mesh holds the mesh where it is: nothing jumps.
+#[test]
+fn a_pin_added_to_a_bent_mesh_moves_nothing() {
+    let (mut s, id) = setup();
+    s.execute("puppet.addPin", json!({"layer": id, "position": [5, 30]})).unwrap();
+    s.execute("puppet.addPin", json!({"layer": id, "position": [95, 30]})).unwrap();
+    s.set_time(Tick::from_seconds_f64(1.0));
+    s.execute("puppet.movePin", json!({"layer": id, "pin": "Puppet Pin 2", "position": [80, 70]})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let t = Tick::from_seconds_f64(1.0);
+    let before = s.render(cid, t, RenderOpts::default());
+    for at in [[50, 54], [30, 42], [70, 62]] {
+        s.execute("puppet.addPin", json!({"layer": id, "position": at})).unwrap();
+        let after = s.render(cid, t, RenderOpts::default());
+        let moved = after.data.iter().zip(&before.data).filter(|(a, b)| (a[3] - b[3]).abs() > 0.25).count();
+        // (Before #318 the pin at [50, 54] moved about 250 edge pixels; the solver's round-off
+        // still touches a few.)
+        assert!(moved <= 16, "a pin at {at:?} moved {moved} pixels");
+        s.undo();
+    }
+}
+
 #[test]
 fn puppet_pin_kinds_and_mesh_options() {
     let (mut s, id) = setup();

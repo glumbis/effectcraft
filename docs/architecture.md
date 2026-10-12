@@ -1,5 +1,7 @@
 # Architecture
 
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (crate table checked against `crates/`: effect count 306, VP9 inter frames) · **Target:** Adobe After Effects 2026
+
 EffectCraft is a stack of small Rust crates. The engine knows nothing about the user interface;
 the egui frontend, the command-line tool and the MCP server all sit on top of the same `Session`
 and drive it through the same command registry.
@@ -16,7 +18,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L0 | `time` | `Tick` (254 016 000 000 per second), rational frame rates incl. NTSC, SMPTE and drop-frame timecode |
 | L0 | `geom` | Vectors, matrices, quaternions, the layer transform (anchor, position, scale, orientation, rotation) |
 | L0 | `color` | sRGB and linear, HSL/HSV, luminance, the 38 blend modes, label colors |
-| L0 | `vp9enc` | VP9 intra-frame encoder (profile 0, 8-bit 4:2:0; lossless at quality 100) for WebM export, from the VP9 bitstream specification |
+| L0 | `vp9enc` | VP9 encoder (profile 0, 8-bit 4:2:0, key and inter frames with motion search, loop filter and rate control; lossless at quality 100) for WebM export, from the VP9 bitstream specification |
 | L0 | `opusenc` | Opus encoder: RFC 6716 SILK (NB/MB/WB), hybrid (SWB/FB) and CELT (FB) modes chosen by bitrate and application (audio / voice), 48 kHz 20 ms packets, mono/stereo, and the RFC 7845 `OpusHead`, for WebM export audio |
 | L0 | `hevcenc` | HEVC (H.265) encoder from ITU-T H.265: Main / Main 10 4:2:0, IDR + P slices (quarter-pel motion, merge/AMVP), CABAC, deblocking, bitrate or constant-QP rate control, for MP4 (`hvc1`) export |
 | L0 | `av1enc` | AV1 encoder from the AV1 bitstream specification: Main profile 8/10-bit 4:2:0, key + inter frames (quarter-pel motion), deblocking, for MP4 (`av01`) and WebM export |
@@ -27,7 +29,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L1 | `path` | Bezier paths, path operators (trim, offset, round corners, zig zag, twist, merge…), stroking, coverage masks |
 | L2 | `project` | The document: items, compositions, layers, the property tree, render queue model, `.ecproj` serde |
 | L2 | `text` | Fonts, shaping, layout, per-glyph geometry, text animators and selectors |
-| L2 | `effects` | The effect registry (241 effects) and their CPU implementations |
+| L2 | `effects` | The effect registry (306 effects) and their CPU implementations |
 | L2 | `svg` | SVG import (W3C SVG 1.1/2 static subset: shapes, paths, transforms, `use`, CSS, gradients) and rasterisation at any scale |
 | L2 | `pdf` | PDF, PDF-compatible Illustrator (`.ai`) and EPS (PostScript subset) vector footage into the `svg` render tree: paths, fills, strokes, shadings, tiling patterns, clipping, text (embedded TrueType / CFF / Type 1 / Type 3 fonts; the bundled `text` fonts for the standard 14), images, blend modes, soft masks, optional-content layers |
 | L2 | `model` | 3D models for Advanced 3D: glTF 2.0 (`.gltf`/`.glb`) and OBJ/MTL import (meshes, PBR metallic-roughness materials and textures, node hierarchy, skins, animations), parametric primitives, extruded/bevelled outline meshes and polygon triangulation |
@@ -50,6 +52,19 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 Allowed same-layer edges: `path → keyframe, raster`, `text → path`, `pdf → svg, text`, `effects → project, text, path, track`,
 `media / expr / export / gpu → render`, `export → media`, `lottie → format`, `host → engine, script`,
 `script → engine`.
+
+The frontend uses `craft-ui::docking` for atomic layout transactions and pointer drop targets,
+and `craft-ui::layout` for bounded split geometry and resize interactions. A small adapter
+preserves EffectCraft's saved dock tree, stacked entries, floating rectangles and dynamic
+viewer/ScriptUI identities. Tab moves, edge splits, reordering, float/redock, activation and
+close operations use the shared model. The app retains composition-tab behavior, accordion
+height allocation and ScriptUI close callbacks. Lower layers cannot depend on `craft-ui`.
+
+Viewer controls retain their native widgets inside a horizontal scroll area, so narrow panels
+keep dropdowns, exposure dragging and snapshot holds reachable. Keyboard focus scrolls the
+focused control into view. Active composition breadcrumbs use the selected-row theme color.
+The `viewer_geometry` tests inspect actual painted contrast, scroll geometry and pointer/keyboard
+reachability across the three themes.
 
 ## 2. Time
 
@@ -165,12 +180,16 @@ editing one layer re-renders only that layer. Each Render Queue job keeps its ow
 for its frames. Effects that read the clock directly are declared in
 `effects::TIME_DEPENDENT`, and a test checks every registered effect against that list.
 
-The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by project
-revision, comp, frame, scale, 3D view / region of interest and a hash of the other render
-options (Draft / Fast Previews, shadows, nested switches), so frames rendered under other
-options are never shown. When the budget (Settings ▸ Memory & CPU) is full the least recently
-shown frames go first, and frames of an older revision are dropped as soon as the project
-changes. The timeline's green bar counts the frames of exactly what the viewer shows.
+The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by comp
+content, frame, scale, 3D view / region of interest and a hash of the other render options
+(Draft / Fast Previews, shadows, nested switches). Edits preserve unaffected comps' frames,
+and undo can reuse earlier content. During rapid edits at the same time and view, the viewer
+shows the newest completed revision while the exact requested revision renders; out-of-order
+completions cannot move it backwards. This avoids freezing until a slider or layer drag stops.
+Frames at other times or with other render options are never substituted. Obsolete queued jobs
+are dropped; running jobs finish into the cache. When the budget (Settings ▸ Memory & CPU) is
+full the least recently shown frames go first. The timeline's green bar counts cached frames
+of the current content and viewer settings.
 Resolution Auto renders the pixels the magnification needs, as in After Effects (Full above
 50 %, Half down to 33.3 %, Third down to 25 %, then Quarter). Below 100 % the viewer averages
 instead of skipping pixels (Viewer Zoom Quality More Accurate): GPU frames carry a mip chain
@@ -230,7 +249,11 @@ Nulls / Nulls Follow Points take pins as well as paths, and `puppet.follow` give
 Position expression that trails the leader by a delay. The renderer flattens nested effect
 groups into `Params` keys (`effects::flatten_params`). Commands: `paint.*`, `puppet.*`.
 
-Half, Third and Quarter resolution render proportionally fewer pixels end to end.
+Half, Third and Quarter resolution render proportionally fewer pixels end to end. Footage
+starts at the render's size where the source can make it more cheaply than the full frame
+(`FootageSource::frame_at_size`): movies in opaque 4:2:0 Y'CbCr are box-filtered to half size
+before conversion (a quarter of the conversions; the result differs from converting first only
+in blocks where colours clip) and resampled from there, as other frames are from full size.
 
 **GPU compositor** (`crates/gpu`; Project Settings ▸ Video Rendering and Effects ▸ Mercury GPU
 Acceleration, the default, or Mercury Software Only; `render.backend`). The CPU renderer is the
@@ -517,9 +540,23 @@ text, disables the expression and shows a warning, like After Effects. `sampleIm
 sampled layer through the evaluating renderer's footage source (`EvalCtx::footage`), cached per
 thread and frame; `footage(name)` reads data footage (JSON, CSV, TSV imported with File ▸ Import,
 text kept in the project) through `sourceData`, `sourceText` and `dataValue`. `expr.errors`
-lists failing expressions for the viewer's error bar. Each thread keeps one boa context; boa
+lists failing expressions on demand. The viewer's error bar uses the same checks against an
+immutable project snapshot, after 150 ms without editing, pointer interaction or playback.
+Native builds run these automatic checks on one persistent worker; layout and paint only read
+completed results. Requests are coalesced per comp, cancelled between properties when obsolete,
+and bounded to eight comp entries. Results must match the current project, revision and time.
+Disabling Show Expression Error Banner cancels automatic checks. Non-solo layers still receive
+diagnostics, including disabled expressions with syntax errors. The single-threaded web build
+shares the cache and debounce but evaluates one scan on the UI thread after interaction stops.
+Each thread keeps one boa context; boa
 leaves values on its stack whenever an exception unwinds through call frames (every pending
 host request does), so a run that hits the stack limit gets a fresh context and is retried once.
+
+Snapping memoizes expression values while collecting one immutable set of targets. Bounds,
+vertices and transforms share those values; the cache is discarded before the next query, so
+time changes and edits always use current geometry. Native timeline disk-cache indicators also
+request missing content hashes in the background, coalescing edits per comp. Their blue bars
+appear after the key is ready instead of serializing composition content during painting.
 
 ## 5a. Scripting
 
@@ -667,3 +704,9 @@ The before frame times were dominated by an O(layers²) menu build per visible t
 by every panel deep-cloning the active comp each frame. Left for later: per-layer structural
 sharing (so a one-layer edit doesn't copy its comp), a binary or compact project format (pretty
 JSON parsing is now the bulk of open), and rendering 5,000-layer comps faster.
+
+## Revision history
+
+| Date | Change | Summary |
+|---|---|---|
+| 2026-10-10 | minor | Status line added; crate table checked against `crates/` (every crate listed); effect count and VP9 encoder description corrected |

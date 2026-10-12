@@ -66,8 +66,12 @@ pub(crate) fn run_chain(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option
     }
     let misses = deferred.as_ref().map(|d| d.misses());
     let mut b = GBuf { img: e.g.upload_image(&buf.img)?, offset: buf.offset, scale: buf.scale };
+    e.take_missing();
     for step in chain {
         b = apply(e, step.spec.id, &step.ctx, b)?;
+        if e.take_missing() {
+            return None;
+        }
         if let Some(l) = levels {
             b.img = ops::quantize(e, &b.img, l);
         }
@@ -119,8 +123,13 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
         let Some(b) = &self.b else { return false };
         let mut cur = GBuf { img: b.img.clone(), offset: b.offset, scale: b.scale };
+        self.e.take_missing();
         for step in steps {
             let Some(next) = apply(self.e, step.spec.id, &step.ctx, cur) else { return false };
+            // A kernel the device couldn't build: the effects render on the CPU (#613).
+            if self.e.take_missing() {
+                return false;
+            }
             cur = next;
             if let Some(l) = self.levels {
                 cur.img = ops::quantize(self.e, &cur.img, l);

@@ -120,3 +120,108 @@ fn enter_chooses_the_highlighted_entry() {
     }
     assert!(!shown(&h, "Quick Apply"), "and closed the menu");
 }
+
+#[test]
+fn relink_menu_uses_engine_availability_and_folder_picker_cancel_is_a_noop() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let mut app = EffectcraftApp::new(Session::default());
+    let menu = effectcraft_ui_egui::menus::menu_items(&app);
+    let entry = menu.iter().find(|e| e.id == "file.relinkFootage").unwrap();
+    assert_eq!(entry.path, ["File", "Dependencies"]);
+    assert_eq!(entry.enabled, app.session.is_enabled("file.relinkFootage"));
+    assert_eq!(entry.enabled, !cfg!(target_arch = "wasm32"));
+    let picked = Rc::new(Cell::new(false));
+    let flag = picked.clone();
+    app.hooks.pick_folder = Some(Box::new(move || {
+        flag.set(true);
+        None
+    }));
+    let revision = app.session.revision;
+    let result = effectcraft_ui_egui::menus::invoke(&mut app, &egui::Context::default(), "file.relinkFootage", json!({})).unwrap();
+    assert!(picked.get());
+    assert!(result.is_null());
+    assert_eq!(app.session.revision, revision);
+    assert!(app.session.history.undo.is_empty());
+}
+
+#[test]
+fn relink_is_reachable_through_the_dependencies_menu() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let mut h = harness();
+    let picked = Rc::new(Cell::new(false));
+    let flag = picked.clone();
+    h.state_mut().hooks.pick_folder = Some(Box::new(move || {
+        flag.set(true);
+        None
+    }));
+    let revision = h.state().session.revision;
+    let file = rect(&h, "menu.File");
+    click_at(&mut h, file.center());
+    let dependencies = h.query_by_label_contains("Dependencies").unwrap().rect();
+    h.input_mut().events.push(Event::PointerMoved(dependencies.center()));
+    h.run_steps(8);
+    let relink = h.query_by_label_contains("Relink Missing Footage").unwrap().rect();
+    if let Some(path) = std::env::var_os("EFFECTCRAFT_RELINK_MENU_SNAPSHOT") {
+        h.render().unwrap().save(path).unwrap();
+    }
+    click_at(&mut h, relink.center());
+    assert!(picked.get());
+    assert_eq!(h.state().session.revision, revision);
+}
+
+#[test]
+fn relink_restores_decoded_pixels_and_invalidates_viewer_content() {
+    use effectcraft_engine::project::{ItemId, ItemKind};
+    use effectcraft_engine::render::RenderOpts;
+    use effectcraft_engine::time::Tick;
+
+    let dir = std::env::temp_dir().join(format!("ec-ui-relink-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("old")).unwrap();
+    std::fs::create_dir_all(dir.join("new/deep")).unwrap();
+    let old = dir.join("old/plate.png");
+    image::RgbaImage::from_pixel(32, 32, image::Rgba([230, 40, 80, 255])).save(&old).unwrap();
+    let mut s = effectcraft_host::session();
+    let item = s.execute("file.import", json!({"paths": [old], "sequence": false})).unwrap()["items"][0].as_u64().unwrap();
+    s.execute("comp.new", json!({"name": "Relink", "width": 32, "height": 32, "duration": 1})).unwrap();
+    s.execute("layer.addItem", json!({"item": item})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let expected = s.render(cid, Tick::ZERO, RenderOpts::default());
+    let moved = dir.join("new/deep/plate.png");
+    std::fs::rename(&old, &moved).unwrap();
+    s.execute("footage.check", json!({"wait": true})).unwrap();
+    let ItemKind::Footage(f) = &s.project.item(ItemId(item)).unwrap().kind else { panic!("footage") };
+    assert!(f.missing);
+    let missing_content = effectcraft_ui_egui::frames::comp_content(&s.project, cid);
+    let missing = s.render(cid, Tick::ZERO, RenderOpts::default());
+    assert_ne!(missing.data, expected.data);
+    let r = s.execute("file.relinkFootage", json!({"folder": dir.join("new"), "wait": true})).unwrap();
+    assert_eq!(r["relinked"], 1);
+    assert_ne!(effectcraft_ui_egui::frames::comp_content(&s.project, cid), missing_content);
+    assert_eq!(s.render(cid, Tick::ZERO, RenderOpts::default()).data, expected.data);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// #767: File ▸ Import ▸ File… offers MXF footage (OP1a / OP-Atom from broadcast cameras and
+/// Avid), which the Media Browser lists and the importer reads.
+#[test]
+fn import_dialog_offers_mxf() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut app = EffectcraftApp::new(Session::default());
+    let offered = Rc::new(RefCell::new(Vec::<String>::new()));
+    let seen = offered.clone();
+    app.hooks.pick_files = Some(Box::new(move |exts: &[&str]| {
+        *seen.borrow_mut() = exts.iter().map(|e| e.to_string()).collect();
+        Vec::new()
+    }));
+    let result = effectcraft_ui_egui::menus::invoke(&mut app, &egui::Context::default(), "file.import", json!({})).unwrap();
+    assert!(result.is_null(), "cancelled: nothing imported");
+    let offered = offered.borrow();
+    assert!(offered.iter().any(|e| e == "mxf"), "offered {offered:?}");
+    assert!(offered.iter().any(|e| e == "mov"));
+}

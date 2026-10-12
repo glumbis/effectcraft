@@ -6,7 +6,7 @@ use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, has_comp, has_layers, layers_p, match_path_of, selected_leaf_props, str_p};
-use crate::{EngineError, LinkClip, Result, Session, cmd};
+use crate::{EngineError, KeyRef, LinkClip, Result, Session, cmd};
 
 fn can_undo(s: &Session) -> std::result::Result<(), String> {
     if s.history.undo.is_empty() { Err("nothing to undo".into()) } else { Ok(()) }
@@ -25,6 +25,7 @@ fn has_clip(s: &Session) -> std::result::Result<(), String> {
         && s.state.effect_clipboard.is_empty()
         && s.state.contents_clipboard.is_empty()
         && s.state.link_clipboard.is_none()
+        && s.state.value_clipboard.is_empty()
     {
         Err("the clipboard is empty".into())
     } else {
@@ -210,13 +211,20 @@ fn clear_clipboards(s: &mut Session) {
     s.state.effect_clipboard.clear();
     s.state.contents_clipboard.clear();
     s.state.link_clipboard = None;
+    s.state.value_clipboard.clear();
     s.state.clip_is_keys = false;
 }
 
-/// Edit ▸ Copy: selected keyframes (when any) go to the keyframe clipboard, else layers.
+/// Edit ▸ Copy: selected properties copy their keyframes and values, selected keyframes go
+/// to the keyframe clipboard, else layers.
 fn copy(s: &mut Session, p: &Value) -> Result<Value> {
     if s.state.text_edit.is_some() && p.get("layers").is_none() {
         return super::text_edit::copy(s);
+    }
+    if p.get("layers").is_none()
+        && let Some(r) = copy_properties(s)?
+    {
+        return Ok(r);
     }
     // Keyframes selected → copy keys (pasted at the CTI).
     if !s.state.selected_keys.is_empty() && p.get("layers").is_none() {
@@ -245,6 +253,101 @@ fn copy(s: &mut Session, p: &Value) -> Result<Value> {
     clear_clipboards(s);
     s.state.clipboard = layers;
     Ok(json!(s.state.clipboard.len()))
+}
+
+/// Edit ▸ Copy with properties selected (Position, or the Transform group), as in After
+/// Effects: an animated property copies its keyframes (the selected ones, else all of them) and
+/// an unanimated one its value, for Paste onto the same properties of other layers (#493).
+/// `None` when no property (or Transform group) is selected.
+fn copy_properties(s: &mut Session) -> Result<Option<Value>> {
+    let Some(comp) = s.active_comp() else { return Ok(None) };
+    let mut leaves = vec![];
+    for (lid, uid) in &s.state.selected_props {
+        let Some(l) = comp.layer(*lid) else { continue };
+        if l.props.find(*uid).is_some() {
+            leaves.push((*lid, *uid));
+        } else if let Some(g) = l.props.find_group(*uid)
+            && l.props.match_path_of(*uid).as_deref() == Some("transform")
+        {
+            g.walk("", &mut |_, pr| leaves.push((*lid, pr.uid)));
+        }
+    }
+    if leaves.is_empty() {
+        return Ok(None);
+    }
+    let mut keys = s.state.selected_keys.clone();
+    let mut values = vec![];
+    for (lid, uid) in &leaves {
+        let Some(l) = comp.layer(*lid) else { continue };
+        let Some(pr) = l.props.find(*uid) else { continue };
+        if pr.keys.is_empty() {
+            if let Some(path) = l.props.match_path_of(*uid)
+                && !values.iter().any(|(p, _)| *p == path)
+            {
+                values.push((path, pr.value.clone()));
+            }
+        } else if !keys.iter().any(|k| k.layer == *lid && k.prop == *uid) {
+            keys.extend(pr.keys.iter().map(|k| KeyRef { layer: *lid, prop: *uid, time: k.time }));
+        }
+    }
+    clear_clipboards(s);
+    let mut n = 0;
+    if !keys.is_empty() {
+        let selected = std::mem::replace(&mut s.state.selected_keys, keys);
+        let r = s.execute("keys.copy", json!({}));
+        s.state.selected_keys = selected;
+        n = r?.as_u64().unwrap_or(0);
+    }
+    let v = values.len();
+    s.state.value_clipboard = values;
+    // Keys alone answer as `keys.copy` does (their count).
+    Ok(Some(if v == 0 { json!(n) } else { json!({"keys": n, "values": v}) }))
+}
+
+/// Paste copied property values (and keyframes, at the CTI) onto the same properties of the
+/// selected layers, as one undo step.
+fn paste_properties(s: &mut Session, p: &Value) -> Result<Value> {
+    let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
+    let ids = s.state.selected_layers.clone();
+    if ids.is_empty() {
+        return Err(EngineError::Other("select a layer to paste into".into()));
+    }
+    let values = s.state.value_clipboard.clone();
+    let keys = s.state.clip_is_keys && !s.state.key_clipboard.is_empty();
+    let t = s.time();
+    // The values and the keys are one step: the keys' paste merges into the values' step.
+    let merge = "edit.paste.properties";
+    s.history.merge_key = None;
+    let n = s.edit("Paste", keys.then_some(merge), |proj, _| {
+        let mut n = 0;
+        for lid in &ids {
+            let l = super::layer_mut(proj, cid, *lid)?;
+            if l.switches.locked {
+                continue;
+            }
+            let lt = l.layer_time(t);
+            for (path, v) in &values {
+                if let Some(pr) = l.props.prop_mut(path)
+                    && let Some(v) = pr.value.coerce_json(&v.to_json())
+                {
+                    pr.set_value_at(lt, v);
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
+    })?;
+    let mut r = json!({"values": n});
+    if keys {
+        let mut kp = p.clone();
+        if let Some(o) = kp.as_object_mut() {
+            o.insert("merge".into(), json!(merge));
+        }
+        let pasted = s.execute("keys.paste", kp);
+        s.history.merge_key = None;
+        r["keys"] = pasted?;
+    }
+    Ok(r)
 }
 
 /// The expression accessor for a property, e.g. `comp("Main").layer("Solid").transform("Position")`.
@@ -392,6 +495,9 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(clip) = s.state.link_clipboard.clone() {
         return paste_links(s, clip);
     }
+    if !s.state.value_clipboard.is_empty() {
+        return paste_properties(s, p);
+    }
     if s.state.clip_is_keys && !s.state.key_clipboard.is_empty() {
         return s.execute("keys.paste", p.clone());
     }
@@ -423,6 +529,42 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(created)
     })?;
     Ok(json!(new.iter().map(|l| l.0).collect::<Vec<_>>()))
+}
+
+/// Largest SVG text `edit.pasteSvg` reads (a clipboard can hold anything).
+const MAX_SVG_PASTE: usize = 64 << 20;
+
+/// `edit.pasteSvg`: SVG markup (the system clipboard's, copied from a browser, Illustrator or a
+/// design tool) as a new shape layer above the selected layer, its canvas centred in the comp:
+/// After Effects 26.3 pastes copied vector artwork as shape layers. Edit ▸ Paste runs it when
+/// the system clipboard holds SVG copied after anything copied in the app.
+fn paste_svg(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "edit.pasteSvg";
+    let text = str_p(p, "svg").ok_or_else(|| super::bad(c, "missing `svg` (SVG markup)"))?;
+    if text.len() > MAX_SVG_PASTE {
+        return Err(super::bad(c, format!("the SVG is larger than {} MB", MAX_SVG_PASTE >> 20)));
+    }
+    if !crate::vector::is_svg_text(text) {
+        return Err(super::bad(c, "the text is not SVG markup"));
+    }
+    let doc = effectcraft_svg::parse(text.as_bytes()).map_err(|e| super::bad(c, format!("cannot read the SVG: {e}")))?;
+    if doc.flatten().is_empty() {
+        return Err(super::bad(c, "the SVG has no shapes"));
+    }
+    let cid = super::comp_id(s, p)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
+    let name = match str_p(p, "name") {
+        Some(n) => n.to_string(),
+        None => {
+            let count = comp.layers.iter().filter(|l| matches!(l.source, LayerSource::Shape)).count();
+            comp.unique_layer_name(&format!("Shape Layer {}", count.saturating_add(1)))
+        }
+    };
+    let id = s.edit("Paste", None, |proj, st| {
+        let l = crate::vector::shapes_from_svg(proj, &comp, &doc, &name);
+        super::layer::insert_layer(proj, st, cid, l)
+    })?;
+    Ok(json!({"layer": id.0, "skipped": doc.skipped}))
 }
 
 fn split(s: &mut Session, p: &Value) -> Result<Value> {
@@ -711,6 +853,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{} (layers, keyframes at the CTI, effects, shape items into the selected shape layers, or property links / expressions)",
             has_clip,
             paste
+        ),
+        cmd!(
+            "edit.pasteSvg",
+            "Paste SVG as Shapes",
+            [],
+            None,
+            "{svg: SVG markup, name?, comp?} → {layer, skipped} (Edit ▸ Paste runs it for SVG on the system clipboard)",
+            has_comp,
+            paste_svg
         ),
         cmd!("edit.pasteReversedKeyframes", "Paste Reversed Keyframes", ["Edit"], None, "{layers?, prop?|path?, time?}", has_key_clip, paste_reversed),
         cmd!("edit.clear", "Clear", ["Edit"], Some("Delete"), "{layers?}", layers_or_keys, delete),

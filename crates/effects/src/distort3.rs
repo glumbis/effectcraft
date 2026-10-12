@@ -182,8 +182,9 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let (x0, y0) = (-ex[1] / 100.0 * lw, -ex[0] / 100.0 * lh);
     let (x1, y1) = (lw + ex[2] / 100.0 * lw, lh + ex[3] / 100.0 * lh);
     let corners_layer = [ctx.params.v2("topLeft"), ctx.params.v2("topRight"), ctx.params.v2("bottomRight"), ctx.params.v2("bottomLeft")];
-    // Grow the buffer to hold the pinned quad.
-    if !ctx.adjustment {
+    let unstretch = ctx.params.b("unstretch");
+    // Grow the buffer to hold the pinned quad (Unstretch writes inside the layer rectangle, so it needs no room).
+    if !ctx.adjustment && !unstretch {
         let mut need = 0.0f64;
         for c in &corners_layer {
             let (px, py) = b.to_px(*c);
@@ -198,7 +199,8 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
         vec2(p.0, p.1)
     });
     let persp = (ctx.params.f("perspective") / 100.0).clamp(0.0, 1.0);
-    let Some(inv) = Mat3::square_to_quad(q).inverse() else { return b };
+    let fwd = Mat3::square_to_quad(q);
+    let Some(inv) = fwd.inverse() else { return b };
     let src = b.img.clone();
     let (sc, off) = (b.scale, b.offset);
     let bil = move |u: f64, v: f64| -> (f64, f64) {
@@ -208,6 +210,17 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
     };
     b.img = crate::util::gen_image(src.width, src.height, |x, y| {
         let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+        if unstretch {
+            // Reverse pinning: the layer rectangle is the target, and the pinned quad is the region that fills it.
+            let u = ((px - off[0]) / sc - x0) / (x1 - x0);
+            let v = ((py - off[1]) / sc - y0) / (y1 - y0);
+            if !(-1e-9..=1.0 + 1e-9).contains(&u) || !(-1e-9..=1.0 + 1e-9).contains(&v) {
+                return [0.0; 4];
+            }
+            let m = fwd.apply(vec2(u, v));
+            let (bx, by) = bil(u, v);
+            return src.sample_bilinear(bx + (m.x - bx) * persp, by + (m.y - by) * persp);
+        }
         let m = inv.apply(vec2(px, py));
         let (mut u, mut v) = (m.x, m.y);
         if persp < 1.0 {
@@ -317,9 +330,12 @@ fn cc_slant(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---------------------------------------------------------------- CC Smear
 
 fn cc_smear(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let reach = ctx.params.f("reach") / 100.0;
+    if !ctx.adjustment {
+        b.pad(cc_smear_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale));
+    }
     let from = b.to_px(ctx.params.v2("from"));
     let to = b.to_px(ctx.params.v2("to"));
-    let reach = ctx.params.f("reach") / 100.0;
     let radius = (ctx.params.f("radius") * b.scale).max(0.5);
     let (dx, dy) = (to.0 - from.0, to.1 - from.1);
     let l2 = dx * dx + dy * dy;
@@ -336,6 +352,21 @@ fn cc_smear(ctx: &EffectCtx, mut b: Buf) -> Buf {
         Some((x - dx * k, y - dy * k))
     });
     b
+}
+
+/// The transparent pixels to add on every side of a buffer `size` pixels big (with `offset` and
+/// `scale`) for CC Smear: it moves pixels by up to Reach × From→To, and they may move out to the
+/// layer bounds. A text or shape layer's buffer ends at its content while its bounds are
+/// comp-sized, so the smear was cut off at the content's box (#659).
+pub fn cc_smear_pad(ctx: &EffectCtx, size: [u32; 2], offset: [f64; 2], scale: f64) -> u32 {
+    let reach = ctx.params.f("reach") / 100.0;
+    let (from, to) = (ctx.params.v2("from"), ctx.params.v2("to"));
+    let len = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt() * scale;
+    let moved = (reach.abs() * len).ceil();
+    if !moved.is_finite() || moved <= 0.0 {
+        return 0;
+    }
+    (moved.min(4096.0) as u32).min(crate::util::layer_cover_pad(ctx, size, offset, scale))
 }
 
 // ---------------------------------------------------------------- CC Split / CC Split 2
@@ -1096,6 +1127,43 @@ mod tests {
         }
     }
 
+    /// A text layer's buffer: 20 × 10 opaque pixels at (90, 45)–(110, 55) of its comp-sized
+    /// (200 × 100) layer bounds, after `id` with `set`.
+    fn on_text(id: &str, set: &[(&str, Value)]) -> Buf {
+        let s = crate::find(id).unwrap();
+        let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        for (k, v) in set {
+            assert!(params.values.contains_key(*k), "{id}: {k}");
+            params.values.insert(k.to_string(), v.clone());
+        }
+        let mut im = Image::new(20, 10);
+        im.data.iter_mut().for_each(|p| *p = [1.0; 4]);
+        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [200.0, 100.0], seed: 1, adjustment: false, env: Default::default() };
+        crate::apply(s, &ctx, Buf { img: im, offset: [-90.0, -45.0], scale: 1.0 })
+    }
+
+    /// Alpha at layer point `p` (0 outside the buffer).
+    fn alpha_at(b: &Buf, p: [f64; 2]) -> f32 {
+        let (x, y) = b.to_px(p);
+        b.img.get(x.floor() as i64, y.floor() as i64)[3]
+    }
+
+    /// #659: CC Smear and CC Tiler on a text layer reach past the text's box to the layer bounds
+    /// (comp-sized, as in After Effects), not cut off where the glyphs end.
+    #[test]
+    fn effects_on_text_reach_past_its_box() {
+        let smear = on_text("ec.distort.ccsmear", &[("from", pt(100.0, 50.0)), ("to", pt(140.0, 50.0)), ("reach", num(100.0)), ("radius", num(30.0))]);
+        assert!(alpha_at(&smear, [130.0, 50.0]) > 0.9, "the smear is cut off at the text's box");
+        assert!(smear.img.width < 200, "it grows only as far as pixels move");
+        let tiles = on_text("ec.distort.cctiler", &[("scale", num(50.0)), ("center", pt(100.0, 50.0))]);
+        assert!(alpha_at(&tiles, [100.0, 50.0]) > 0.9);
+        assert!(alpha_at(&tiles, [2.0, 50.0]) > 0.9, "tiles fill the layer bounds");
+        assert!(alpha_at(&tiles, [50.0, 50.0]) < 0.1);
+        // A footage layer's buffer is its bounds already: no change.
+        let o = run("ec.distort.ccsmear", &[], img(40, 30), &[]);
+        assert_eq!((o.img.width, o.img.height, o.offset), (40, 30, [0.0, 0.0]));
+    }
+
     #[test]
     fn every_warp_style_runs_and_bends() {
         let im = img(40, 30);
@@ -1125,6 +1193,23 @@ mod tests {
         assert_eq!(o.img.get(3, 10)[3], 0.0);
         let px = o.img.get(15, 10);
         assert!((px[0] - 0.5).abs() < 0.1, "{px:?}");
+    }
+
+    #[test]
+    fn power_pin_unstretch_expands_pinned_region() {
+        let im = crate::util::gen_image(24, 16, |_, _| [1.0, 0.0, 0.0, 1.0]);
+        let inset = [("topLeft", pt(6.0, 4.0)), ("topRight", pt(18.0, 4.0)), ("bottomRight", pt(18.0, 12.0)), ("bottomLeft", pt(6.0, 12.0))];
+        let opaque = |o: &Buf| o.img.data.iter().filter(|p| p[3] > 0.99).count();
+        let off = run("ec.distort.ccpowerpin", &inset, im.clone(), &[]);
+        assert_eq!(opaque(&off), 96);
+        let mut set = inset.to_vec();
+        set.push(("unstretch", Value::Bool(true)));
+        let on = run("ec.distort.ccpowerpin", &set, im.clone(), &[]);
+        assert_eq!(opaque(&on), 24 * 16);
+        assert!(on.img.get(0, 0)[3] > 0.99);
+        // Default corners are the identity either way.
+        let id = run("ec.distort.ccpowerpin", &[("unstretch", Value::Bool(true))], im.clone(), &[]);
+        assert!(maxd(&id.img, &im) < 1e-4);
     }
 
     #[test]

@@ -316,6 +316,8 @@ pub const IMPORT_FORMATS: &[&str] = &[
     "Opus",
     "glTF/GLB",
     "OBJ",
+    "STL",
+    "FBX",
     "Lottie JSON",
 ];
 
@@ -328,7 +330,10 @@ pub fn system_report(s: &Session) -> Value {
     let budgets = s.prefs.cache_budgets(mem.or(s.sys_memory));
     let mut issues = vec![];
     if gpu.is_none() {
-        issues.push("No GPU compositor: rendering uses the CPU (all features still work).".to_string());
+        issues.push(match &s.accel_note {
+            Some(why) => format!("No GPU compositor ({why}): rendering uses the CPU (all features still work)."),
+            None => "No GPU compositor: rendering uses the CPU (all features still work).".to_string(),
+        });
     }
     if mem.is_some_and(|m| m.total < 8 << 30) {
         issues.push("Less than 8 GB of memory: use lower preview resolutions for long or large comps.".to_string());
@@ -344,6 +349,8 @@ pub fn system_report(s: &Session) -> Value {
         "cores": crate::sysinfo::cpu_cores(),
         "memory": mem.map(|m| json!({"total": gb(m.total), "available": gb(m.available)})),
         "gpu": gpu,
+        "gpuNote": if gpu.is_none() { s.accel_note.clone() } else { None },
+        "windowGraphics": s.window_adapter,
         "caches": {"layer": gb(budgets.layer as u64), "footage": gb(budgets.media as u64), "preview": gb(budgets.preview as u64)},
         "import": IMPORT_FORMATS,
         "export": export,
@@ -369,7 +376,14 @@ pub fn report_text(r: &Value) -> String {
         Some(m) => t.push_str(&format!("Memory: {} ({} available)\n", m["total"].as_str().unwrap_or("?"), m["available"].as_str().unwrap_or("?"))),
         None => t.push_str("Memory: unknown\n"),
     }
-    t.push_str(&format!("GPU: {}\n", r.get("gpu").and_then(Value::as_str).unwrap_or("none (CPU compositing)")));
+    match (r.get("gpu").and_then(Value::as_str), r.get("gpuNote").and_then(Value::as_str)) {
+        (Some(gpu), _) => t.push_str(&format!("GPU: {gpu}\n")),
+        (None, Some(why)) => t.push_str(&format!("GPU: none (CPU compositing): {why}\n")),
+        (None, None) => t.push_str("GPU: none (CPU compositing)\n"),
+    }
+    if let Some(w) = r.get("windowGraphics").and_then(Value::as_str) {
+        t.push_str(&format!("Window graphics: {w}\n"));
+    }
     let c = &r["caches"];
     t.push_str(&format!(
         "Cache budgets: layer {}, footage {}, preview {}\n",

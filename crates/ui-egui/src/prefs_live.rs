@@ -4,47 +4,117 @@
 //! output (a second window showing the composition frame, Mercury Transmit-style).
 
 use egui::{Color32, Rect};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(not(target_arch = "wasm32"))]
+use serde_json::json;
 
 use crate::EffectcraftApp;
 use crate::frames::FrameKey;
 
 /// Run once per frame, before the panels draw.
 pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
-    dropped_files(app, ctx);
     memory_watch(app, ctx);
     home_on_open(app, ctx);
     video_preview(app, ctx);
 }
 
-/// Files dropped on the window are imported (layered files as Default Drag Import As says) in
-/// the background, with the Importing card showing what is read (#270). Dropped on the
-/// Composition viewer, they also become layers centred there, as in After Effects (#85), when the
-/// platform reports where the pointer is during file drags.
-fn dropped_files(app: &mut EffectcraftApp, ctx: &egui::Context) {
-    let paths: Vec<String> =
-        ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().to_string()).filter(|p| std::path::Path::new(p).is_absolute()).collect());
-    if paths.is_empty() {
+/// Import native file drops through the same command as the file picker. Run after the dock
+/// layout to use the current viewer rectangle for drops that also add layers.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dropped_files(app: &mut EffectcraftApp, ui: &egui::Ui, bounds: Rect) {
+    use egui::{Align2, Stroke, StrokeKind, vec2};
+
+    let ctx = ui.ctx().clone();
+    let hovered = ctx.input(|i| i.raw.hovered_files.len());
+    if hovered != 0 {
+        let label =
+            if hovered == 1 { crate::i18n::tr("Drop file to import").to_string() } else { crate::i18n::tr_args("Drop {} files to import", &[&hovered]) };
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("native-file-drop")));
+        painter.rect_stroke(bounds.shrink(8.0), 6.0, Stroke::new(2.0, app.tokens.accent), StrokeKind::Inside);
+        let hint = Rect::from_center_size(bounds.center(), vec2(300.0, 46.0));
+        painter.rect_filled(hint, 6.0, app.tokens.panel_bg);
+        painter.text(hint.center(), Align2::CENTER_CENTER, &label, crate::theme::Tokens::medium(14.0), app.tokens.text);
+        app.auto.add("file.dropTarget", hint, &label);
+    }
+
+    let (paths, skipped) = ctx.input(|i| {
+        let mut paths = Vec::new();
+        let mut skipped = 0;
+        for file in &i.raw.dropped_files {
+            if file.path().is_absolute() {
+                paths.push(file.path().to_string_lossy().into_owned());
+            } else {
+                skipped += 1;
+            }
+        }
+        (paths, skipped)
+    });
+
+    if paths.is_empty() && skipped == 0 {
         return;
     }
+
+    let mut errors = Vec::new();
+    if skipped != 0 {
+        errors.push(crate::i18n::tr_args("Skipped {} dropped file(s) without a local path. Use File ▸ Import ▸ File…", &[&skipped]));
+    }
+
     let (proj, rest): (Vec<String>, Vec<String>) = paths.into_iter().partition(|p| {
         let l = p.to_ascii_lowercase();
         l.ends_with(".ecproj") || l.ends_with(".ecprojx")
     });
-    if let Some(p) = proj.first()
-        && let Err(e) = crate::menus::invoke(app, ctx, "file.open", json!({"path": p}))
-    {
-        app.ui.status = e;
+
+    if proj.len() > 1 {
+        errors.push(crate::i18n::tr_args("Only one project can be opened per drop; skipped {} more", &[&proj.len().saturating_sub(1)]));
     }
+
+    if let Some(p) = proj.first()
+        && let Err(e) = crate::menus::invoke(app, &ctx, "file.open", json!({"path": p}))
+    {
+        errors.push(crate::i18n::tr_args("Cannot open dropped project {}: {}", &[&p, &e]));
+    }
+
     if !rest.is_empty() {
-        let viewer = app.auto.find("viewer.area").map(|e| Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])));
-        let at =
-            ctx.input(|i| i.pointer.hover_pos()).filter(|p| viewer.is_some_and(|v| v.contains(*p))).and_then(|p| crate::panels::viewer::screen_to_comp(ctx, p));
-        let params =
-            json!({"paths": rest, "drag": true, "importAs": app.session.prefs.drag_import_as(), "addToComp": at.is_some(), "position": at, "background": true});
-        if let Err(e) = crate::menus::invoke(app, ctx, "file.import", params) {
-            app.ui.status = e;
+        let viewer = app
+            .auto
+            .elements
+            .iter()
+            .find(|e| e.id == "viewer.area")
+            .map(|e| Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])));
+
+        let at = if proj.is_empty() {
+            ctx.input(|i| i.pointer.hover_pos()).filter(|p| viewer.is_some_and(|v| v.contains(*p))).and_then(|p| crate::panels::viewer::screen_to_comp(&ctx, p))
+        } else {
+            None
+        };
+
+        // Dropped files import as stills and folders' numbered stills as sequences; Alt-drag
+        // imports a folder's files one by one (After Effects).
+        let alt = ctx.input(|i| i.modifiers.alt);
+        // A dropped Photoshop file asks how to import it (the Import Photoshop File dialog, its
+        // Import Kind starting at Default Drag Import As), as File ▸ Import ▸ File… does (#678).
+        let layered = rest.iter().any(|p| p.rsplit('.').next().is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "psd" | "psb")));
+        let mut params = json!({
+            "paths": rest,
+            "drag": true,
+            "addToComp": at.is_some(),
+            "position": at,
+            "background": true
+        });
+        if !layered {
+            params["importAs"] = json!(app.session.prefs.drag_import_as());
         }
+        if alt {
+            params["sequence"] = json!(false);
+        }
+
+        if let Err(e) = crate::menus::invoke(app, &ctx, "file.import", params) {
+            errors.push(crate::i18n::tr_args("Cannot import dropped files: {}", &[&e]));
+        }
+    }
+
+    if !errors.is_empty() {
+        app.ui.status = errors.join("; ");
     }
 }
 
@@ -122,12 +192,16 @@ fn video_preview(app: &mut EffectcraftApp, ctx: &egui::Context) {
         },
         (_, _, prev) => prev.map(|p| p.1),
     };
+
     let title =
         format!("Video Preview — {}", app.session.active_comp_id().and_then(|c| app.session.project.item(c)).map(|i| i.name.clone()).unwrap_or_default());
+
     let mut builder = egui::ViewportBuilder::default().with_title(title).with_inner_size([960.0, 540.0]);
+
     if v.device == "fullscreen" {
         builder = builder.with_fullscreen(true);
     }
+
     let mut closed = false;
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("effectcraft-video-preview"), builder, |vctx, _| {
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::BLACK)).show(vctx, |ui| {
@@ -143,6 +217,7 @@ fn video_preview(app: &mut EffectcraftApp, ctx: &egui::Context) {
             closed = true;
         }
     });
+
     if closed && let Err(e) = app.set_pref("video.enableOutput", Value::Bool(false)) {
         app.ui.status = e;
     }
