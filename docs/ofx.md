@@ -39,12 +39,19 @@ locations, and EffectCraft looks in the same places as other hosts:
 | macOS | `/Library/OFX/Plugins` |
 | Linux | `/usr/OFX/Plugins` |
 
-In addition, every folder listed in the `OFX_PLUGIN_PATH` environment variable is searched
-(separated by `;` on Windows, `:` elsewhere). Folders are scanned recursively for bundles.
+In addition, an `OFX` folder next to the executable and every folder listed in the
+`OFX_PLUGIN_PATH` environment variable are searched (separated by `;` on Windows, `:` elsewhere).
+Folders are scanned recursively for bundles; links and junctions are followed.
 
 Nothing needs configuring: at start-up the desktop app scans these folders (the
 `effect.plugins.scanOfx` command) and registers everything it finds. Large suites register many
 effects (Sapphire around 290); loading them takes a few seconds.
+
+The desktop app writes what the scan found to `ofx_scan.txt` in its config folder
+(`%APPDATA%\EffectCraft` on Windows, see below): the folders searched, every effect registered and
+every problem. When a plug-in fails to load it also says so in a message at start-up. The release
+app has no console on Windows, so this file is where load errors end up. Troubleshooting steps for
+users are in [FORK.md](../FORK.md#getting-plug-ins-to-work).
 
 ## Loading a plug-in by hand
 
