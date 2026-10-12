@@ -47,7 +47,9 @@ fn loaded_cache() -> &'static Mutex<HashMap<PathBuf, Vec<LoadedEffect>>> {
     L.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Standard OFX locations for this OS plus every entry of `OFX_PLUGIN_PATH`.
+/// Standard OFX locations for this OS, an `OFX` folder next to the executable (where the
+/// fork's download keeps its test plug-in, so other OFX hosts don't see it) and every entry of
+/// `OFX_PLUGIN_PATH`.
 pub fn default_search_paths() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = Vec::new();
     #[cfg(windows)]
@@ -60,6 +62,9 @@ pub fn default_search_paths() -> Vec<PathBuf> {
     v.push(PathBuf::from("/Library/OFX/Plugins"));
     #[cfg(all(not(windows), not(target_os = "macos")))]
     v.push(PathBuf::from("/usr/OFX/Plugins"));
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("OFX"))) {
+        v.push(dir);
+    }
     if let Some(p) = std::env::var_os("OFX_PLUGIN_PATH") {
         v.extend(std::env::split_paths(&p).filter(|p| !p.as_os_str().is_empty()));
     }
@@ -81,6 +86,9 @@ pub fn load_path(path: &Path) -> LoadReport {
     if binaries.is_empty() && report.errors.is_empty() {
         report.errors.push(format!("{}: no OpenFX plug-ins found", path.display()));
     }
+    // The same binary can be reached twice (through a link, or a folder listed twice).
+    let mut seen = std::collections::HashSet::new();
+    binaries.retain(|(bin, _)| seen.insert(std::fs::canonicalize(bin).unwrap_or_else(|_| bin.clone())));
     for (bin, bundle) in binaries {
         load_binary(&bin, &bundle, &mut report);
     }
@@ -143,8 +151,9 @@ fn find_binaries(path: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>, er
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
     entries.sort();
     for p in entries {
-        // `symlink_metadata` does not follow links, so link cycles cannot recurse forever.
-        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+        // Links and junctions are followed (plug-ins are often linked in from elsewhere); a link
+        // cycle stops at MAX_DEPTH and `load_path` loads each binary once.
+        let Ok(meta) = std::fs::metadata(&p) else { continue };
         if meta.is_dir() {
             find_binaries(&p, depth + 1, out, errors);
         } else if meta.is_file() && is_ofx_file(&p) {

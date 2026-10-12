@@ -82,8 +82,11 @@ fn plugins_load_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad(c, "missing `path`"))?;
     let r = loader(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let n = r["loaded"].as_array().map_or(0, Vec::len);
-    if n > 0 {
-        s.toast(format!("Loaded {n} OpenFX effect(s)"));
+    let errors: Vec<&str> = r["errors"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    match (n, errors.first()) {
+        (0, None) => s.toast(format!("{path}: no OpenFX effects in it")),
+        (_, None) => s.toast(format!("Loaded {n} OpenFX effect(s)")),
+        (_, Some(first)) => s.toast(format!("Loaded {n} OpenFX effect(s), {} problem(s): {first}", errors.len())),
     }
     Ok(r)
 }

@@ -52,6 +52,58 @@ fn is_project_file(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("ecproj") || ext.eq_ignore_ascii_case("ecprojx"))
 }
 
+/// The start-up OpenFX scan as plain text for `<config>/ofx_scan.txt`: the folders searched, the
+/// effects registered and every problem. `result` is `effect.plugins.scanOfx`'s.
+fn ofx_scan_report(search_paths: &[std::path::PathBuf], result: &Result<serde_json::Value, String>) -> String {
+    use std::fmt::Write as _;
+    let mut t = String::from("EffectCraft OpenFX plug-in scan (written at every start-up)\n\nFolders searched:\n");
+    for p in search_paths {
+        let state = if p.is_dir() { "found  " } else { "missing" };
+        let _ = writeln!(t, "  [{state}] {}", p.display());
+    }
+    let r = match result {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(t, "\nThe scan failed: {e}");
+            return t;
+        }
+    };
+    let loaded = r["loaded"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let _ = writeln!(t, "\nEffects registered: {}", loaded.len());
+    for e in loaded {
+        let s = |k: &str| e[k].as_str().unwrap_or("").to_string();
+        let _ = writeln!(t, "  {} [{}]  id {}  ({})", s("name"), s("category"), s("id"), s("bundle"));
+    }
+    let errors = r["errors"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let _ = writeln!(t, "\nProblems: {}", errors.len());
+    for e in errors {
+        let _ = writeln!(t, "  {}", e.as_str().unwrap_or("error"));
+    }
+    if loaded.is_empty() {
+        t.push_str(
+            "\nNo OpenFX effects were found. Install the OFX version of your plug-ins (not the After Effects\n\
+             one) into one of the folders above, or list extra folders in the OFX_PLUGIN_PATH environment\n\
+             variable, then restart EffectCraft. See FORK.md, \"Getting plug-ins to work\".\n",
+        );
+    }
+    t
+}
+
+/// The toast after the start-up OpenFX scan: only when something needs attention.
+fn ofx_scan_toast(result: &Result<serde_json::Value, String>, report: &std::path::Path) -> Option<String> {
+    let r = match result {
+        Ok(r) => r,
+        Err(e) => return Some(format!("OpenFX plug-ins could not be scanned: {e}")),
+    };
+    let loaded = r["loaded"].as_array().map_or(0, Vec::len);
+    let errors = r["errors"].as_array().map_or(0, Vec::len);
+    match (loaded, errors) {
+        (_, 0) => None,
+        (0, n) => Some(format!("No OpenFX plug-in loaded ({n} problem(s)). Details: {}", report.display())),
+        (l, n) => Some(format!("{l} OpenFX effect(s) loaded, {n} problem(s). Details: {}", report.display())),
+    }
+}
+
 /// winit 0.30 cannot deliver native Wayland file drops. XWayland can.
 #[cfg(target_os = "linux")]
 fn wayland_drop_notice(wayland_display: Option<&std::ffi::OsStr>, backend: Option<&std::ffi::OsStr>) -> Option<&'static str> {
@@ -171,13 +223,15 @@ fn main() -> eframe::Result {
                 // OpenFX plug-ins from the standard folders, in builds with the `openfx` feature
                 // (EFFECTCRAFT_NO_OFX=1 skips them).
                 if session.ofx_loader.is_some() && std::env::var_os("EFFECTCRAFT_NO_OFX").is_none_or(|v| v != "1") {
-                    match session.execute("effect.plugins.scanOfx", json!({})) {
-                        Ok(r) => {
-                            for e in r["errors"].as_array().into_iter().flatten() {
-                                eprintln!("effectcraft: OpenFX: {}", e.as_str().unwrap_or("error"));
-                            }
-                        }
-                        Err(e) => eprintln!("effectcraft: OpenFX: {e}"),
+                    let result = session.execute("effect.plugins.scanOfx", json!({})).map_err(|e| e.to_string());
+                    // The release app has no console on Windows, so stderr alone goes nowhere:
+                    // the scan is also written to <config>/ofx_scan.txt and summarised in a toast.
+                    let report = dir.join("ofx_scan.txt");
+                    let text = ofx_scan_report(&session.ofx_search_paths, &result);
+                    eprint!("{text}");
+                    let _ = std::fs::write(&report, &text);
+                    if let Some(msg) = ofx_scan_toast(&result, &report) {
+                        session.toast(msg);
                     }
                 }
                 session.config = Some(std::sync::Arc::new(effectcraft_engine::config::DirConfig::new(dir)));
@@ -438,6 +492,22 @@ mod tests {
         assert!(super::wayland_drop_notice(None, None).is_none());
         assert!(super::wayland_drop_notice(Some(OsStr::new("")), None).is_none());
         assert!(super::wayland_drop_notice(Some(OsStr::new("wayland-0")), Some(OsStr::new("x11"))).is_none());
+    }
+
+    /// The OpenFX scan report lists folders, effects and problems; the toast only speaks up on problems.
+    #[test]
+    fn ofx_scan_report_and_toast() {
+        use serde_json::json;
+        use std::path::{Path, PathBuf};
+        let ok = Ok(json!({"loaded": [{"name": "Invert", "category": "EC Test", "id": "org.x.invert", "bundle": "x.ofx.bundle"}], "errors": []}));
+        let t = super::ofx_scan_report(&[PathBuf::from("/definitely/not/here")], &ok);
+        assert!(t.contains("[missing] /definitely/not/here") && t.contains("Invert [EC Test]") && t.contains("Problems: 0"));
+        assert_eq!(super::ofx_scan_toast(&ok, Path::new("r.txt")), None);
+        let bad = Ok(json!({"loaded": [], "errors": ["a.ofx: cannot load the library"]}));
+        let t = super::ofx_scan_report(&[], &bad);
+        assert!(t.contains("a.ofx: cannot load the library") && t.contains("No OpenFX effects were found"));
+        assert!(super::ofx_scan_toast(&bad, Path::new("r.txt")).is_some_and(|m| m.contains("r.txt")));
+        assert!(super::ofx_scan_toast(&Err("boom".into()), Path::new("r.txt")).is_some_and(|m| m.contains("boom")));
     }
 
     /// The window's device never asks for more than the adapter offers (#198).

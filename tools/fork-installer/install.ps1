@@ -4,7 +4,7 @@
 #  1. Copies the app to %LOCALAPPDATA%\Programs\EffectCraft-OFX (closes nothing: asks you to quit
 #     EffectCraft first if it's running).
 #  2. Adds Start menu and desktop shortcuts.
-#  3. Puts the small EC Test plug-in on OFX_PLUGIN_PATH, so OpenFX can be checked without a
+#  3. Installs the small EC Test plug-in next to the app, so OpenFX can be checked without a
 #     commercial plug-in.
 #  4. For opening .aep / .aepx: finds Python 3 and installs the py-aep library; if Python is
 #     missing it offers to install it with winget (you're asked first).
@@ -65,18 +65,20 @@ foreach ($l in $links) {
 }
 Say '[ok] Start menu and desktop shortcuts: "EffectCraft (OFX)"' 'Green'
 
-# 3. The test plug-in, on OFX_PLUGIN_PATH (added to, never replaced).
-$bundle = Join-Path $src 'ec-test-ofx.ofx.bundle'
+# 3. The test plug-in, in OFX\ next to the app (EffectCraft scans it; other OFX hosts don't).
+$bundle = Join-Path $src 'OFX\ec-test-ofx.ofx.bundle'
+if (-not (Test-Path $bundle)) { $bundle = Join-Path $src 'ec-test-ofx.ofx.bundle' }  # older downloads
+$ofx = Join-Path $dst 'OFX'
 if (Test-Path $bundle) {
-    $ofx = Join-Path $dst 'OFX'
     New-Item -ItemType Directory -Force $ofx | Out-Null
     Copy-Item $bundle $ofx -Recurse -Force
-    $cur = [Environment]::GetEnvironmentVariable('OFX_PLUGIN_PATH', 'User')
-    $parts = @(if ($cur) { $cur -split ';' | Where-Object { $_ } })
-    if ($parts -notcontains $ofx) {
-        [Environment]::SetEnvironmentVariable('OFX_PLUGIN_PATH', (($parts + $ofx) -join ';'), 'User')
-    }
     Say '[ok] Test plug-in installed ("EC Test" effects)' 'Green'
+}
+# Older versions put that folder on OFX_PLUGIN_PATH, where Resolve, Vegas and Natron saw it too.
+$cur = [Environment]::GetEnvironmentVariable('OFX_PLUGIN_PATH', 'User')
+if ($cur -and (($cur -split ';') -contains $ofx)) {
+    $rest = @($cur -split ';' | Where-Object { $_ -and $_ -ne $ofx })
+    [Environment]::SetEnvironmentVariable('OFX_PLUGIN_PATH', $(if ($rest.Count) { $rest -join ';' } else { $null }), 'User')
 }
 Say '     Your own OpenFX plug-ins (RSMB, Twixtor, Sapphire...): install their OFX versions with their own installers.'
 

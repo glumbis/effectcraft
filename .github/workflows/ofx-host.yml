@@ -62,7 +62,9 @@ jobs:
           Copy-Item target/release/effectcraft.exe, target/release/effectcraft-cli.exe dist/EffectCraft-OFX/
           Copy-Item FORK.md dist/EffectCraft-OFX/README.md
           Copy-Item tools/fork-installer/* dist/EffectCraft-OFX/
-          Copy-Item target/ofx-test/ec-test-ofx.ofx.bundle dist/EffectCraft-OFX/ -Recurse
+          # The test plug-in goes in OFX\ next to the app, which the app always scans.
+          New-Item -ItemType Directory -Force dist/EffectCraft-OFX/OFX | Out-Null
+          Copy-Item target/ofx-test/ec-test-ofx.ofx.bundle dist/EffectCraft-OFX/OFX/ -Recurse
           New-Item -ItemType Directory -Force dist/EffectCraft-OFX/aep-import | Out-Null
           Copy-Item tools/aep-import/*.py, tools/aep-import/README.md, tools/aep-import/requirements.txt dist/EffectCraft-OFX/aep-import/
           Compress-Archive -Path dist/EffectCraft-OFX -DestinationPath dist/EffectCraft-OFX-windows.zip
