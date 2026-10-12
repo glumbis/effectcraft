@@ -76,14 +76,20 @@ EffectCraft keeps a **crash blocklist** in its config folder (`%APPDATA%\EffectC
   keeps that file locked, and deletes it once the binary has been loaded and described
   (successfully or with an ordinary error).
 * If the process dies in between, the file is still there and its lock is gone. The next process
-  that loads plug-ins moves the path to `ofx_blocklist.txt` (one path per line) and the binary is
-  **skipped** from then on. The skip shows up in the loader's `errors` ("... skipped: it crashed
-  EffectCraft while loading last time ...") and on stderr at start-up. The rest of the plug-ins load
-  normally. A marker that is still locked belongs to another EffectCraft process (the CLI next to
-  the app) that is loading right now, and is left alone.
-* To try a blocklisted plug-in again (after updating or re-licensing it), run
-  `effect.plugins.scanOfx {"retry": true}` from the control protocol, or delete its line (or the whole
-  `ofx_blocklist.txt`) and restart. A plug-in that crashes again is simply blocklisted again.
+  that loads plug-ins records a **strike** against that binary in `ofx_blocklist.txt` (one line
+  per binary: strikes, a file stamp, the path). A marker that is still locked belongs to another
+  EffectCraft process (the CLI next to the app) that is loading right now, and is left alone.
+* One strike doesn't block anything: the app may have been closed or killed while a big suite was
+  loading (the window isn't up yet, so it can look stuck), or the plug-in had a one-off problem.
+  A binary is **skipped** only after it crashed **two loads in a row**. The skip shows up in the
+  loader's `errors` ("... skipped: it crashed EffectCraft while loading 2 times in a row ..."), in
+  `ofx_scan.txt` and in the start-up message. The rest of the plug-ins load normally.
+* A load that finishes clears the binary's strikes, and a binary whose file changed (updated or
+  reinstalled) starts again from zero. To try a skipped plug-in again without updating it, run
+  `effect.plugins.scanOfx {"retry": true}` from the control protocol, or delete its line (or the
+  whole `ofx_blocklist.txt`) and restart.
+* Lists written by earlier versions of the fork (a bare path per line, written after a single
+  crash) count as one strike, so those plug-ins are tried again.
 
 This only covers loading. A crash while an effect is rendering is not caught and is not
 blocklisted; if that keeps happening, start with `EFFECTCRAFT_NO_OFX=1` or uninstall the plug-in.
@@ -103,6 +109,9 @@ blocklisted; if that keeps happening, start with `EFFECTCRAFT_NO_OFX=1` or unins
 * The effect's output may be larger than its input (glows, blurs, borders); EffectCraft pads the
   layer buffer by the plug-in's region of definition before rendering, measured on the real layer.
 * Pixels are float RGBA, premultiplied. Plug-ins that only support 8- or 16-bit are converted.
+* Plug-in code runs on threads with 16 MiB stacks: the multithread suite's workers, and on Linux
+  the render call itself (Linux plug-ins are built for glibc's 8 MiB thread stacks; on the
+  renderer's 2 MiB worker threads Twixtor's optical flow overflowed the stack and crashed).
 * Temporal plug-ins (motion blur, echo, retiming) can ask for the input at other times and for other
   layers; EffectCraft renders those on demand. Each applied effect gets its own pool of OFX
   instances, so plug-ins that keep state between frames never mix two layers up.

@@ -112,7 +112,7 @@ What the common problems mean:
 | `cannot load the library: ... The specified module could not be found` | The plug-in needs a DLL it can't find. Install the latest **Microsoft Visual C++ Redistributable (x64)**; reinstall the plug-in (its installer brings its own runtime files) |
 | `cannot load the library: ... %1 is not a valid Win32 application` | A 32-bit or wrong-platform build; get the 64-bit Windows OFX version |
 | `not an OpenFX plug-in` | The file isn't an OFX binary (an AE `.aex` renamed, or a support library) |
-| `... skipped: it crashed EffectCraft while loading last time` | It crashed while loading once and is blocklisted. After updating or reinstalling it, delete its line from `%APPDATA%\EffectCraft\ofx_blocklist.txt` (or the whole file) and restart |
+| `... skipped: it crashed EffectCraft while loading 2 times in a row` | It crashed EffectCraft twice while starting, so it's skipped. Updating or reinstalling it un-skips it automatically; otherwise delete its line from `%APPDATA%\EffectCraft\ofx_blocklist.txt` (or the whole file) and restart |
 | `Load failed (OFX status ...)` / `Describe failed` | The plug-in refused this host, often a licence check or a missing installation step. Run the vendor's activation tool, then try again |
 | `no supported context` / `unsupported pixel depth` | It's a kind of OFX effect EffectCraft can't host yet; please [open an issue](https://github.com/glumbis/effectcraft/issues) with the report |
 | `no Win64 binary in this bundle` | The bundle has no 64-bit Windows build |

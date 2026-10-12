@@ -7,10 +7,19 @@
 //! holding the binary's canonical path) in the state directory, keeps it exclusively locked, and
 //! removes it once the binary has been loaded and described, successfully or with an ordinary
 //! error. If the process dies in between, the marker survives and the OS releases the lock; on
-//! the next first load of any process a marker that can be locked is moved to
-//! `ofx_blocklist.txt` (one path per line) and that binary is skipped from then on. A marker that
-//! is still locked belongs to another EffectCraft process that is loading right now and is left
-//! alone. `effect.plugins.scanOfx {"retry": true}` or deleting the line brings a binary back.
+//! the next first load of any process a marker that can be locked counts as a *strike* against
+//! that binary in `ofx_blocklist.txt`. A marker that is still locked belongs to another
+//! EffectCraft process that is loading right now and is left alone.
+//!
+//! One strike isn't enough to skip a binary: the process may have been closed or killed while a
+//! large suite was loading (the window isn't up yet, so the app looks stuck), or the plug-in hit
+//! a one-off problem. Only a binary that crashed [`STRIKES`] loads in a row is skipped. A load
+//! that finishes clears its strikes, and a binary whose file changed since its last strike
+//! (updated, reinstalled) starts over. `effect.plugins.scanOfx {"retry": true}` or deleting the
+//! line brings a binary back.
+//!
+//! `ofx_blocklist.txt` holds one binary per line: `<strikes>\t<file stamp>\t<path>`. A line with
+//! only a path (written by earlier versions after a single crash) counts as one strike.
 //!
 //! The state directory is set once by the host ([`set_state_dir`]); without one (tests, tools with
 //! no config directory) the blocklist is disabled. All file IO errors are ignored: the blocklist
@@ -25,8 +34,10 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 /// Marker files are `ofx_loading.<owner>.txt`, one per process.
 const MARKER_PREFIX: &str = "ofx_loading.";
 const MARKER_SUFFIX: &str = ".txt";
-/// The binaries that crashed the process while loading, one path per line.
+/// The binaries that crashed the process while loading, one per line (see the module docs).
 const LIST: &str = "ofx_blocklist.txt";
+/// Crashes in a row after which a binary is skipped.
+const STRIKES: u32 = 2;
 
 fn state_dir_cell() -> &'static Mutex<Option<PathBuf>> {
     static C: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
@@ -59,14 +70,20 @@ pub fn clear() {
 struct Marker {
     path: PathBuf,
     file: File,
+    /// The binary being loaded.
+    bin: String,
 }
 
 impl Marker {
-    /// The load finished: unlock (closing the file releases the lock) and remove the marker.
+    /// The load finished: unlock (closing the file releases the lock), remove the marker and
+    /// forget the binary's earlier strikes.
     fn finish(self) {
-        let Marker { path, file } = self;
+        let Marker { path, file, bin } = self;
         drop(file);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        if let Some(dir) = path.parent() {
+            forget(dir, &bin);
+        }
     }
 }
 
@@ -97,14 +114,81 @@ fn norm(path: &str) -> String {
     if cfg!(windows) { path.to_lowercase() } else { path.to_string() }
 }
 
-fn read_list(dir: &Path) -> Vec<String> {
+/// One line of the blocklist.
+#[derive(Clone, Debug, PartialEq)]
+struct Entry {
+    strikes: u32,
+    /// [`stamp`] of the binary at its last strike ("" if unknown).
+    stamp: String,
+    path: String,
+}
+
+fn parse_line(line: &str) -> Option<Entry> {
+    let line = line.trim_end_matches('\r');
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.splitn(3, '\t');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some(stamp), Some(path)) if !path.is_empty() => {
+            Some(Entry { strikes: n.parse().unwrap_or(1).max(1), stamp: stamp.to_string(), path: path.to_string() })
+        }
+        // A single-path line from an earlier version: one crash.
+        _ => Some(Entry { strikes: 1, stamp: String::new(), path: line.to_string() }),
+    }
+}
+
+fn read_list(dir: &Path) -> Vec<Entry> {
     let text = std::fs::read_to_string(dir.join(LIST)).unwrap_or_default();
-    text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty()).map(str::to_string).collect()
+    text.lines().filter_map(parse_line).collect()
+}
+
+fn write_list(dir: &Path, list: &[Entry]) {
+    if list.is_empty() {
+        let _ = std::fs::remove_file(dir.join(LIST));
+        return;
+    }
+    let text: String = list.iter().map(|e| format!("{}\t{}\t{}\n", e.strikes, e.stamp, e.path)).collect();
+    let _ = std::fs::write(dir.join(LIST), text);
+}
+
+/// Identifies a binary's file version: its size and modification time ("" if unreadable).
+fn stamp(bin: &str) -> String {
+    let Ok(meta) = std::fs::metadata(bin) else { return String::new() };
+    let secs = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    format!("{}-{secs}", meta.len())
+}
+
+/// The entry for `bin`, if it still describes the same file.
+fn entry_of(list: &[Entry], bin: &str) -> Option<Entry> {
+    let want = norm(bin);
+    let e = list.iter().find(|e| norm(&e.path) == want)?;
+    (e.stamp.is_empty() || e.stamp == stamp(bin)).then(|| e.clone())
 }
 
 fn is_blocked(dir: &Path, bin: &str) -> bool {
+    entry_of(&read_list(dir), bin).is_some_and(|e| e.strikes >= STRIKES)
+}
+
+/// One more crash for `bin`.
+fn strike(dir: &Path, bin: &str) {
+    let mut list = read_list(dir);
+    let strikes = entry_of(&list, bin).map_or(0, |e| e.strikes).saturating_add(1);
     let want = norm(bin);
-    read_list(dir).iter().any(|l| norm(l) == want)
+    list.retain(|e| norm(&e.path) != want);
+    list.push(Entry { strikes, stamp: stamp(bin), path: bin.to_string() });
+    write_list(dir, &list);
+}
+
+/// `bin` loaded without crashing: drop its strikes.
+fn forget(dir: &Path, bin: &str) {
+    let mut list = read_list(dir);
+    let want = norm(bin);
+    let before = list.len();
+    list.retain(|e| norm(&e.path) != want);
+    if list.len() != before {
+        write_list(dir, &list);
+    }
 }
 
 fn marker_path(dir: &Path, owner: u32) -> PathBuf {
@@ -132,7 +216,7 @@ fn check_and_mark(dir: &Path, bin: &Path, label: &str, owner: u32) -> Result<Opt
     let key = bin.to_string_lossy();
     if is_blocked(dir, &key) {
         return Err(format!(
-            "{label}: skipped: it crashed EffectCraft while loading last time (remove it from {} or run effect.plugins.scanOfx {{\"retry\": true}} to try again)",
+            "{label}: skipped: it crashed EffectCraft while loading {STRIKES} times in a row (update or reinstall it, remove its line from {} or run effect.plugins.scanOfx {{\"retry\": true}} to try again)",
             dir.join(LIST).display()
         ));
     }
@@ -146,7 +230,7 @@ fn check_and_mark(dir: &Path, bin: &Path, label: &str, owner: u32) -> Result<Opt
     // Locked for as long as the load runs; a lock failure only weakens the multi-process check.
     let _ = file.lock();
     let _ = file.write_all(key.as_bytes()).and_then(|()| file.flush());
-    Ok(Some(Marker { path, file }))
+    Ok(Some(Marker { path, file, bin: key.into_owned() }))
 }
 
 /// Markers left by processes that died while loading a binary: blocklist those binaries.
@@ -158,11 +242,8 @@ fn recover(dir: &Path) {
         let _ = file.read_to_string(&mut text);
         drop(file);
         let bin = text.lines().next().unwrap_or("").trim_end_matches('\r');
-        if !bin.is_empty()
-            && !is_blocked(dir, bin)
-            && let Ok(mut f) = File::options().create(true).append(true).open(dir.join(LIST))
-        {
-            let _ = writeln!(f, "{bin}");
+        if !bin.is_empty() {
+            strike(dir, bin);
         }
         let _ = std::fs::remove_file(&marker);
     }
@@ -229,23 +310,71 @@ mod tests {
         assert!(check_and_mark(&t.0, &b, "Good", 2).is_ok());
     }
 
+    /// A run that dies while loading `b`, then the next run's recovery.
+    fn crash_and_recover(dir: &Path, b: &Path, owner: u32) {
+        crash(check_and_mark(dir, b, "x", owner).unwrap());
+        recover(dir);
+    }
+
     #[test]
-    fn a_crash_blocklists_the_binary_on_the_next_run() {
+    fn two_crashes_in_a_row_blocklist_the_binary() {
         let t = TempDir::new("crash");
         let bad = bin("Bad.ofx");
         let good = bin("Good.ofx");
-        // Run 1 dies inside the plug-in.
-        crash(check_and_mark(&t.0, &bad, "Bad", 1).unwrap());
-        // Run 2 notices the marker.
-        recover(&t.0);
+        // Run 1 dies inside the plug-in; run 2 notices the marker. One strike: still loaded.
+        crash_and_recover(&t.0, &bad, 1);
         assert_eq!(markers(&t.0), 0);
-        assert_eq!(read_list(&t.0), vec![bad.to_string_lossy().into_owned()]);
-        let err = check_and_mark(&t.0, &bad, "Bad", 2).err().unwrap_or_default();
-        assert!(err.starts_with("Bad: skipped: it crashed EffectCraft while loading last time"), "{err}");
+        assert_eq!(read_list(&t.0).iter().map(|e| (e.strikes, e.path.clone())).collect::<Vec<_>>(), vec![(1, bad.to_string_lossy().into_owned())]);
+        assert!(!is_blocked(&t.0, &bad.to_string_lossy()));
+        // Run 2 dies there too: skipped from run 3 on.
+        crash_and_recover(&t.0, &bad, 2);
+        let err = check_and_mark(&t.0, &bad, "Bad", 3).err().unwrap_or_default();
+        assert!(err.starts_with("Bad: skipped: it crashed EffectCraft while loading 2 times in a row"), "{err}");
         assert!(err.contains("ofx_blocklist.txt") && err.contains("retry"), "{err}");
         // A refused binary writes no marker, and other binaries still load.
         assert_eq!(markers(&t.0), 0);
-        assert!(check_and_mark(&t.0, &good, "Good", 2).unwrap().is_some());
+        assert!(check_and_mark(&t.0, &good, "Good", 3).unwrap().is_some());
+    }
+
+    /// A process killed while loading (the user closing an app that looked stuck) is one strike,
+    /// which the next good load forgets.
+    #[test]
+    fn a_clean_load_clears_earlier_strikes() {
+        let t = TempDir::new("forgive");
+        let b = bin("Suite.ofx");
+        crash_and_recover(&t.0, &b, 1);
+        check_and_mark(&t.0, &b, "Suite", 2).unwrap().unwrap().finish();
+        assert!(!t.0.join(LIST).exists());
+        crash_and_recover(&t.0, &b, 3);
+        assert!(!is_blocked(&t.0, &b.to_string_lossy()));
+    }
+
+    /// Lists written by earlier versions (a bare path after one crash) count as one strike.
+    #[test]
+    fn an_older_single_path_line_is_one_strike() {
+        let t = TempDir::new("legacy");
+        let _ = std::fs::create_dir_all(&t.0);
+        let b = bin("Old.ofx");
+        let _ = std::fs::write(t.0.join(LIST), format!("{}\r\n", b.to_string_lossy()));
+        assert!(check_and_mark(&t.0, &b, "Old", 1).is_ok());
+        crash_and_recover(&t.0, &b, 2);
+        assert!(is_blocked(&t.0, &b.to_string_lossy()));
+    }
+
+    /// Updating or reinstalling a blocked plug-in changes its file: it is tried again.
+    #[test]
+    fn a_changed_binary_starts_over() {
+        let t = TempDir::new("changed");
+        let _ = std::fs::create_dir_all(&t.0);
+        let b = t.0.join("Real.ofx");
+        let _ = std::fs::write(&b, b"v1");
+        crash_and_recover(&t.0, &b, 1);
+        crash_and_recover(&t.0, &b, 2);
+        assert!(is_blocked(&t.0, &b.to_string_lossy()));
+        let _ = std::fs::write(&b, b"version 2");
+        assert!(!is_blocked(&t.0, &b.to_string_lossy()));
+        crash_and_recover(&t.0, &b, 3);
+        assert_eq!(read_list(&t.0).first().map(|e| e.strikes), Some(1));
     }
 
     #[test]
@@ -257,6 +386,7 @@ mod tests {
         recover(&t.0);
         clear_in(&t.0);
         assert!(!is_blocked(&t.0, &busy.to_string_lossy()));
+        assert!(read_list(&t.0).is_empty());
         assert_eq!(markers(&t.0), 1);
         live.finish();
         assert_eq!(markers(&t.0), 0);
@@ -266,12 +396,12 @@ mod tests {
     fn recovering_twice_does_not_duplicate_entries() {
         let t = TempDir::new("twice");
         let bad = bin("Bad.ofx");
-        crash(check_and_mark(&t.0, &bad, "Bad", 1).unwrap());
-        recover(&t.0);
+        crash_and_recover(&t.0, &bad, 1);
         // Another marker for the same binary (for example after a manual retry that crashed again).
         let _ = std::fs::write(marker_path(&t.0, 7), bad.to_string_lossy().as_bytes());
         recover(&t.0);
         assert_eq!(read_list(&t.0).len(), 1);
+        assert_eq!(read_list(&t.0).first().map(|e| e.strikes), Some(2));
         assert_eq!(markers(&t.0), 0);
     }
 
@@ -279,8 +409,8 @@ mod tests {
     fn several_crashes_accumulate() {
         let t = TempDir::new("several");
         for (i, n) in ["A.ofx", "B.ofx"].into_iter().enumerate() {
-            crash(check_and_mark(&t.0, &bin(n), n, i as u32).unwrap());
-            recover(&t.0);
+            crash_and_recover(&t.0, &bin(n), 2 * i as u32);
+            crash_and_recover(&t.0, &bin(n), 2 * i as u32 + 1);
         }
         assert_eq!(read_list(&t.0).len(), 2);
         assert!(is_blocked(&t.0, &bin("A.ofx").to_string_lossy()));
@@ -292,15 +422,15 @@ mod tests {
     fn clear_forgets_everything() {
         let t = TempDir::new("clear");
         let bad = bin("Bad.ofx");
-        crash(check_and_mark(&t.0, &bad, "Bad", 1).unwrap());
-        recover(&t.0);
-        assert!(check_and_mark(&t.0, &bad, "Bad", 2).is_err());
+        crash_and_recover(&t.0, &bad, 1);
+        crash_and_recover(&t.0, &bad, 2);
+        assert!(check_and_mark(&t.0, &bad, "Bad", 3).is_err());
         // A leftover marker of a dead process goes too.
-        let _ = std::fs::write(marker_path(&t.0, 3), b"C:\\x.ofx");
+        let _ = std::fs::write(marker_path(&t.0, 4), b"C:\\x.ofx");
         clear_in(&t.0);
         assert!(!t.0.join(LIST).exists());
         assert_eq!(markers(&t.0), 0);
-        assert!(check_and_mark(&t.0, &bad, "Bad", 2).is_ok());
+        assert!(check_and_mark(&t.0, &bad, "Bad", 3).is_ok());
     }
 
     #[test]
@@ -338,9 +468,9 @@ mod tests {
     #[test]
     fn windows_paths_compare_case_insensitively() {
         let t = TempDir::new("case");
-        crash(check_and_mark(&t.0, Path::new(r"C:\OFX\Plugins\Bad.ofx"), "Bad", 1).unwrap());
-        recover(&t.0);
-        assert!(check_and_mark(&t.0, Path::new(r"c:\ofx\plugins\BAD.OFX"), "Bad", 2).is_err());
+        crash_and_recover(&t.0, Path::new(r"C:\OFX\Plugins\Bad.ofx"), 1);
+        crash_and_recover(&t.0, Path::new(r"c:\ofx\plugins\bad.ofx"), 2);
+        assert!(check_and_mark(&t.0, Path::new(r"c:\ofx\plugins\BAD.OFX"), "Bad", 3).is_err());
     }
 
     #[test]
