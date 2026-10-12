@@ -41,6 +41,8 @@ SKIP_GROUPS = {
     "ADBE Source Options Group",  # Essential Graphics media replacement
 }
 WARN_GROUPS = {"ADBE Layer Styles": "layer styles"}
+# Layer transform properties written even when After Effects reports them unchanged.
+FORCED_TRANSFORM = {"ADBE Anchor Point", "ADBE Position", "ADBE Scale", "ADBE Rotate Z"}
 NO_VALUE_TYPES = {
     PropertyValueType.NO_VALUE,
     PropertyValueType.UNKNOWN,
@@ -477,7 +479,11 @@ class Converter:
             if mn == "ADBE Marker":
                 self.markers(child, "Q(%s, %s)" % (ref, js(mn)), ref, "markers of " + ctx)
                 continue
-            if ptype == PropertyType.PROPERTY:
+            if ptype == PropertyType.PROPERTY and group.match_name == "ADBE Text Animator Properties":
+                # A text animator's properties (Position, Fill Color, Tracking...) exist only once
+                # they're added, and an added property applies even at its default value.
+                self.leaf(child, "QA(%s, %s)" % (ref, js(mn)), ctx, depth, force=True)
+            elif ptype == PropertyType.PROPERTY:
                 self.leaf(child, "Q(%s, %s)" % (ref, js(mn)), ctx, depth)
             elif indexed:
                 gv = self.var("G")
@@ -521,7 +527,7 @@ class Converter:
             except Exception:
                 continue
 
-    def leaf(self, prop, ref, ctx, depth):
+    def leaf(self, prop, ref, ctx, depth, force=False):
         try:
             vt = prop.property_value_type
         except Exception:
@@ -535,8 +541,14 @@ class Converter:
         expr = getattr(prop, "expression", "") or ""
         # Defaults that differ between the two apps are written out even when unchanged: a null's
         # anchor point is its top-left corner in After Effects (it pivots its children), and its
-        # opacity.
-        forced = prop.match_name == "ADBE Anchor Point" or (self.null_layer and prop.match_name == "ADBE Opacity")
+        # opacity. The basic transform is always written too: whether After Effects counts a
+        # value as changed depends on its own defaults, and a child layer whose Position, Scale or
+        # Rotation kept EffectCraft's default sat in the wrong place relative to its parent.
+        forced = (
+            force
+            or prop.match_name in FORCED_TRANSFORM
+            or (self.null_layer and prop.match_name == "ADBE Opacity")
+        )
         if not keys and not expr and not forced and not getattr(prop, "is_modified", False):
             return
         label = "%s > %s" % (ctx, prop.name or prop.match_name)
@@ -643,6 +655,7 @@ class Converter:
         self.emit("var __warnings = [], __missing = {};")
         self.emit("function MISS(name) { __missing[name] = (__missing[name] || 0) + 1; }")
         self.emit("function Q(o, n) { return o ? o.property(n) : null; }")
+        self.emit("function QA(o, n) { if (!o) return null; var p = null; try { p = o.property(n); } catch (e) {} if (p) return p; try { return o.addProperty(n); } catch (e) { return null; } }")
         self.emit("function T(what, f) { try { return f(); } catch (e) { if (what) __warnings.push(what + \": \" + (e && e.message ? e.message : e)); return null; } }")
         self.emit("function SH(v, i, o, c) { var s = new Shape(); s.vertices = v; s.inTangents = i; s.outTangents = o; s.closed = c; return s; }")
         self.emit("function KE(a) { var r = []; for (var i = 0; i < a.length; i++) r.push(new KeyframeEase(a[i][0], Math.max(0.1, Math.min(100, a[i][1])))); return r; }")

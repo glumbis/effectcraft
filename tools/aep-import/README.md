@@ -42,7 +42,7 @@ timing, parenting, transform values over time, effects, masks) and prints every 
 
 Carries over: comps and their settings, folders, footage (found at its saved path or relative to the
 project; missing files become placeholders you can relink), solids, nulls, precomps, text with its
-styling, shape layers, cameras, lights, layer timing / stretch / switches / blend modes / quality,
+styling and its animators (selectors and animated properties), shape layers, cameras, lights, layer timing / stretch / switches / blend modes / quality,
 parenting, track mattes, keyframes (values, interpolation, temporal eases, spatial tangents),
 expressions, masks, built-in effects and their settings, comp and layer markers.
 
