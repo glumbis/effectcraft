@@ -343,9 +343,11 @@ mod tests {
         s.poll_render();
         let mut got = got.lock().unwrap().clone();
         got.sort_by(|a, b| a.0.cmp(&b.0));
-        let names: Vec<std::path::PathBuf> = got.iter().map(|(p, _)| std::path::PathBuf::from(p)).collect();
-        let expected = [format!("{dir}/a.gif"), format!("{dir}/seq_00.png"), format!("{dir}/seq_01.png"), format!("{dir}/seq_02.png")]
-            .map(|p| std::path::absolute(p).unwrap());
+        // Absolute outputs; compared without the drive, which on Windows can differ from the
+        // working directory's (CI checks out on D:, a rooted path may resolve to C:).
+        assert!(got.iter().all(|(p, _)| std::path::Path::new(p).is_absolute()), "{got:?}");
+        let names: Vec<String> = got.iter().map(|(p, _)| p.replace('\\', "/").split_once(dir).map(|(_, rest)| format!("{dir}{rest}")).unwrap_or_default()).collect();
+        let expected = [format!("{dir}/a.gif"), format!("{dir}/seq_00.png"), format!("{dir}/seq_01.png"), format!("{dir}/seq_02.png")];
         assert_eq!(names, expected);
         assert!(got[0].1.starts_with(b"GIF89a"));
         assert!(got[1].1.starts_with(b"\x89PNG"));
