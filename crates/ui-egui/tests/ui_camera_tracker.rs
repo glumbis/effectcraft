@@ -145,6 +145,60 @@ fn viewer_points_selection_and_effect_controls() {
     assert!(h.state().session.is_enabled("track.camera"));
 }
 
+/// Drag with `button` from `from` to `to` in steps, then release.
+fn drag_with(h: &mut Harness<'_, EffectcraftApp>, button: egui::PointerButton, from: egui::Pos2, to: egui::Pos2) {
+    h.input_mut().events.push(egui::Event::PointerMoved(from));
+    h.input_mut().events.push(egui::Event::PointerButton { pos: from, button, pressed: true, modifiers: Default::default() });
+    h.step();
+    for i in 1..=8 {
+        h.input_mut().events.push(egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
+        h.step();
+    }
+    h.input_mut().events.push(egui::Event::PointerButton { pos: to, button, pressed: false, modifiers: Default::default() });
+    h.run_steps(3);
+}
+
+/// #505: with the track points shown, the wheel still zooms the viewer, and a middle-button drag
+/// and a Spacebar (Hand tool) drag over the points still pan it.
+#[test]
+fn viewer_zooms_and_pans_over_the_track_points() {
+    let (a, ..) = app();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| a);
+    h.state_mut().show_panel(PanelKind::Composition);
+    h.run_steps(4);
+    // Wheel over a point: zooms.
+    let at = rect(&h, "viewer.cameraTracker.point.7").center();
+    let zoom = h.state().ui.viewer.zoom;
+    h.input_mut().events.push(egui::Event::PointerMoved(at));
+    h.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 120.0),
+        modifiers: Default::default(),
+        phase: egui::TouchPhase::Move,
+    });
+    h.run_steps(20);
+    assert_ne!(h.state().ui.viewer.zoom, zoom, "the wheel zooms over the track points");
+    // Middle-button drag from a point: pans, and selects nothing.
+    let at = rect(&h, "viewer.cameraTracker.point.7").center();
+    let before = h.state().ui.viewer.pan;
+    drag_with(&mut h, egui::PointerButton::Middle, at, at + egui::vec2(120.0, 60.0));
+    let after = h.state().ui.viewer.pan;
+    assert!((after[0] - before[0] - 120.0).abs() < 1.0 && (after[1] - before[1] - 60.0).abs() < 1.0, "{before:?} → {after:?}");
+    assert!(h.state().session.state.camera_points.is_empty(), "a pan selects no points");
+    // Spacebar held: a primary drag from a point pans instead of drawing a marquee.
+    let at = rect(&h, "viewer.cameraTracker.point.7").center();
+    let space = |h: &mut Harness<'_, EffectcraftApp>, pressed: bool| {
+        h.input_mut().events.push(egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed, repeat: false, modifiers: Default::default() });
+        h.step();
+    };
+    space(&mut h, true);
+    drag_with(&mut h, egui::PointerButton::Primary, at, at + egui::vec2(80.0, 40.0));
+    space(&mut h, false);
+    let end = h.state().ui.viewer.pan;
+    assert!((end[0] - after[0] - 80.0).abs() < 1.0 && (end[1] - after[1] - 40.0).abs() < 1.0, "{after:?} → {end:?}");
+    assert!(h.state().session.state.camera_points.is_empty(), "a Spacebar pan selects no points");
+}
+
 /// Step the UI until background frame renders have landed.
 fn settle(h: &mut Harness<'_, EffectcraftApp>) {
     for _ in 0..600 {

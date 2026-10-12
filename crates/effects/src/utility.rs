@@ -385,8 +385,9 @@ pub fn specs() -> Vec<EffectSpec> {
             ],
             cineon,
         ),
-        // `lut`: a path to a `.cube` file, or the `.cube` text itself (set via commands/automation).
-        spec("ec.utility.applylut", "Apply Color LUT", vec![p("lut", "LUT", Value::Str(String::new()), ParamUi::Hidden)], apply_lut),
+        // `lut`: a path to a `.cube` file (Effect Controls' Choose…, asked for when the effect is
+        // applied, as in After Effects), or the `.cube` text itself (commands/automation).
+        spec("ec.utility.applylut", "Apply Color LUT", vec![p("lut", "LUT", Value::Str(String::new()), crate::file_ui(&["cube"]))], apply_lut),
     ]
 }
 

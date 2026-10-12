@@ -29,7 +29,7 @@ Commands (CLI, MCP, control channel):
 
 ### Settings that change behaviour
 
-- `general.language`: interface language (`system` / `en` / `ja` / `zh-hans` / `zh-hant` / `uk`), Settings ▸ General ▸ Language; menu labels change immediately. `system` (Match System, the default) follows the operating system's interface language where EffectCraft has a translation and is English otherwise: a Simplified Chinese locale (`zh`, `zh-CN`, `zh_CN.UTF-8`, `zh-Hans-CN`, `zh-SG`) selects `zh-hans`, a Traditional one (`zh-TW`, `zh-HK`, `zh-Hant`, `zh_MO`) selects `zh-hant`, a Ukrainian one (`uk`, `uk-UA`, `uk_UA.UTF-8`) selects `uk`; the browser build stays in English with it. Choose **Українська** for Ukrainian menus; Ukrainian dialog and panel contents stay in English for now, and Ukrainian uses the bundled UI fonts. Native Japanese, Simplified and Traditional Chinese UI uses installed system fonts; the web host must supply a Japanese font. The same setting picks the CJK fallback for the interface *and* the Han preference of the text engine, so the composition's own text is drawn with the same language's glyph forms (the text engine's preference is process-global); swapping the language reinstalls the fonts, so it applies without a restart. Two catalogs back the text: the menus are keyed by `(command, English label)` (`crates/ui-egui/src/i18n.rs`), and the rest of the interface - panels, dialogs, buttons, tooltips - is keyed by its English source string (`crates/ui-egui/src/i18n/ui.rs`), where a panel writes `tr("Rename")`, or `tr_args("Proxy Use: {}", &[&quality])` when the row carries a value. A row that is missing falls back to English, so a new string shows up untranslated rather than empty; the tests in that module fail on an unused row and on a hard-coded string in a converted panel.
+- `general.language`: interface language (`system` / `en` / `ja` / `zh-hans` / `zh-hant` / `uk` / `es` / `pt-br`), Settings ▸ General ▸ Language; menu labels change immediately. `system` (Match System, the default) follows the operating system's interface language where EffectCraft has a translation and is English otherwise: a Simplified Chinese locale (`zh`, `zh-CN`, `zh_CN.UTF-8`, `zh-Hans-CN`, `zh-SG`) selects `zh-hans`, a Traditional one (`zh-TW`, `zh-HK`, `zh-Hant`, `zh_MO`) selects `zh-hant`, a Ukrainian one (`uk`, `uk-UA`, `uk_UA.UTF-8`) selects `uk`, a Spanish one (`es`, `es-ES`, `es_MX.UTF-8`) selects `es`, a Portuguese one (`pt`, `pt-BR`, `pt_PT.UTF-8`) selects `pt-br`; the browser build stays in English with it. Choose **Español** or **Português (Brasil)** for Spanish or Brazilian Portuguese menus (panels stay in English for now); choose **Українська** for Ukrainian menus and cataloged panel, dialog, button and tooltip text; Ukrainian uses the bundled UI fonts. Native Japanese, Simplified and Traditional Chinese UI uses installed system fonts; the web host must supply a Japanese font. The same setting picks the CJK fallback for the interface *and* the Han preference of the text engine, so the composition's own text is drawn with the same language's glyph forms (the text engine's preference is process-global); swapping the language reinstalls the fonts, so it applies without a restart. Two catalogs back the text: the menus are keyed by `(command, English label)` (`crates/ui-egui/src/i18n.rs`), and the rest of the interface - panels, dialogs, buttons, tooltips - is keyed by its English source string (`crates/ui-egui/src/i18n/ui.rs`, with rows for Japanese, Simplified and Traditional Chinese and Ukrainian), where a panel writes `tr("Rename")`, or `tr_args("Proxy Use: {}", &[&quality])` when the row carries a value. A row that is missing falls back to English, so a new string shows up untranslated rather than empty; the tests in that module fail on an unused row and on a hard-coded string in a converted panel.
 - `general.undoLevels`: Levels of Undo
 - `general.pathPointSize`: Path Point and Handle Size
 - `general.recentItems`: Recent Projects Shown
@@ -38,7 +38,7 @@ Commands (CLI, MCP, control channel):
 - `general.defaultSpatialLinear`: Default Spatial Interpolation to Linear
 - `startup.showHomeOnLaunch`: Show Home Screen When Launching
 - `startup.offerCrashRecovery`: Offer to Open the Latest Auto-Save After a Crash
-- `startup.windowGraphics`: Window Graphics (`auto` / `gl`), what the desktop window draws with from the next launch. `auto` lets the platform pick (DirectX 12, Vulkan or Metal); `gl` uses OpenGL, with CPU compositing, for graphics drivers that crash with the others. A launch whose window never drew leaves a `launch-pending` marker in the settings folder, and the next launch switches to `gl` and says so (not on macOS, which has no OpenGL backend). `WGPU_BACKEND` overrides both.
+- `startup.windowGraphics`: Window Graphics (`auto` / `gl`), what the desktop window draws with from the next launch. `auto` lets the platform pick (DirectX 12, Vulkan or Metal); `gl` uses OpenGL, with CPU compositing, for graphics drivers that crash with the others. A launch leaves a `launch-pending` marker in the settings folder until its window has been drawing for a few seconds (or the app quits normally before that); a launch that stops earlier (a graphics driver crashing as the window opens or as its surface is re-created) leaves the marker behind, and the next launch switches to `gl` and says so (not on macOS, which has no OpenGL backend). `WGPU_BACKEND` overrides both.
 - `project.useTemplate`: New Project Loads Template
 - `project.templatePath`: Template Project
 - `autoSave.enabled`: Automatically Save Projects
@@ -54,10 +54,15 @@ Commands (CLI, MCP, control channel):
   without input or edits, the viewer renders the work area into the RAM preview in the
   background, from the current time on, until it is cached or the budget is full
 - `previews.fastPreviews`: Fast Previews (Draft 3D, Faster Effects)
-- `appearance.theme`: Theme
+- `appearance.appearanceMode`: Appearance Mode (`auto` / `dark` / `light`). `auto` (Sync with System) follows the operating system's light or dark appearance while the app runs: on Linux the desktop app reads the XDG desktop portal (`org.freedesktop.appearance` `color-scheme`) once and then listens for its `SettingChanged` signal on a worker thread, repainting only when the value changes (nothing polls); `gsettings` runs at most once at start-up, by absolute path, when the portal gives no answer. Elsewhere it uses what the window system reports. With no answer it shows the dark theme. New installs stay `dark`; Sync with System is opt-in. The Tools bar's appearance button (a monitor, sun or moon) cycles Sync with System, Light and Dark (`view.theme.toggle`, Next Appearance Mode).
+- `appearance.darkTheme`: Dark Theme (`dark` / `darker`), shown in dark appearance
+- `appearance.lightTheme`: Light Theme (`light`), shown in light appearance. Settings ▸ Appearance shows the mode above a light and a dark theme card, each with a preview of the EffectCraft window in that theme.
+- `appearance.favoriteThemes`: a list of unique theme ids (`dark`, `darker`, `light`), empty by default. Hover a theme row to star it; saved favorites keep an accent-colored star. Right-click the appearance button for Appearance Settings and favorites grouped light first, then dark. Selecting a favorite fixes its appearance family and preserves the opposite family choice; left-click still cycles modes. Settings OK saves favorites and Cancel restores them. Unknown or duplicate ids are rejected by `prefs.set` and removed when loading old settings.
+- `appearance.theme`: the single theme from before appearance modes, kept for older settings files and automation. A saved file with only `theme` loads as a fixed Dark or Light mode showing it; setting it (`prefs.set`, `ui.set {"theme": …}`, `view.theme.dark|darker|light`) selects that theme and fixes the mode to its family. While the mode is Dark or Light it mirrors the theme in use.
 - `appearance.brightness`: Brightness
-- `appearance.uiScale`: UI Scale, the size of the whole interface (75–200 %, on top of the
-  display's own scaling), applied as soon as it is chosen
+- `appearance.uiScale`: UI Scale, the size of the whole interface (any whole percentage from
+  75 to 200, on top of the display's own scaling), dragged or typed; it applies as soon as it is
+  dragged or entered
 - `appearance.useLabelColorForHandles`: Use Label Color for Layer Handles and Paths
 - `grids.gridColor`: Color
 - `grids.gridSpacing`: Gridline Every
@@ -71,8 +76,8 @@ Commands (CLI, MCP, control channel):
 - `audio.outputDevice`: Default Output (device list from the desktop host)
 - `audio.outputLeft`: Left (Audio Output Mapping)
 - `audio.outputRight`: Right (Audio Output Mapping)
-- `memory.layerCacheMb`: Layer Cache
-- `memory.mediaCacheMb`: Footage Frame Cache
+- `memory.layerCacheMb`: Layer Cache (in the browser at most 512 MB, see [web.md](web.md))
+- `memory.mediaCacheMb`: Footage Frame Cache (in the browser at most 256 MB)
 - `memory.previewCacheMb`: Preview (RAM) Cache
 - `threeD.defaultRenderer`: Default 3D Renderer
 - `labels.N.name` / `labels.N.color`: the 16 label names and colours, used by the Label menu,
@@ -109,6 +114,14 @@ Commands (CLI, MCP, control channel):
 - `type.fontNamesInEnglish`: off, fonts with a native-language family name show it
 - `import.reportMissingFrames`: gaps in an image sequence's numbering are reported on import
   (they show as colour-bar placeholders, as in After Effects; see [footage.md](footage.md))
+- `import.autoReloadFootage`: Automatically Reload Footage, `off`, `nonSequence` (the default, as
+  in After Effects) or `all` (image sequences too). Every two seconds,
+  and as soon as the window comes back to the front, the desktop app compares each footage file's
+  size and modification time with what they were, and reloads what another app saved: a
+  Photoshop file edited in PhotoCraft or Photoshop shows its new pixels without File ▸ Reload
+  Footage. It is not an undo step and doesn't modify the project; a layer item stays on its layer
+  (found again by name), and a file that can't be read yet (still being written) is tried again once it changes again.
+  `footage.reloadChanged` runs the same check once (CLI, agents)
 - `import.unlabeledAlpha`: alpha of TGA / TIFF / movie footage (Ask opens Interpret Footage;
   Guess takes premultiplied for movies, straight for stills)
 - `import.dragImportAs`: layered files dropped on the window import as footage or a comp

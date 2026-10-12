@@ -21,6 +21,10 @@ use serde_json::{Value, json};
 use super::{CommandSpec, bad, f_p, has_comp, layer_mut, layer_p, merge_p, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
+fn dist2(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
+}
+
 fn pt(v: Option<&Value>) -> Option<[f64; 2]> {
     let a = v?.as_array()?;
     Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?])
@@ -77,7 +81,8 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
     let fx_uid = find_puppet(s, cid, lid);
     let want_mesh = p.get("mesh").and_then(Value::as_u64);
     let new_mesh = p.get("newMesh").and_then(Value::as_bool).unwrap_or(false);
-    let mut target: Option<(Uid, [f64; 2])> = None;
+    // (mesh, the pin's rest point, where it is now)
+    let mut target: Option<(Uid, [f64; 2], [f64; 2])> = None;
     if let Some(fu) = fx_uid
         && !new_mesh
         && let Some((buf, params)) = puppet_eval(s, cid, lid, fu, t)
@@ -90,7 +95,22 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
             let inside = puppet::contains(mesh, def, at);
             let near = def.iter().map(|v| (v[0] - at[0]).hypot(v[1] - at[1])).fold(f64::MAX, f64::min) < 12.0;
             if inside || near || want_mesh.is_some() {
-                target = Some((*uid, puppet::unmap(mesh, def, at)));
+                let rest = puppet::unmap(mesh, def, at);
+                // A moving pin holds its nearest mesh vertex at `position + (vertex - rest)`
+                // (puppet::solve). Choose the position that keeps that vertex where it is now, so
+                // adding a pin to a bent mesh moves nothing (After Effects, #318); on an unbent
+                // mesh that is the click itself.
+                let now = (0..mesh.verts.len().min(def.len()))
+                    .filter(|_| kind.moves())
+                    .min_by(|a, b| dist2(mesh.verts[*a], rest).total_cmp(&dist2(mesh.verts[*b], rest)))
+                    .and_then(|v| {
+                        let (r, d) = (mesh.verts.get(v)?, def.get(v)?);
+                        Some([d[0] - (r[0] - rest[0]), d[1] - (r[1] - rest[1])])
+                    })
+                    // Round-off only (an unbent mesh): exactly the click.
+                    .filter(|n| dist2(*n, at) > 1e-12)
+                    .unwrap_or(at);
+                target = Some((*uid, rest, now));
                 break;
             }
         }
@@ -131,14 +151,14 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
             }
         };
         let pg = fxg.find_group_mut(fx_uid).ok_or_else(|| bad(cmd, "Puppet effect gone"))?;
-        let (mesh_uid, rest) = match target {
-            Some((m, r)) => (m, r),
+        let (mesh_uid, rest, now) = match target {
+            Some(t) => t,
             None => {
                 let n = puppet::meshes(pg).count();
                 let g = puppet::mesh_group(&mut ids, &format!("Mesh {}", n + 1), at, &opts);
                 let u = g.uid;
                 pg.children.push(g.into());
-                (u, at)
+                (u, at, at)
             }
         };
         let name = puppet::next_pin_name(pg, kind);
@@ -146,7 +166,7 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
         let mut pin = puppet::pin_group(&mut ids, &name, kind, rest);
         if let Some(pos) = pin.get_mut("position") {
             if kind.moves() {
-                pos.value = KV::Vec2(at);
+                pos.value = KV::Vec2(now);
                 pos.set_animated(true, lt);
             } else {
                 pos.value = KV::Vec2(rest);

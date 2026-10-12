@@ -86,6 +86,7 @@ const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
     ("ec.blur.cameralens", &["irisProperties/diffractionFringe", "blurMap/blurMapLayer"]),
     ("ec.noise.removegrain", &["temporalFiltering/enabled"]),
     ("ec.distort.liquify", &["viewFreezeAreaMask", "viewMesh"]),
+    ("ec.distort.ccpowerpin", &["unstretch"]),
     ("ec.matte.refinesoft", &["reduceChatter", "useMotionBlur", "invert"]),
     ("ec.matte.refinehard", &["reduceChatter", "useMotionBlur", "invert"]),
 ];
@@ -201,6 +202,8 @@ mod tests {
         assert!(ok("ec.generate.cellpattern", &[("cellPattern", Value::Enum(3))]));
         assert!(!ok("ec.generate.cellpattern", &[("cellPattern", Value::Enum(9))]));
         assert!(!ok("ec.distort.turbulentdisplace", &[("pinning", Value::Enum(9))]));
+        assert!(ok("ec.distort.ccpowerpin", &[]));
+        assert!(!ok("ec.distort.ccpowerpin", &[("unstretch", Value::Bool(true))]));
         assert!(ok("ec.blur.gaussian", &[]));
     }
 

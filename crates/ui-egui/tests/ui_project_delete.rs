@@ -1,4 +1,5 @@
 //! Project-panel deletion uses its selection, even when a Timeline layer is still selected.
+//! Shift+Delete deletes it without asking (Delete Project Items Without Confirmation).
 
 use effectcraft_engine::Session;
 use effectcraft_engine::project::{Footage, FootageKind, ItemId, ItemKind, LayerId};
@@ -50,6 +51,31 @@ fn key(h: &mut Harness<'_, EffectcraftApp>, key: Key, modifiers: Modifiers) {
     h.input_mut().events.push(Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers });
     h.run_steps(2);
 }
+
+/// Shift+Delete as each platform delivers it: a key press (macOS, Linux), or on Windows a Cut
+/// event with Shift held (the windowing layer turns Shift+Delete into Cut).
+#[derive(Clone, Copy, Debug)]
+enum ShiftDelete {
+    Key,
+    WindowsCut,
+}
+
+fn shift_delete(h: &mut Harness<'_, EffectcraftApp>, how: ShiftDelete) {
+    match how {
+        ShiftDelete::Key => key(h, Key::Delete, Modifiers::SHIFT),
+        // Shift down, Cut and Shift up all in one frame.
+        ShiftDelete::WindowsCut => frame(h, &[Event::ModifiersChanged(Modifiers::SHIFT), Event::Cut, Event::ModifiersChanged(Modifiers::NONE)]),
+    }
+}
+
+/// Queue `events` together and run them as one frame.
+fn frame(h: &mut Harness<'_, EffectcraftApp>, events: &[Event]) {
+    h.input_mut().events.extend(events.iter().cloned());
+    h.step();
+    h.run_steps(2);
+}
+
+const SHIFT_DELETE: [ShiftDelete; 2] = [ShiftDelete::Key, ShiftDelete::WindowsCut];
 
 /// Items that compositions use ask first, as in After Effects: answer Delete when asked.
 /// Returns whether it asked.
@@ -138,12 +164,22 @@ fn typing_dialogs_and_modified_keys_do_not_delete_project_items() {
     let item = items[0];
     click(&mut h, &format!("project.item.{}.name", item.0), Modifiers::NONE);
     let project = h.state().session.project.clone();
-    for delete_key in [Key::Delete, Key::Backspace] {
-        key(&mut h, delete_key, Modifiers::SHIFT);
-        assert_eq!(h.state().session.project, project);
+    // Only plain Delete/Backspace and Shift+Delete delete Project items.
+    for (k, m) in [
+        (Key::Backspace, Modifiers::SHIFT),
+        (Key::Delete, Modifiers::ALT),
+        (Key::Delete, Modifiers::COMMAND),
+        (Key::Delete, Modifiers::SHIFT | Modifiers::COMMAND),
+        (Key::Delete, Modifiers::SHIFT | Modifiers::ALT),
+    ] {
+        key(&mut h, k, m);
+        assert_eq!(h.state().session.project, project, "{m:?}+{k:?}");
     }
     h.state_mut().dialog = Some(effectcraft_ui_egui::Dialog::About);
     key(&mut h, Key::Delete, Modifiers::NONE);
+    for how in SHIFT_DELETE {
+        shift_delete(&mut h, how);
+    }
     assert_eq!(h.state().session.project, project);
     h.state_mut().dialog = None;
     h.run_steps(2);
@@ -153,6 +189,10 @@ fn typing_dialogs_and_modified_keys_do_not_delete_project_items() {
     for delete_key in [Key::Backspace, Key::Delete] {
         key(&mut h, delete_key, Modifiers::NONE);
         assert_eq!(h.state().session.project, project, "typing must not delete the item");
+    }
+    for how in SHIFT_DELETE {
+        shift_delete(&mut h, how);
+        assert_eq!(h.state().session.project, project, "typing must not delete the item ({how:?})");
     }
 }
 
@@ -189,4 +229,138 @@ fn deleting_items_in_use_asks_first() {
     h.state_mut().session.execute("edit.undo", json!({})).unwrap();
     h.state_mut().session.execute("project.delete", json!({"items": [solid.0]})).unwrap();
     assert!(h.state().session.project.item(solid).is_none());
+}
+
+/// Shift+Delete deletes the selected item without asking, even one a composition uses, with the
+/// layers that use it, in one undo step (Delete Project Items Without Confirmation).
+#[test]
+fn shift_delete_deletes_without_asking_and_undoes_once() {
+    for how in SHIFT_DELETE {
+        for target in 0..4 {
+            let (mut h, items, keep) = harness();
+            let item = items[target];
+            click(&mut h, &format!("project.item.{}.name", item.0), Modifiers::NONE);
+            let project = h.state().session.project.clone();
+            let undo = h.state().session.history.undo.len();
+            shift_delete(&mut h, how);
+            assert_eq!(h.state().dialog, None, "{how:?} item {target}: no prompt");
+            assert!(h.state().session.project.item(item).is_none(), "{how:?} should delete project item {target}");
+            assert!(h.state().session.active_comp().unwrap().layer(keep).is_some(), "the unrelated Timeline layer stays");
+            assert!(h.state().session.state.project_selection.is_empty());
+            assert_eq!(h.state().session.history.undo.len(), undo + 1);
+            h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(h.state().session.project, project, "one undo restores the item and its references");
+        }
+    }
+}
+
+#[test]
+fn shift_delete_deletes_a_multi_selection_and_folder_contents_together() {
+    for how in SHIFT_DELETE {
+        let (mut h, items, keep) = harness();
+        let (solid, folder) = (items[1], items[3]);
+        // The solid (used by a layer) inside the folder: deleting the folder takes both.
+        h.state_mut().session.execute("project.move", json!({"items": [solid.0], "folder": folder.0})).unwrap();
+        h.run_steps(2);
+        click(&mut h, &format!("project.item.{}.name", items[0].0), Modifiers::NONE);
+        click(&mut h, &format!("project.item.{}.name", folder.0), Modifiers::COMMAND);
+        assert_eq!(h.state().session.state.project_selection, vec![items[0], folder]);
+        let project = h.state().session.project.clone();
+        let undo = h.state().session.history.undo.len();
+        shift_delete(&mut h, how);
+        assert_eq!(h.state().dialog, None, "{how:?}: no prompt");
+        for gone in [items[0], solid, folder] {
+            assert!(h.state().session.project.item(gone).is_none(), "{how:?}: {gone:?} goes");
+        }
+        assert!(h.state().session.project.item(items[2]).is_some(), "the unselected item stays");
+        let uses = h.state().session.project.comps().flat_map(|(_, c)| c.layers.iter()).filter(|l| l.source.item() == Some(solid)).count();
+        assert_eq!(uses, 0, "the layer using the solid goes with it");
+        assert!(h.state().session.active_comp().unwrap().layer(keep).is_some());
+        assert_eq!(h.state().session.history.undo.len(), undo + 1);
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(h.state().session.project, project);
+    }
+}
+
+/// Shift+Delete with nothing selected deletes nothing, and skipping the prompt once (Shift+Delete,
+/// or answering Delete) doesn't skip it for the next Delete.
+#[test]
+fn shift_delete_and_answered_prompts_dont_skip_the_next_prompt() {
+    for how in SHIFT_DELETE {
+        let (mut h, items, keep) = harness();
+        let solid = items[1];
+        click(&mut h, &format!("project.item.{}.name", items[0].0), Modifiers::NONE);
+        h.state_mut().session.execute("project.select", json!({"items": []})).unwrap();
+        let project = h.state().session.project.clone();
+        shift_delete(&mut h, how);
+        assert_eq!(h.state().dialog, None);
+        assert_eq!(h.state().session.project, project, "{how:?} with nothing selected deletes nothing");
+        assert!(h.state().session.active_comp().unwrap().layer(keep).is_some());
+
+        // Without asking once, then Delete on an item in use still asks.
+        click(&mut h, &format!("project.item.{}.name", items[2].0), Modifiers::NONE);
+        shift_delete(&mut h, how);
+        assert!(h.state().session.project.item(items[2]).is_none());
+        click(&mut h, &format!("project.item.{}.name", solid.0), Modifiers::NONE);
+        key(&mut h, Key::Delete, Modifiers::NONE);
+        assert_eq!(h.state().dialog, Some(Dialog::DeleteItems), "{how:?}: Delete still asks after Shift+Delete");
+        click(&mut h, "dialog.deleteItems.cancel", Modifiers::NONE);
+        assert!(h.state().session.project.item(solid).is_some());
+    }
+
+    // Answering Delete runs that deletion only: the next Delete asks again.
+    let (mut h, items, _) = harness();
+    let solid = items[1];
+    h.state_mut().session.execute("layer.newSolid", json!({"name": "Second solid", "color": "#806040"})).unwrap();
+    let second = h.state().session.project.items.values().find(|i| i.name == "Second solid").unwrap().id;
+    h.run_steps(2);
+    click(&mut h, &format!("project.item.{}.name", solid.0), Modifiers::NONE);
+    key(&mut h, Key::Delete, Modifiers::NONE);
+    assert!(confirm_if_asked(&mut h));
+    assert!(h.state().session.project.item(solid).is_none());
+    click(&mut h, &format!("project.item.{}.name", second.0), Modifiers::NONE);
+    key(&mut h, Key::Delete, Modifiers::NONE);
+    assert_eq!(h.state().dialog, Some(Dialog::DeleteItems), "the answer was for the first deletion only");
+}
+
+/// Shift+Delete only deletes Project items with the Project panel focused.
+#[test]
+fn shift_delete_in_other_panels_keeps_project_items() {
+    for how in SHIFT_DELETE {
+        let (mut h, items, _) = harness();
+        click(&mut h, &format!("project.item.{}.name", items[0].0), Modifiers::NONE);
+        click(&mut h, "viewer.comp", Modifiers::NONE);
+        assert_eq!(h.state().ui.focused, PanelKind::Composition);
+        assert_eq!(h.state().session.state.project_selection, vec![items[0]]);
+        shift_delete(&mut h, how);
+        assert_eq!(h.state().dialog, None);
+        assert!(items.iter().all(|i| h.state().session.project.item(*i).is_some()), "{how:?} in the Composition panel");
+    }
+}
+
+/// A Cut is read with the modifiers held where it is among the frame's events, not those held
+/// after the frame: Shift released in the same frame is still Shift+Delete, and a Ctrl+X followed
+/// in the same frame by Ctrl up and Shift down is not.
+#[test]
+fn a_cut_is_read_with_the_modifiers_where_it_is_in_the_frame() {
+    use Event::{Cut, ModifiersChanged as M};
+    let (shift, ctrl, none) = (Modifiers::SHIFT, Modifiers::COMMAND, Modifiers::NONE);
+    // (held from the frame before, this frame's events, whether the solid in use goes)
+    let cases: [(Modifiers, Vec<Event>, bool); 5] = [
+        (shift, vec![Cut, M(none)], true),
+        (ctrl, vec![Cut, M(none), M(shift)], false),
+        (none, vec![M(shift), Cut, M(none)], true),
+        (none, vec![M(ctrl), Cut, M(none), M(shift)], false),
+        (shift, vec![M(none), Cut, M(shift)], false),
+    ];
+    for (n, (before, events, deletes)) in cases.into_iter().enumerate() {
+        let (mut h, items, _) = harness();
+        let solid = items[1];
+        click(&mut h, &format!("project.item.{}.name", solid.0), Modifiers::NONE);
+        frame(&mut h, &[M(before)]);
+        frame(&mut h, &events);
+        frame(&mut h, &[M(none)]);
+        assert_eq!(h.state().dialog, None, "case {n}: no prompt");
+        assert_eq!(h.state().session.project.item(solid).is_none(), deletes, "case {n}: {events:?} after {before:?}");
+    }
 }

@@ -340,6 +340,24 @@ fn wire_removal(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let (nx, ny) = (-ty, tx);
     let src = b.img.clone();
     let soft_w = half * slope as f64;
+    // Frame Offset: the same pixels from the previous or next frame, resampled into this grid.
+    let offset = ctx.params.f("frameOffset").round();
+    let neighbour = if style == 1 && offset != 0.0 {
+        ctx.env.host.and_then(|h| h.self_at(ctx.time + offset / ctx.fps(), ctx.env.effect_index)).map(|nb| {
+            if nb.img.width == b.img.width && nb.img.height == b.img.height && nb.offset == b.offset && nb.scale == b.scale {
+                nb.img
+            } else {
+                let k = nb.scale / b.scale.max(1e-9);
+                crate::util::gen_image(b.img.width, b.img.height, |x, y| {
+                    let lx = (x as f64 + 0.5 - b.offset[0]) * k + nb.offset[0];
+                    let ly = (y as f64 + 0.5 - b.offset[1]) * k + nb.offset[1];
+                    nb.img.sample_bilinear(lx, ly)
+                })
+            }
+        })
+    } else {
+        None
+    };
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             let (qx, qy) = (x as f64 + 0.5 - ax, y as f64 + 0.5 - ay);
@@ -357,7 +375,9 @@ fn wire_removal(ctx: &EffectCtx, mut b: Buf) -> Buf {
                     let t = ((d + edge) / (2.0 * edge)) as f32;
                     lerp4(pos(-edge), pos(edge), t.clamp(0.0, 1.0))
                 }
-                // Displace: shift the image across the wire from the nearer side.
+                1 if neighbour.is_some() => neighbour.as_ref().map_or(*px, |n| n.get(x as i64, y as i64)),
+                // Displace: shift the image across the wire from the nearer side (also Frame Offset
+                // when no other frame is available).
                 2 | 1 => {
                     let s = if d >= 0.0 { d + 2.0 * (half - ad) + 1.0 } else { d - 2.0 * (half - ad) - 1.0 };
                     let sh = pos(s);
@@ -558,6 +578,49 @@ mod tests {
             assert!((out.img.get(10, 10)[0] - 0.5).abs() < 0.05, "style {style}: {:?}", out.img.get(10, 10));
             assert_eq!(out.img.get(2, 10), img.get(2, 10));
         }
+    }
+
+    #[test]
+    fn wire_removal_frame_offset_uses_neighbour_frame() {
+        use crate::{EffectHost, LayerPixels};
+        struct Frames;
+        impl EffectHost for Frames {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn self_at(&self, t: f64, _: usize) -> Option<Buf> {
+                // Frame n (at 10 fps) is a flat grey of n / 10.
+                let v = (t * 10.0).round() as f32 / 10.0;
+                Some(Buf { img: Image::filled(20, 20, [v, v, v, 1.0]), offset: [0.0; 2], scale: 1.0 })
+            }
+        }
+        let mut img = Image::filled(20, 20, [0.5, 0.5, 0.5, 1.0]);
+        for y in 0..20 {
+            img.set(10, y, [0.0, 0.0, 0.0, 1.0]);
+        }
+        let host = Frames;
+        let run = |style: u32, off: f64| {
+            let env = EffectEnv { host: Some(&host), frame_rate: 10.0, ..Default::default() };
+            let vals = [
+                ("pointA", Value::Vec2([10.5, 0.0])),
+                ("pointB", Value::Vec2([10.5, 20.0])),
+                ("removalStyle", Value::Enum(style)),
+                ("thickness", num(3.0)),
+                ("frameOffset", num(off)),
+            ];
+            run_fx("ec.key.ccsimplewireremoval", &vals, img.clone(), 0.5, env).img
+        };
+        // At 0.5 s (frame 5) offset -1 shows frame 4 and +1 shows frame 6 inside the strip.
+        let (prev, next) = (run(1, -1.0), run(1, 1.0));
+        assert!((prev.get(10, 10)[0] - 0.4).abs() < 1e-4, "{:?}", prev.get(10, 10));
+        assert!((next.get(10, 10)[0] - 0.6).abs() < 1e-4, "{:?}", next.get(10, 10));
+        // Outside the strip the current frame stays.
+        assert_eq!(prev.get(2, 10), img.get(2, 10));
+        // Displace ignores Frame Offset.
+        assert_eq!(run(2, -1.0).data, run(2, 1.0).data);
     }
 
     #[test]

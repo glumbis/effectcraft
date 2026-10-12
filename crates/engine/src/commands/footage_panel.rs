@@ -179,7 +179,8 @@ fn edit_into_comp(s: &mut Session, p: &Value, ripple: bool) -> Result<Value> {
         let mut l = build::layer(proj, &comp, &it.name, src, size, Some(len));
         l.start_time = at - src_in;
         l.in_point = at;
-        l.out_point = (at + len).min(comp.duration);
+        // Keep the full marked length past the comp's end (After Effects); the comp just doesn't show it.
+        l.out_point = at + len;
         let lid = l.id;
         let cm = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         cm.layers.insert(0, l);

@@ -265,6 +265,27 @@ mod tests {
         assert!(s.execute("layer.align", json!({"edge": "diagonal", "layers": [a]})).is_err());
     }
 
+    /// #352: shape layers align and snap by their visual edges (half the stroke, no
+    /// anti-aliasing padding), so two rectangles lined up edge to edge touch with no gap.
+    #[test]
+    fn shape_layers_align_by_their_visual_edges() {
+        let mut s = session();
+        let shape = |s: &mut Session, extra: Value| {
+            let mut p = json!({"kind": "rect", "size": [100, 100], "fill": "#ff0000"});
+            p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            s.execute("layer.newShape", p).unwrap()["layer"].as_u64().unwrap()
+        };
+        let a = shape(&mut s, json!({}));
+        let b = shape(&mut s, json!({"stroke": "#ffffff", "strokeWidth": 10}));
+        let width = |s: &Session, id| {
+            let r = bounds(s, id);
+            r[2] - r[0]
+        };
+        assert!((width(&s, a) - 100.0).abs() < 1e-6 && (width(&s, b) - 110.0).abs() < 1e-6, "{} {}", width(&s, a), width(&s, b));
+        s.execute("layer.align", json!({"edge": "left", "layers": [a, b]})).unwrap();
+        assert!(bounds(&s, a)[0].abs() < 1e-6 && bounds(&s, b)[0].abs() < 1e-6);
+    }
+
     #[test]
     fn align_honours_parent_scale_and_rotation() {
         let mut s = session();

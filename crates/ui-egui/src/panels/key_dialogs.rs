@@ -126,7 +126,7 @@ fn buttons(ui: &mut egui::Ui, app: &mut EffectcraftApp, t: &Tokens, prefix: &str
 }
 
 fn drag(ui: &mut egui::Ui, app: &mut EffectcraftApp, id: &str, v: &mut f64, speed: f64, range: std::ops::RangeInclusive<f64>, suffix: &str, enabled: bool) {
-    let r = ui.add_enabled(enabled, egui::DragValue::new(v).speed(speed).range(range).max_decimals(2).suffix(suffix));
+    let r = ui.add_enabled(enabled, crate::widgets::drag_value(egui::DragValue::new(v).speed(speed).range(range).max_decimals(2).suffix(suffix)));
     app.auto.add(id, r.rect, id);
 }
 
@@ -190,9 +190,10 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
 
 fn combo(ui: &mut egui::Ui, app: &mut EffectcraftApp, id: &str, sel: &mut usize, opts: &[&str], enabled: bool) {
     ui.add_enabled_ui(enabled, |ui| {
-        let r = egui::ComboBox::from_id_salt(id).width(200.0).selected_text(opts[*sel]).show_ui(ui, |ui| {
+        // The options are the English source strings; the automation id and label stay English.
+        let r = egui::ComboBox::from_id_salt(id).width(200.0).selected_text(tr(opts[*sel])).show_ui(ui, |ui| {
             for (i, o) in opts.iter().enumerate() {
-                ui.selectable_value(sel, i, *o);
+                ui.selectable_value(sel, i, tr(o));
             }
         });
         app.auto.add(id, r.response.rect, id);

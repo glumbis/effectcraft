@@ -932,8 +932,10 @@ __TextStyle.prototype = {
   setVerticalScaling: __styleSetter('vScale'),
   setTsume: __styleSetter('tsume'),
   setBaselineOption: __styleSetter('baseline', function (v) { return String(v).toLowerCase().replace('_baseline', ''); }),
-  setSuperscript: __styleSetter('superscript', Boolean),
-  setSubscript: __styleSetter('subscript', Boolean),
+  // Canonical baseline operations also make the returned TextStyle's getters reflect
+  // the pending edit, rather than waiting for the host to apply a superscript flag.
+  setSuperscript: __styleSetter('baseline', function (v) { return v ? 'superscript' : 'normal'; }),
+  setSubscript: __styleSetter('baseline', function (v) { return v ? 'subscript' : 'normal'; }),
   setKerningType: __styleSetter('kerning', function (v) { v = String(v).toLowerCase(); return v === 'manual' ? 0 : v; }),
   setKerning: __styleSetter('kerning', Number),
   setLigature: __styleSetter('ligatures', Boolean),

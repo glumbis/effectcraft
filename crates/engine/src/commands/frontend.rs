@@ -3,8 +3,10 @@
 //! control channel and MCP all see them); running one emits [`crate::Event::Frontend`] and the UI
 //! performs it. Headless sessions accept and ignore them.
 
-use super::{CommandSpec, always, frontend, has_comp, has_layers};
-use crate::cmd;
+use serde_json::{Value, json};
+
+use super::{CommandSpec, always, bad, frontend, has_comp, has_layers};
+use crate::{Result, Session, cmd};
 
 macro_rules! fe {
     ($id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr) => {
@@ -106,5 +108,38 @@ pub fn specs() -> Vec<CommandSpec> {
         fe!("layer.openLayer", "Open Layer", ["Layer"], None, "{layer?}", has_layers),
         fe!("effect.manage", "Manage Effects...", ["Effect"], None, "{}", always),
         fe!("anim.browsePresets", "Browse Presets...", ["Animation"], None, "{}", always),
+        // Project panel: delete the selected items without the prompt that Delete shows when
+        // compositions use them. The UI runs `project.delete` (agents can run it directly).
+        fe!(
+            "project.deleteWithoutConfirmation",
+            "Delete Project Items Without Confirmation",
+            [],
+            Some("Shift+Delete"),
+            "{} — the Project panel's selection, with the layers that use it; one undo step",
+            always
+        ),
+        // A gradient property's "Edit Gradient…" (the Timeline's Colors value): opens the
+        // Gradient Editor on it at the current time. OK sets it with prop.set (one undo step).
+        cmd!(
+            "prop.editGradient",
+            "Edit Gradient...",
+            [],
+            None,
+            "{layer?, path|prop, comp?} — a gradient property; opens the Gradient Editor at the current time",
+            has_layers,
+            edit_gradient
+        ),
     ]
+}
+
+/// `prop.editGradient`: check the target is a gradient property before the UI opens the editor,
+/// so agents get an error (not success) for a wrong one, and hand the UI the resolved ids.
+fn edit_gradient(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "prop.editGradient";
+    let (cid, lid, uid) = super::prop::prop_ref(s, p, c)?;
+    let pr = s.project.comp(cid).and_then(|comp| comp.layer(lid)).and_then(|l| l.props.find(uid)).ok_or_else(|| bad(c, format!("no property @{uid}")))?;
+    if !matches!(pr.value, effectcraft_keyframe::Value::Gradient(_)) {
+        return Err(bad(c, format!("{} is not a gradient property", pr.name)));
+    }
+    frontend(s, c, &json!({"comp": cid.0, "layer": lid.0, "prop": uid}))
 }

@@ -171,8 +171,7 @@ const CC_COMPOSITE_MODES: [&str; 16] = [
     "Stencil Alpha",
 ];
 
-/// Composites the original over/under/with the effect result. The original is the image as it
-/// enters this effect (the host does not expose the pre-effect source).
+/// Composites the original stack input over/under/with the result of preceding effects.
 fn cc_composite(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let op = (ctx.params.f("opacity") as f32 / 100.0).clamp(0.0, 1.0);
     let m = ctx.params.e("compositeOriginal");
@@ -194,9 +193,10 @@ fn cc_composite(ctx: &EffectCtx, mut b: Buf) -> Buf {
         15 => BlendMode::StencilAlpha,
         _ => BlendMode::Normal,
     };
-    b.img.data.par_iter_mut().for_each(|px| {
+    let original = ctx.env.host.and_then(|h| h.original()).map(|o| crate::util::fit_buffer(o, b.img.width, b.img.height, b.offset, b.scale));
+    b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
         let result = *px;
-        let orig = result.map(|v| v * op);
+        let orig = original.as_ref().and_then(|o| o.data.get(i)).copied().unwrap_or(result).map(|v| v * op);
         let mut o = if m == 1 { blend_pixel(BlendMode::Normal, orig, result, 0.5) } else { blend_pixel(mode, result, orig, 0.5) };
         o[3] = o[3].clamp(0.0, 1.0);
         if rgb_only {
@@ -444,5 +444,55 @@ pub(crate) mod tests {
             )
         });
         assert!((sc.img.get(4, 3)[0] - 0.75).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod original_tests {
+    use super::*;
+    use crate::{EffectEnv, EffectHost, Image, LayerPixels};
+    struct Original(Buf);
+    impl EffectHost for Original {
+        fn original(&self) -> Option<&Buf> {
+            Some(&self.0)
+        }
+        fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+    }
+    #[test]
+    fn composite_preserves_alpha_opacity_and_padded_alignment() {
+        let spec = crate::find("ec.channel.cccomposite").unwrap();
+        let mut params = crate::Params { values: spec.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        let host = Original(Buf { img: Image::filled(1, 1, [0.5, 0.0, 0.0, 0.5]), offset: [0.0; 2], scale: 1.0 });
+        for (mode, opacity, rgb, want) in [
+            (0, 100.0, false, [0.5, 0.0, 0.125, 0.625]),
+            (1, 100.0, false, [0.375, 0.0, 0.25, 0.625]),
+            (0, 50.0, false, [0.25, 0.0, 0.1875, 0.4375]),
+            (0, 100.0, true, [0.2, 0.0, 0.05, 0.25]),
+        ] {
+            params.values.insert("compositeOriginal".into(), Value::Enum(mode));
+            params.values.insert("opacity".into(), num(opacity));
+            params.values.insert("rgbOnly".into(), Value::Bool(rgb));
+            let ctx = EffectCtx {
+                params: &params,
+                time: 0.0,
+                layer_size: [1.0; 2],
+                seed: 0,
+                adjustment: false,
+                env: EffectEnv { host: Some(&host), ..Default::default() },
+            };
+            let mut input = Buf { img: Image::filled(1, 1, [0.0, 0.0, 0.25, 0.25]), offset: [0.0; 2], scale: 1.0 };
+            input.pad(1);
+            let out = cc_composite(&ctx, input);
+            for (a, b) in out.img.get(1, 1).iter().zip(want) {
+                assert!((a - b).abs() < 1e-6, "{:?} vs {want:?}", out.img.get(1, 1));
+            }
+            assert_eq!(out.img.get(0, 0), [0.0; 4]);
+            assert_eq!(out.offset, [1.0; 2]);
+        }
     }
 }

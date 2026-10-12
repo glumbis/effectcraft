@@ -20,15 +20,17 @@ use crate::{Importer, Services};
 /// How an import treats numbered stills.
 #[derive(Clone, Copy, Debug)]
 pub struct SequenceOptions {
-    /// The "<format> Sequence" checkbox: numbered stills of one run import as a sequence.
+    /// The "<format> Sequence" checkbox: picked numbered stills of one run import as a sequence.
     pub sequence: bool,
+    /// The numbered stills inside a picked or dropped folder import as sequences.
+    pub folders: bool,
     /// Force Alphabetical Order.
     pub alphabetical: bool,
 }
 
 impl Default for SequenceOptions {
     fn default() -> Self {
-        SequenceOptions { sequence: true, alphabetical: false }
+        SequenceOptions { sequence: true, folders: true, alphabetical: false }
     }
 }
 
@@ -36,7 +38,21 @@ impl SequenceOptions {
     /// From command parameters `sequence?` (default on) and `alphabetical?`.
     pub fn from_params(p: &serde_json::Value) -> SequenceOptions {
         let flag = |k: &str| p.get(k).and_then(serde_json::Value::as_bool);
-        SequenceOptions { sequence: flag("sequence").unwrap_or(true), alphabetical: flag("alphabetical").unwrap_or(false) }
+        let sequence = flag("sequence").unwrap_or(true);
+        SequenceOptions { sequence, folders: sequence, alphabetical: flag("alphabetical").unwrap_or(false) }
+    }
+
+    /// `file.import`'s options. Dropped files (`drag: true`) import as stills, as in After
+    /// Effects, while a folder's numbered stills import as sequences unless `sequence: false`
+    /// (Alt-drag of a folder). The Import dialog passes its "<format> Sequence" checkbox (off
+    /// unless ticked) as `sequence`. Without `sequence` or `drag` (scripts, agents) a numbered
+    /// still brings its run, as it always has.
+    pub fn for_import(p: &serde_json::Value) -> SequenceOptions {
+        let flag = |k: &str| p.get(k).and_then(serde_json::Value::as_bool);
+        let (sequence, alphabetical) = (flag("sequence"), flag("alphabetical").unwrap_or(false));
+        let dropped = flag("drag").unwrap_or(false);
+        // Force Alphabetical Order is part of the Sequence option.
+        SequenceOptions { sequence: sequence.unwrap_or(alphabetical || !dropped), folders: sequence.unwrap_or(true), alphabetical }
     }
 }
 
@@ -120,28 +136,27 @@ fn run_files(services: &dyn Services, path: &str, alphabetical: bool) -> Vec<Str
 }
 
 /// What importing `paths` makes, in the order picked: folders become their importable files,
-/// and (with the Sequence option) numbered stills of one run one [`Source::Sequence`].
+/// and (with the Sequence option, or [`SequenceOptions::folders`] for a folder's files) numbered
+/// stills of one run one [`Source::Sequence`].
 pub fn group(services: &dyn Services, paths: &[String], opts: SequenceOptions) -> Vec<Source> {
-    let mut files: Vec<String> = vec![];
+    // Each file, and whether it may join a sequence.
+    let mut files: Vec<(String, bool)> = vec![];
     for p in paths {
         if services.is_dir(p) {
             let mut inside: Vec<String> =
                 services.list_dir(p).into_iter().filter(|f| matches!(crate::media_browser::kind_of(f), Some(k) if k != "project")).collect();
             inside.sort_by_key(|f| file_name(f).to_lowercase());
-            files.extend(inside);
+            files.extend(inside.into_iter().map(|f| (f, opts.folders)));
         } else {
-            files.push(p.clone());
+            files.push((p.clone(), opts.sequence));
         }
-    }
-    if !opts.sequence {
-        return files.into_iter().map(Source::File).collect();
     }
     // Runs in the order their first file was picked.
     let mut runs: Vec<((String, String, String), Vec<String>)> = vec![];
     let mut out: Vec<Option<Source>> = vec![];
     let mut slot: Vec<usize> = vec![];
-    for f in files {
-        match run_key(&f, opts.alphabetical) {
+    for (f, joins) in files {
+        match run_key(&f, opts.alphabetical).filter(|_| joins) {
             Some(key) => match runs.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, run)) => run.push(f),
                 None => {
@@ -155,8 +170,10 @@ pub fn group(services: &dyn Services, paths: &[String], opts: SequenceOptions) -
     }
     for ((_, mut picked), at) in runs.into_iter().zip(slot) {
         sort_run(&mut picked, opts.alphabetical);
-        // One file: its whole run from the folder.
-        if let [one] = picked.as_slice() {
+        // One picked file: its whole run from the folder.
+        if let [one] = picked.as_slice()
+            && opts.sequence
+        {
             let all = run_files(services, one, opts.alphabetical);
             if all.len() >= 2 {
                 picked = all;
@@ -176,7 +193,7 @@ pub fn group(services: &dyn Services, paths: &[String], opts: SequenceOptions) -
 
 /// The image sequences importing `paths` would make (the Import dialog asks about them).
 pub fn sequences(services: &dyn Services, paths: &[String], alphabetical: bool) -> Vec<Vec<String>> {
-    group(services, paths, SequenceOptions { sequence: true, alphabetical })
+    group(services, paths, SequenceOptions { sequence: true, folders: true, alphabetical })
         .into_iter()
         .filter_map(|s| match s {
             Source::Sequence { files, .. } => Some(files),
@@ -282,7 +299,10 @@ mod tests {
             ]
         );
         // Sequence off: every file on its own.
-        assert_eq!(group(&t, &strs(&["/s/a_0001.png"]), SequenceOptions { sequence: false, alphabetical: false }), [Source::File("/s/a_0001.png".into())]);
+        assert_eq!(
+            group(&t, &strs(&["/s/a_0001.png"]), SequenceOptions { sequence: false, folders: false, alphabetical: false }),
+            [Source::File("/s/a_0001.png".into())]
+        );
         // A folder: its media files, runs as sequences.
         let g = group(&t, &strs(&["/s"]), on);
         assert_eq!(g.len(), 4, "{g:?}");
@@ -290,10 +310,27 @@ mod tests {
         assert_eq!(g[0].name(), "a_[0001-0010].png");
         assert!(!g.iter().any(|s| s.path().ends_with(".txt")));
         // Force Alphabetical Order: every PNG in the folder, by name.
-        let a = group(&t, &strs(&["/s/c.png"]), SequenceOptions { sequence: true, alphabetical: true });
+        let a = group(&t, &strs(&["/s/c.png"]), SequenceOptions { sequence: true, folders: true, alphabetical: true });
         assert_eq!(a, [Source::Sequence { files: strs(&["/s/a_0001.png", "/s/a_0002.png", "/s/a_0010.png", "/s/b_1.png", "/s/c.png"]), alphabetical: true }]);
         assert_eq!(a[0].name(), "a_0001.png");
         assert_eq!(sequences(&t, &strs(&["/s/a_0001.png", "/s/c.png"]), false).len(), 1);
+    }
+
+    /// #431: `file.import` brings picked or dropped numbered stills in as stills; only a folder or
+    /// an explicit `sequence: true` makes a sequence, as After Effects' Sequence checkbox does.
+    #[test]
+    fn import_takes_stills_unless_asked_for_a_sequence() {
+        let t = Table(vec!["/s/a_0001.png", "/s/a_0002.png", "/s/a_0003.png", "/s/IMG_0001.jpg", "/s/IMG_0042.jpg"]);
+        let opts = |p: serde_json::Value| SequenceOptions::for_import(&p);
+        let none = opts(serde_json::json!({"drag": true}));
+        assert_eq!(group(&t, &strs(&["/s/a_0002.png"]), none), [Source::File("/s/a_0002.png".into())]);
+        assert_eq!(group(&t, &strs(&["/s/IMG_0001.jpg", "/s/IMG_0042.jpg"]), none).len(), 2);
+        // A dropped folder: its runs as sequences (Alt-drag: `sequence: false`, files on their own).
+        assert_eq!(group(&t, &strs(&["/s"]), none).len(), 2);
+        assert_eq!(group(&t, &strs(&["/s"]), opts(serde_json::json!({"sequence": false}))).len(), 5);
+        // The Sequence checkbox: one picked file brings its whole run.
+        let on = group(&t, &strs(&["/s/a_0002.png"]), opts(serde_json::json!({"sequence": true})));
+        assert!(matches!(on.as_slice(), [Source::Sequence { files, .. }] if files.len() == 3), "{on:?}");
     }
 
     #[test]

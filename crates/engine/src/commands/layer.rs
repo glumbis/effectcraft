@@ -4,7 +4,8 @@ use effectcraft_color::{BlendMode, Label};
 use effectcraft_keyframe::{Justify, TextDoc, Value as KV};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{
-    Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Project, PropGroup, Quality, Solid, TrackMatte,
+    Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Node, Project, PropGroup, Quality, Solid, TrackMatte,
+    limits,
 };
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
@@ -92,8 +93,9 @@ fn new_solid_like(s: &mut Session, p: &Value, adjustment: bool) -> Result<Value>
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
     let color = color_p(p, "color").unwrap_or(if adjustment { [1.0, 1.0, 1.0] } else { [0.85, 0.2, 0.2] });
-    let w = p.get("width").and_then(Value::as_u64).map(|v| v as u32).unwrap_or(comp.width);
-    let h = p.get("height").and_then(Value::as_u64).map(|v| v as u32).unwrap_or(comp.height);
+    // 1 to 30,000 px a side (#788): the layer is sized from the same numbers as its solid.
+    let w = p.get("width").and_then(Value::as_u64).map(limits::size).unwrap_or(comp.width);
+    let h = p.get("height").and_then(Value::as_u64).map(limits::size).unwrap_or(comp.height);
     let pixel_aspect = pixel_aspect_p(p)?.unwrap_or(comp.pixel_aspect);
     let default_name = if adjustment { "Adjustment Layer 1".to_string() } else { "Solid 1".to_string() };
     let name = str_p(p, "name").map(str::to_string).unwrap_or(default_name);
@@ -114,7 +116,7 @@ fn new_solid_like(s: &mut Session, p: &Value, adjustment: bool) -> Result<Value>
 fn pixel_aspect_p(p: &Value) -> Result<Option<f64>> {
     match p.get("pixelAspect").and_then(Value::as_f64) {
         Some(v) if !(v.is_finite() && v > 0.0) => Err(bad("layer.settings", "`pixelAspect` must be a positive number")),
-        v => Ok(v),
+        v => Ok(v.map(limits::pixel_aspect)),
     }
 }
 
@@ -173,7 +175,7 @@ fn new_text(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let layer_name = str_p(p, "name").map(str::to_string);
     apply_text_params("layer.newText", &q, &mut doc, None)?;
-    let mut pos = p.get("position").and_then(|v| v.as_array()).map(|a| [a[0].as_f64().unwrap_or(0.0), a.get(1).and_then(Value::as_f64).unwrap_or(0.0)]);
+    let mut pos = position_p(p, "layer.newText")?;
     if let Some([x, y, w, h]) = bx {
         let (w, h) = (w.abs().max(1.0), h.abs().max(1.0));
         doc.box_size = Some([w, h]);
@@ -295,7 +297,10 @@ fn add_item(s: &mut Session, p: &Value) -> Result<Value> {
         let mut l = build::layer(proj, &comp, &it.name, src, size, dur);
         l.start_time = start;
         l.in_point = start;
-        l.out_point = fr.snap_nearest((start + dur.unwrap_or(comp.duration)).min(comp.duration)).max(start + fr.frame_duration());
+        // Footage and precomps keep their full length past the comp's end (After Effects); items
+        // without a duration (solids, comp-length stills) end with the comp.
+        let end = dur.map_or((start + comp.duration).min(comp.duration), |d| start + d);
+        l.out_point = fr.snap_nearest(end).max(start + fr.frame_duration());
         place(&mut l, position);
         insert_layer_at(proj, st, cid, l, index)
     })?;
@@ -542,7 +547,7 @@ fn track_matte(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// How a 2D layer's transform changes so it stays where it is when its parent changes.
+/// Re-express a layer in its new parent space without moving its anchor.
 pub(crate) struct ParentFix {
     pub layer: LayerId,
     /// Maps Position from the old parent's space into the new one's.
@@ -551,12 +556,80 @@ pub(crate) struct ParentFix {
     rotation: f64,
     /// Multiply Scale.
     scale: [f64; 2],
+    /// 3D AV layers retain their world-space anchor, including Z.
+    position_3d: Option<effectcraft_geom::Mat4>,
+    /// A uniform relative parent transform can preserve static Orientation and Scale.
+    pose_3d: Option<([f64; 3], f64)>,
 }
 
 impl ParentFix {
     /// Re-express the layer's Position, Rotation and Scale (every key) in the new parent's space.
     pub fn apply(&self, l: &mut Layer) {
         let Some(tr) = l.props.sub_mut("transform") else { return };
+        if let Some(m) = self.position_3d {
+            // Spatial Position speed measures distance along its path. Its parent-space
+            // unit changes even when the child's Orientation cannot be re-expressed.
+            let position_speed = uniform_parent_pose(m, [0.0; 3]).map(|(_, factor)| factor.abs());
+            let map_position = |v: &KV| {
+                let q = m.apply(effectcraft_geom::Vec3::from(v.as_vec3()));
+                KV::Vec3([q.x, q.y, q.z])
+            };
+            // Read all separated axes before writing any of them.
+            let names = ["positionX", "positionY", "positionZ"];
+            if tr.get("positionX").is_some() {
+                let axes = names.map(|name| tr.get(name).cloned());
+                let current = axes.each_ref().map(|pr| pr.as_ref().map(|pr| pr.value.as_f64()).unwrap_or(0.0));
+                let q = m.apply(effectcraft_geom::Vec3::from(current));
+                for (i, name) in names.into_iter().enumerate() {
+                    if let Some(pr) = tr.get_mut(name) {
+                        pr.value = KV::Scalar([q.x, q.y, q.z].get(i).copied().unwrap_or(0.0));
+                        for key in &mut pr.keys {
+                            let p = axes.each_ref().map(|axis| axis.as_ref().map(|axis| axis.value_at(key.time).as_f64()).unwrap_or(0.0));
+                            let q = m.apply(effectcraft_geom::Vec3::from(p));
+                            key.value = KV::Scalar([q.x, q.y, q.z].get(i).copied().unwrap_or(0.0));
+                        }
+                    }
+                }
+            }
+            if let Some(pr) = tr.get_mut("position") {
+                pr.value = map_position(&pr.value);
+                for key in &mut pr.keys {
+                    key.value = map_position(&key.value);
+                    // Spatial tangents are vectors, so the parent's translation is excluded.
+                    for tangent in [&mut key.spatial_in, &mut key.spatial_out] {
+                        let v = m.apply_vec(effectcraft_geom::Vec3::from(*tangent));
+                        *tangent = [v.x, v.y, v.z];
+                    }
+                }
+                if let Some(factor) = position_speed
+                    .filter(|_| pr.spatial)
+                    .filter(|factor| pr.keys.iter().flat_map(|key| key.in_ease.iter().chain(&key.out_ease)).all(|ease| (ease.speed * *factor).is_finite()))
+                {
+                    for key in &mut pr.keys {
+                        for ease in key.in_ease.iter_mut().chain(&mut key.out_ease) {
+                            ease.speed *= factor;
+                        }
+                    }
+                }
+            }
+            if let Some((orientation, factor)) = self.pose_3d {
+                if let Some(pr) = tr.get_mut("orientation") {
+                    pr.value = KV::Vec3(orientation);
+                }
+                if let Some(pr) = tr.get_mut("scale") {
+                    let scaled = |value: &KV| KV::Vec3(value.as_vec3().map(|v| v * factor));
+                    pr.value = scaled(&pr.value);
+                    for key in &mut pr.keys {
+                        key.value = scaled(&key.value);
+                        // Scale's temporal speeds use the same units as its values.
+                        for ease in key.in_ease.iter_mut().chain(&mut key.out_ease) {
+                            ease.speed *= factor;
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let map = |pr: &mut effectcraft_project::Property, f: &dyn Fn(&KV) -> KV| {
             pr.value = f(&pr.value);
             for key in &mut pr.keys {
@@ -606,7 +679,42 @@ impl ParentFix {
     }
 }
 
-/// Like the pick-whip, a parent change keeps 2D layers where they are: their transform is
+/// A uniform factor commutes with authored axis Rotation and Scale; prepend its orthogonal
+/// rotation to static Orientation using the existing Rz * Ry * Rx order.
+fn uniform_parent_pose(m: effectcraft_geom::Mat4, orientation: [f64; 3]) -> Option<([f64; 3], f64)> {
+    use effectcraft_geom::{Mat4, Vec3, vec3};
+    if !orientation.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let a = m.0;
+    let columns = [vec3(a[0][0], a[1][0], a[2][0]), vec3(a[0][1], a[1][1], a[2][1]), vec3(a[0][2], a[1][2], a[2][2])];
+    let magnitude = columns[0].x.hypot(columns[0].y).hypot(columns[0].z);
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return None;
+    }
+    let c = columns.map(|c| c / magnitude);
+    if c.iter().any(|c| (c.dot(*c) - 1.0).abs() > 1e-9) || c[0].dot(c[1]).abs() > 1e-9 || c[0].dot(c[2]).abs() > 1e-9 || c[1].dot(c[2]).abs() > 1e-9 {
+        return None;
+    }
+    let cross = vec3(c[1].y * c[2].z - c[1].z * c[2].y, c[1].z * c[2].x - c[1].x * c[2].z, c[1].x * c[2].y - c[1].y * c[2].x);
+    let factor = if c[0].dot(cross) < 0.0 { -magnitude } else { magnitude };
+    let mut rotation = Mat4::IDENTITY;
+    for row in 0..3 {
+        for col in 0..3 {
+            rotation.0[row][col] = a[row][col] / factor;
+        }
+    }
+    if (0..3).all(|row| (0..3).all(|col| (rotation.0[row][col] - if row == col { 1.0 } else { 0.0 }).abs() < 1e-12)) {
+        return Some((orientation, factor));
+    }
+    let r = (rotation * Mat4::orientation(Vec3::from(orientation))).0;
+    let sy = (-r[2][0]).clamp(-1.0, 1.0);
+    let y = sy.asin();
+    let (x, z) = if (1.0 - sy * sy).sqrt() > 1e-9 { (r[2][1].atan2(r[2][2]), r[1][0].atan2(r[0][0])) } else { ((-r[1][2]).atan2(r[1][1]), 0.0) };
+    Some(([x.to_degrees(), y.to_degrees(), z.to_degrees()], factor))
+}
+
+/// A parent change retains 2D transforms and the world-space anchor of 3D AV layers. Position is
 /// re-expressed in the new parent's space (`None`: the composition), evaluated at the current
 /// time.
 pub(crate) fn parent_fixes(s: &Session, cid: ItemId, ids: &[LayerId], parent: Option<LayerId>) -> Vec<ParentFix> {
@@ -625,16 +733,59 @@ pub(crate) fn parent_fixes(s: &Session, cid: ItemId, ids: &[LayerId], parent: Op
     let new_m = space(parent);
     let Some(inv) = new_m.inverse() else { return vec![] };
     let (rn, sxn, syn) = decompose(&new_m);
-    comp.layers
+    let mut fixes: Vec<_> = comp
+        .layers
         .iter()
         .filter(|l| ids.contains(&l.id) && !l.is_3d() && l.parent != parent)
         .map(|l| {
             let old_m = space(l.parent);
             let (ro, sxo, syo) = decompose(&old_m);
             let scale = [if sxn.abs() > 1e-12 { sxo / sxn } else { 1.0 }, if syn.abs() > 1e-12 { syo / syn } else { 1.0 }];
-            ParentFix { layer: l.id, m: inv * old_m, rotation: ro - rn, scale }
+            ParentFix { layer: l.id, m: inv * old_m, rotation: ro - rn, scale, position_3d: None, pose_3d: None }
         })
-        .collect()
+        .collect();
+    let space_3d = |id: Option<LayerId>| {
+        id.and_then(|id| comp.layer(id)).map_or(effectcraft_geom::Mat4::IDENTITY, |layer| {
+            // Parent transforms do not inherit the parent's source pixel-aspect stretch.
+            let world = ectx.world_matrix(layer);
+            let par = ectx.par_ratio(layer);
+            let a = layer.transform().map(|tr| ectx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
+            let anchor = effectcraft_geom::vec3(a[0], a[1], if layer.is_3d() { a[2] } else { 0.0 });
+            world
+                * effectcraft_geom::Mat4::translate(anchor)
+                * effectcraft_geom::Mat4::scale(effectcraft_geom::vec3(1.0 / par, 1.0, 1.0))
+                * effectcraft_geom::Mat4::translate(-anchor)
+        })
+    };
+    if let Some(inv) = space_3d(parent).inverse().filter(|m| m.0.iter().flatten().all(|v| v.is_finite())) {
+        for layer in comp.layers.iter().filter(|l| ids.contains(&l.id) && l.is_3d() && !l.is_camera() && !l.is_light() && l.parent != parent) {
+            let m = inv * space_3d(layer.parent);
+            if m.0.iter().flatten().all(|v| v.is_finite()) {
+                let pose_3d = layer.transform().and_then(|tr| {
+                    let orientation = tr.get("orientation")?;
+                    let scale = tr.get("scale")?;
+                    // Animated Euler Orientation and auto-orient cannot be re-expressed by
+                    // prepending a constant Euler value. Expression-driven values stay authored.
+                    if !orientation.keys.is_empty()
+                        || orientation.expr.is_some()
+                        || scale.expr.is_some()
+                        || layer.auto_orient != effectcraft_project::AutoOrient::Off
+                    {
+                        return None;
+                    }
+                    let pose = uniform_parent_pose(m, orientation.value.as_vec3())?;
+                    let factor = pose.1;
+                    let values_finite = std::iter::once(&scale.value)
+                        .chain(scale.keys.iter().map(|key| &key.value))
+                        .all(|value| value.as_vec3().iter().all(|v| (v * factor).is_finite()));
+                    let speeds_finite = scale.keys.iter().flat_map(|key| key.in_ease.iter().chain(&key.out_ease)).all(|ease| (ease.speed * factor).is_finite());
+                    (values_finite && speeds_finite).then_some(pose)
+                });
+                fixes.push(ParentFix { layer: layer.id, m: effectcraft_geom::Mat3::IDENTITY, rotation: 0.0, scale: [1.0; 2], position_3d: Some(m), pose_3d });
+            }
+        }
+    }
+    fixes
 }
 
 /// Validate the proposed ancestor chain before any authored edit, including when compensation
@@ -1040,6 +1191,26 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
     let uid = s.edit("Add Shape Item", None, |proj, _| {
         let mut next = proj.next_id;
         let mut ids = Ids(&mut next);
+        // Front / Bevel / Side / Back ▸ property: into the group's surface item (one per group).
+        if let Some((surface, prop)) = build::shape_surface_kind(&kind) {
+            let target = shape_item_target(proj, cid, lid, group_uid)?;
+            let item = match target.children.iter().position(|c| matches!(c, Node::Group(g) if g.match_id == surface)) {
+                Some(i) => i,
+                None => {
+                    let g = build::shape_surface(&mut ids, surface).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{kind}`")))?;
+                    target.children.push(g.into());
+                    target.children.len() - 1
+                }
+            };
+            let Some(Node::Group(g)) = target.children.get_mut(item) else { return Err(bad("layer.addShapeItem", "no such group")) };
+            if g.get(prop).is_none() {
+                let p = build::shape_surface_prop(&mut ids, prop).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{kind}`")))?;
+                g.children.push(p.into());
+            }
+            let uid = g.uid;
+            proj.next_id = next;
+            return Ok(uid);
+        }
         let g = match kind.as_str() {
             "group" => build::shape_group(&mut ids, "Group 1", vec![]),
             "rect" | "rectangle" => build::shape_rect(&mut ids, [200.0, 200.0], [0.0, 0.0], 0.0),
@@ -1057,21 +1228,26 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
         };
         let uid = g.uid;
         proj.next_id = next;
-        let l = layer_mut(proj, cid, lid)?;
-        let contents = l.props.sub_mut("contents").ok_or_else(|| bad("layer.addShapeItem", "not a shape layer"))?;
-        let target = match group_uid {
-            Some(u) => contents
-                .find_group_mut(u)
-                .and_then(|g| if g.match_id == "contents" { Some(g) } else { g.sub_mut("contents") })
-                .ok_or_else(|| bad("layer.addShapeItem", "no such group"))?,
-            None => contents,
-        };
-        target.children.push(g.into());
+        shape_item_target(proj, cid, lid, group_uid)?.children.push(g.into());
         Ok(uid)
     })?;
     // The new item's property path, ready for prop.set / add_keyframe (`contents/trim#2/end`).
     let path = s.project.comp(cid).and_then(|c| c.layer(lid)).and_then(|l| l.props.match_path_of(uid));
     Ok(json!({"uid": uid, "path": path}))
+}
+
+/// The contents a new shape item goes into: the shape group `group_uid` (its Contents), else the
+/// layer's Contents.
+fn shape_item_target(proj: &mut Project, cid: ItemId, lid: LayerId, group_uid: Option<u64>) -> Result<&mut PropGroup> {
+    let l = layer_mut(proj, cid, lid)?;
+    let contents = l.props.sub_mut("contents").ok_or_else(|| bad("layer.addShapeItem", "not a shape layer"))?;
+    Ok(match group_uid {
+        Some(u) => contents
+            .find_group_mut(u)
+            .and_then(|g| if g.match_id == "contents" { Some(g) } else { g.sub_mut("contents") })
+            .ok_or_else(|| bad("layer.addShapeItem", "no such group"))?,
+        None => contents,
+    })
 }
 
 fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1122,6 +1298,37 @@ fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// Move Position by `(dx, dy)`, including every key. Separated dimensions move X and Y as well
+/// as the combined property the channels were split from.
+pub(crate) fn offset_position(tr: &mut PropGroup, dx: f64, dy: f64) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    if tr.get("positionX").is_some() {
+        for (name, d) in [("positionX", dx), ("positionY", dy)] {
+            if let Some(pr) = tr.get_mut(name) {
+                pr.value = KV::Scalar(pr.value.as_f64() + d);
+                for k in &mut pr.keys {
+                    k.value = KV::Scalar(k.value.as_f64() + d);
+                }
+            }
+        }
+    }
+    if let Some(pr) = tr.get_mut("position") {
+        let shift = |v: &KV| match v {
+            KV::Vec2(a) => KV::Vec2([a[0] + dx, a[1] + dy]),
+            other => {
+                let a = other.as_vec3();
+                KV::Vec3([a[0] + dx, a[1] + dy, a[2]])
+            }
+        };
+        pr.value = shift(&pr.value);
+        for k in &mut pr.keys {
+            k.value = shift(&k.value);
+        }
+    }
 }
 
 /// Set a layer's Position at layer time `lt` to `f(current)`: X/Y/Z Position when its dimensions
@@ -1227,8 +1434,8 @@ fn layer_settings(s: &mut Session, p: &Value) -> Result<Value> {
         _ => {}
     }
     let color = color_p(p, "color");
-    let w = p.get("width").and_then(Value::as_u64).map(|v| v.max(1) as u32);
-    let h = p.get("height").and_then(Value::as_u64).map(|v| v.max(1) as u32);
+    let w = p.get("width").and_then(Value::as_u64).map(limits::size);
+    let h = p.get("height").and_then(Value::as_u64).map(limits::size);
     let pixel_aspect = pixel_aspect_p(p)?;
     let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
     let affect_all = p.get("affectAll").and_then(Value::as_bool).unwrap_or(true);
@@ -1347,7 +1554,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layers,
             track_matte
         ),
-        cmd!("layer.setParent", "Parent", [], None, "{layers?, parent: layer|null}", has_layers, set_parent),
+        cmd!("layer.setParent", "Parent", [], None, "{layers?, parent: layer|null, compensate?: bool}", has_layers, set_parent),
         cmd!(
             "layer.timing",
             "Layer Timing",
@@ -1393,7 +1600,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add (Shape)",
             [],
             None,
-            "{layer?, kind: group|rect|ellipse|star|polygon|path|fill|stroke|gfill|gstroke|trim|repeater|round|offset|pucker|twist|zigzag|wiggle|merge, group?: uid|path} → {uid, path}",
+            "{layer?, kind: group|rect|ellipse|star|polygon|path|fill|stroke|gfill|gstroke|trim|repeater|round|offset|pucker|twist|zigzag|wiggle|merge|frontColor|bevelColor|sideColor|backColor, group?: uid|path} → {uid, path} (frontColor…backColor: the group's Front / Bevel / Side / Back item, which colours that surface of every extruded paint in the group in Advanced 3D)",
             has_layers,
             add_shape_item
         ),
@@ -1402,7 +1609,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Text",
             [],
             None,
-            "{layer?, range?: [start, end] (characters; default all), text?, font?, style?, size?, fill?, stroke?, applyFill?, applyStroke?, strokeWidth?, tracking?, leading?: px|\"auto\", baselineShift? px, hScale? %, vScale? %, tsume? %, fauxBold?, fauxItalic?, allCaps?, smallCaps?, baseline?: normal|superscript|subscript, superscript?, subscript?, kerning?: metrics|optical|number, ligatures?, OpenType: discretionaryLigatures?, contextualAlternates?, stylisticAlternates?, stylisticSets?: [1–20], ss01…ss20?, swash?, titling?, ordinals?, fractions?, allSmallCaps?, figureStyle?: default|lining|oldStyle, figureWidth?: default|proportional|tabular, figures?, variations?: {tag: value} (variable font axes; null resets), justify?: left|center|right|justifyLeft|justifyCenter|justifyRight|justifyAll, indentLeft?, indentRight?, indentFirst?, spaceBefore?, spaceAfter?, direction?: ltr|rtl, composer?: everyLine|singleLine, hangingPunctuation?, strokeOverFill?, box?: [x,y,w,h]|null (layer space), vertical?}",
+            "{layer?, range?: [start, end] (characters; default all), text?, font?, style?, size?, fill?, stroke?, applyFill?, applyStroke?, strokeWidth?, tracking?, leading?: px|\"auto\", baselineShift? px, hScale? %, vScale? %, tsume? %, fauxBold?, fauxItalic?, allCaps?, smallCaps?, baseline?: normal|superscript|subscript, superscript?, subscript?, kerning?: metrics|optical|number, ligatures?, discretionaryLigatures? (OpenType), contextualAlternates?, stylisticAlternates?, stylisticSets?: [1–20], ss01?, ss02?, ss03?, ss04?, ss05?, ss06?, ss07?, ss08?, ss09?, ss10?, ss11?, ss12?, ss13?, ss14?, ss15?, ss16?, ss17?, ss18?, ss19?, ss20?, swash?, titling?, ordinals?, fractions?, allSmallCaps?, figureStyle?: default|lining|oldStyle, figureWidth?: default|proportional|tabular, figures?, variations?: {tag: value} (variable font axes; null resets), justify?: left|center|right|justifyLeft|justifyCenter|justifyRight|justifyAll, indentLeft?, indentRight?, indentFirst?, spaceBefore?, spaceAfter?, direction?: ltr|rtl, composer?: everyLine|singleLine, hangingPunctuation?, strokeOverFill?, box?: [x,y,w,h]|null (layer space), vertical?}",
             has_layers,
             set_text
         ),

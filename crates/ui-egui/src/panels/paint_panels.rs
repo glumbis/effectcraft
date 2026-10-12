@@ -102,11 +102,11 @@ pub fn paint(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     app.auto.add("paint.color", fg, "Foreground color");
     app.auto.add("paint.background", bg, "Background color");
     let mut fc = rgb(o.color);
-    if crate::header::color_popup(ui, egui::Id::new("paint-fg-pop"), fg.left_bottom(), &mut fc) {
+    if crate::widgets::color_popup(ui, egui::Id::new("paint-fg-pop"), fg.left_bottom(), &mut fc) {
         set(app, json!({"color": [fc[0], fc[1], fc[2], 1.0]}));
     }
     let mut bc = rgb(o.background);
-    if crate::header::color_popup(ui, egui::Id::new("paint-bg-pop"), bg.left_bottom(), &mut bc) {
+    if crate::widgets::color_popup(ui, egui::Id::new("paint-bg-pop"), bg.left_bottom(), &mut bc) {
         set(app, json!({"background": [bc[0], bc[1], bc[2], 1.0]}));
     }
     let swap = Rect::from_min_size(pos2(x0 + 46.0, y), vec2(18.0, 14.0));

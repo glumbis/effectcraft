@@ -195,3 +195,17 @@ fn timeline_property_names_have_the_property_menu() {
     choose(&mut h, scale, "editValue");
     assert_eq!(h.state().dialog, Some(Dialog::Form));
 }
+
+/// The rows of a context menu touch: a gap between two entries highlighted neither and
+/// swallowed a click there.
+#[test]
+fn context_menu_rows_leave_no_gap_between_them() {
+    let mut h = harness();
+    let p = rect(&h, "project.empty").center();
+    right_click(&mut h, p);
+    let rows = ["newComp", "newFolder", "import"].map(|key| rect(&h, &format!("project.context.{key}")));
+    for pair in rows.windows(2) {
+        assert!((pair[1].top() - pair[0].bottom()).abs() < 0.5, "gap between {:?} and {:?}", pair[0], pair[1]);
+    }
+    snapshot(&mut h, "project-rows");
+}

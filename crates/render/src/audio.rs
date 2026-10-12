@@ -85,7 +85,9 @@ fn units_ceil(t: Tick, rate: u32) -> i64 {
 }
 
 fn sample_tick(i: i64, rate: u32) -> Tick {
-    Tick(((i as i128 * TICKS_PER_SECOND as i128) / rate as i128) as i64)
+    // Keep the requested sample when the rate does not divide the tick clock.
+    let t = Tick::from_units(i, i64::from(rate));
+    if t.to_units_floor(i64::from(rate)) < i { Tick(t.0.saturating_add(1)) } else { t }
 }
 
 struct MixEnv<'a> {

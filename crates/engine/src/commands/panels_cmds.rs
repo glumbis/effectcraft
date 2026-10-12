@@ -105,7 +105,10 @@ fn browser_import(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(json!({"pending": true, "paths": list}));
     }
     let target = s.active_comp_id();
-    let mut r = s.execute("file.import", json!({"paths": paths}))?;
+    // A numbered still picked in the browser still brings its image sequence (`sequence: false`
+    // for the picked stills alone); `file.import` alone imports stills.
+    let sequence = p.get("sequence").and_then(Value::as_bool).unwrap_or(true);
+    let mut r = s.execute("file.import", json!({"paths": paths, "sequence": sequence}))?;
     // Dragged into the Timeline or the Composition viewer: into the comp, where they were dropped.
     let errors = super::file::add_to_comp(s, &r, target, p);
     if !errors.is_empty()
@@ -236,7 +239,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Import",
             [],
             None,
-            "{paths, addToComp?, time?, index?, position? (where the layers go, as in layer.addItem)}",
+            "{paths, sequence? (default true: a numbered still brings its image sequence), addToComp?, time?, index?, position? (where the layers go, as in layer.addItem)}",
             browser_enabled,
             browser_import
         ),

@@ -26,6 +26,19 @@ impl ThemeKind {
             _ => None,
         }
     }
+
+    /// The settings value (`appearance.theme`, `appearance.darkTheme`, `appearance.lightTheme`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ThemeKind::Dark => "dark",
+            ThemeKind::Darker => "darker",
+            ThemeKind::Light => "light",
+        }
+    }
+
+    pub fn is_light(self) -> bool {
+        self == ThemeKind::Light
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -68,6 +81,20 @@ pub struct Tokens {
     pub timecode: Color32,
     pub danger: Color32,
     pub warning: Color32,
+    /// Effect Controls effect headers, and the header of the effect being worked on (it or one
+    /// of its properties selected).
+    pub fx_header: Color32,
+    pub fx_header_active: Color32,
+    /// Timeline: a selected layer's row in the time graph, the boxes behind the A/V and layer
+    /// switches, the time navigator and the work area bar.
+    pub tl_graph_selected: Color32,
+    pub switch_well: Color32,
+    pub tl_nav_bar: Color32,
+    pub tl_work_area_bar: Color32,
+    /// The Timeline's expression field and the colour of enabled expressions (their text and
+    /// the names of properties that have one).
+    pub expr_bg: Color32,
+    pub expr_text: Color32,
     /// Label colours (`Label::ALL` order), from Settings ▸ Labels.
     pub labels: [Color32; 17],
     pub radius: f32,
@@ -140,6 +167,14 @@ impl Tokens {
             timecode: Color32::from_rgb(0x3d, 0x8f, 0xf5),
             danger: Color32::from_rgb(0xe0, 0x4a, 0x3c),
             warning: Color32::from_rgb(0xe8, 0x9a, 0x2c),
+            fx_header: Color32::from_rgb(0x2a, 0x2a, 0x2a),
+            fx_header_active: Color32::from_rgb(0x2f, 0x3a, 0x52),
+            tl_graph_selected: Color32::from_rgb(0x2a, 0x2a, 0x2a),
+            switch_well: Color32::from_rgb(0x19, 0x19, 0x19),
+            tl_nav_bar: Color32::from_rgb(0x55, 0x55, 0x55),
+            tl_work_area_bar: Color32::from_rgb(0x5c, 0x5c, 0x5c),
+            expr_bg: Color32::from_rgb(0x1a, 0x1a, 0x1a),
+            expr_text: Color32::from_rgb(0xe8, 0x7c, 0x5c),
             labels: default_labels(),
             radius: 6.0,
             radius_sm: 3.0,
@@ -189,6 +224,16 @@ impl Tokens {
                 pasteboard: Color32::from_rgb(0xa8, 0xa8, 0xa8),
                 // Keyframes have no outline: dark enough to stand out on the light time graph.
                 keyframe: Color32::from_rgb(0x6c, 0x6c, 0x6c),
+                // Custom-painted surfaces in the Light palette, so dark text stays readable on
+                // them (#644).
+                fx_header: Color32::from_rgb(0xd8, 0xd8, 0xd8),
+                fx_header_active: Color32::from_rgb(0xb0, 0xcf, 0xec),
+                tl_graph_selected: Color32::from_rgb(0xc2, 0xc2, 0xc2),
+                switch_well: Color32::from_rgb(0xf2, 0xf2, 0xf2),
+                tl_nav_bar: Color32::from_rgb(0x9a, 0x9a, 0x9a),
+                tl_work_area_bar: Color32::from_rgb(0x94, 0x94, 0x94),
+                expr_bg: Color32::from_rgb(0xf2, 0xf2, 0xf2),
+                expr_text: Color32::from_rgb(0xa3, 0x34, 0x17),
                 ..dark
             },
         }
@@ -213,8 +258,9 @@ impl Tokens {
     }
 
     /// Theme tokens for the current settings: theme, UI brightness and label colours.
-    pub fn from_prefs(p: &effectcraft_engine::prefs::Prefs) -> Tokens {
-        let kind = ThemeKind::from_name(&p.appearance.theme).unwrap_or_default();
+    /// The tokens for theme `kind` (resolved from the appearance mode) with the rest of the
+    /// Appearance settings: brightness, label colours, gradients.
+    pub fn from_prefs(p: &effectcraft_engine::prefs::Prefs, kind: ThemeKind) -> Tokens {
         let mut t = Tokens::for_kind(kind).with_brightness(p.appearance.brightness as f32);
         for (i, l) in effectcraft_color::Label::ALL.iter().enumerate() {
             let [r, g, b] = p.label_rgb(*l);
@@ -254,6 +300,10 @@ impl Tokens {
             &mut self.tl_ruler_bg,
             &mut self.pasteboard,
             &mut self.work_area,
+            &mut self.fx_header,
+            &mut self.tl_graph_selected,
+            &mut self.switch_well,
+            &mut self.expr_bg,
         ] {
             adj(c);
         }
@@ -325,8 +375,9 @@ const SCRIPT_PROBES: &[(char, &str)] = &[
 /// Japanese-locale machine would be drawn with the Japanese face. The interface language is the
 /// better signal, so the probe for its script comes first — kana for Japanese, a Han character for
 /// the Chinese catalogs. Both scripts are registered, so file, layer and template names in the
-/// other one still render; then [`SCRIPT_PROBES`]. The web build has no system fonts and installs
-/// nothing.
+/// other one still render; then [`SCRIPT_PROBES`], then Hangul, since the Japanese and Chinese faces
+/// may lack it (Hiragino Sans on macOS has none). The web build has no system fonts
+/// and installs nothing.
 fn install_script_fallbacks(family_fonts: &mut FontDefinitions, language: &str) -> Vec<String> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -340,13 +391,17 @@ fn install_script_fallbacks(family_fonts: &mut FontDefinitions, language: &str) 
         // language's face draws them.
         const KANA: (char, &str) = ('あ', "japanese-system");
         const HAN: (char, &str) = ('文', "chinese-system");
+        // Hangul is probed last: with no Korean font installed the lookup can land on a catch-all
+        // face (Unifont) that also covers Arabic or Indic text but can't shape it, so the
+        // script-specific faces must be registered ahead of it. A face already seen is skipped.
+        const HANGUL: (char, &str) = ('한', "korean-system");
         // Han text follows the interface language, not the operating system's locale.
         fonts::set_cjk_locale(cjk_locale(language));
         let base = fonts::resolve("Inter", "Regular").face;
         let cjk = if is_chinese(language) { [HAN, KANA] } else { [KANA, HAN] };
         let mut names = Vec::new();
         let mut seen = Vec::new();
-        for &(probe, name) in cjk.iter().chain(SCRIPT_PROBES) {
+        for &(probe, name) in cjk.iter().chain(SCRIPT_PROBES).chain(std::iter::once(&HANGUL)) {
             let id = fonts::fallback_for(probe, base);
             if seen.contains(&id) {
                 continue;
@@ -386,8 +441,21 @@ fn is_chinese(language: &str) -> bool {
     matches!(language, "zh-hans" | "zh-hant")
 }
 
+/// egui's theme preference for an appearance mode showing a `light` (or dark) theme. Sync with
+/// System leaves it at System: a concrete preference makes egui set the native window's
+/// appearance, and on macOS a window with its own appearance no longer hears when the system's
+/// changes (#642). A fixed Light or Dark mode pins the window to match.
+pub fn theme_preference(appearance_mode: &str, light: bool) -> egui::ThemePreference {
+    match appearance_mode {
+        "auto" => egui::ThemePreference::System,
+        _ if light => egui::ThemePreference::Light,
+        _ => egui::ThemePreference::Dark,
+    }
+}
+
 pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
-    let mut v = if t.kind == ThemeKind::Light { Visuals::light() } else { Visuals::dark() };
+    let light = t.kind.is_light();
+    let mut v = if light { Visuals::light() } else { Visuals::dark() };
     v.panel_fill = t.panel_bg;
     v.window_fill = t.panel_bg;
     v.extreme_bg_color = t.field_bg;
@@ -421,8 +489,10 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
     v.widgets.active.fg_stroke = Stroke::new(1.0, t.tab_text_active);
     v.widgets.open.bg_fill = t.hover;
     v.widgets.open.weak_bg_fill = t.hover;
-    ctx.set_visuals(v);
-    ctx.global_style_mut(|s| {
+    // egui keeps one style per light/dark theme and picks it by its theme preference (see
+    // [`theme_preference`]); both get ours, so whichever it picks, egui's defaults never show.
+    ctx.all_styles_mut(|s| {
+        s.visuals = v.clone();
         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
         s.spacing.button_padding = egui::vec2(8.0, 3.0);
         s.spacing.interact_size.y = 22.0;
@@ -577,6 +647,24 @@ mod tests {
         // And an English interface leaves the operating system's locale in charge.
         let mut english = FontDefinitions::default();
         install_script_fallbacks(&mut english, "en");
+    }
+
+    #[test]
+    fn hangul_gets_a_face_when_one_is_installed() {
+        use effectcraft_text::fonts;
+        let mut fonts_def = FontDefinitions::default();
+        install_script_fallbacks(&mut fonts_def, "en");
+        let base = fonts::resolve("Inter", "Regular").face;
+        let id = fonts::fallback_for('한', base);
+        let face = fonts::face(id);
+        if !face.has_char('한') {
+            eprintln!("no Hangul font is installed: nothing to check here");
+            return;
+        }
+        let Some(font) = face.font() else { return };
+        let bytes = font.data().as_bytes();
+        let covered = fonts_def.font_data.values().any(|d| d.font.as_ref() == bytes && d.index == face.info.index);
+        assert!(covered, "a face covering Hangul must be registered with egui");
     }
 
     #[test]

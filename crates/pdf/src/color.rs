@@ -1,6 +1,9 @@
 //! Colour spaces (ISO 32000-1 §8.6) reduced to sRGB, and functions (§7.10: sampled,
 //! exponential, stitching and PostScript calculator functions).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::object::{Dict, File, Obj, decode_stream};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,9 +82,23 @@ fn lab_to_rgb(l: f64, a: f64, b: f64) -> [f64; 3] {
     })
 }
 
+/// How deep colour spaces nest (an Indexed base, the alternate of an ICCBased, Separation or
+/// DeviceN space) and, counted separately, functions (in arrays and stitching functions).
+/// References can make either a cycle, while real files nest two or three levels; anything deeper
+/// reads as unreadable (DeviceGray, an unsupported function).
+const MAX_DEPTH: usize = 8;
+
 /// Read a colour space (a name, or an array such as `[/ICCBased 5 0 R]`); named resources are
 /// looked up in `res` (`/ColorSpace`).
 pub fn color_space(file: &File, o: &Obj, res: Option<&Dict>) -> Cs {
+    color_space_at(file, o, res, 0)
+}
+
+/// [`color_space`] nested `depth` levels deep: DeviceGray past [`MAX_DEPTH`].
+fn color_space_at(file: &File, o: &Obj, res: Option<&Dict>, depth: usize) -> Cs {
+    if depth >= MAX_DEPTH {
+        return Cs::Gray;
+    }
     let o = file.resolve(o);
     match o {
         Obj::Name(n) => match n.as_str() {
@@ -90,7 +107,7 @@ pub fn color_space(file: &File, o: &Obj, res: Option<&Dict>) -> Cs {
             "DeviceCMYK" | "CMYK" => Cs::Cmyk,
             "Pattern" => Cs::Pattern,
             other => match res.and_then(|r| file.get_dict(r, "ColorSpace")).and_then(|cs| file.get(cs, other)) {
-                Some(x) if !matches!(x, Obj::Name(m) if m == other) => color_space(file, x, None),
+                Some(x) if !matches!(x, Obj::Name(m) if m == other) => color_space_at(file, x, None, depth + 1),
                 _ => Cs::Gray,
             },
         },
@@ -102,7 +119,7 @@ pub fn color_space(file: &File, o: &Obj, res: Option<&Dict>) -> Cs {
                     // The profile's alternate space when it names one (profiles are not
                     // evaluated), else the device space with the same number of components.
                     if let Some(alt) = d.and_then(|d| file.get(d, "Alternate")) {
-                        return color_space(file, alt, res);
+                        return color_space_at(file, alt, res, depth + 1);
                     }
                     let n = d.and_then(|d| file.get_num(d, "N")).unwrap_or(3.0) as usize;
                     match n {
@@ -116,8 +133,10 @@ pub fn color_space(file: &File, o: &Obj, res: Option<&Dict>) -> Cs {
                 "Lab" => Cs::Lab,
                 "Pattern" => Cs::Pattern,
                 "Indexed" | "I" => {
-                    let base = a.get(1).map(|b| color_space(file, b, res)).unwrap_or(Cs::Rgb);
-                    let hival = a.get(2).and_then(|h| file.resolve(h).num()).unwrap_or(0.0) as usize;
+                    let base = a.get(1).map(|b| color_space_at(file, b, res, depth + 1)).unwrap_or(Cs::Rgb);
+                    // An indexed palette holds at most 256 entries, so hival (its largest index) is
+                    // 0 to 255; an image builds its palette from every entry up to hival.
+                    let hival = (a.get(2).and_then(|h| file.resolve(h).num()).unwrap_or(0.0) as usize).min(255);
                     let lookup = match a.get(3).map(|l| file.resolve(l)) {
                         Some(Obj::Str(s)) => s.clone(),
                         Some(Obj::Stream(d, raw)) => decode_stream(file, d, raw).unwrap_or_default(),
@@ -127,7 +146,7 @@ pub fn color_space(file: &File, o: &Obj, res: Option<&Dict>) -> Cs {
                 }
                 "Separation" | "DeviceN" => {
                     let n = if head == "Separation" { 1 } else { a.get(1).map(|x| file.resolve(x)).and_then(Obj::array).map_or(1, <[Obj]>::len) };
-                    let alt = a.get(2).map(|b| color_space(file, b, res)).unwrap_or(Cs::Gray);
+                    let alt = a.get(2).map(|b| color_space_at(file, b, res, depth + 1)).unwrap_or(Cs::Gray);
                     let func = a.get(3).map(|f| Func::read(file, f)).unwrap_or(Func::Unsupported);
                     // An unreadable tint transform: tint 1 = black, 0 = white.
                     if func == Func::Unsupported {
@@ -158,14 +177,14 @@ pub enum Func {
         bounds: Vec<f64>,
         encode: Vec<f64>,
     },
-    /// Type 0 with one input.
+    /// Type 0 with one input. Copies share the samples (a graphics state is copied at every `q`).
     Sampled {
         domain: [f64; 2],
         size: usize,
         outputs: usize,
         encode: [f64; 2],
         decode: Vec<f64>,
-        samples: Vec<f64>,
+        samples: Arc<[f64]>,
     },
     /// Type 0 with several inputs (function-based shadings): multilinear interpolation, the
     /// first input varying fastest in the sample table.
@@ -175,7 +194,7 @@ pub enum Func {
         outputs: usize,
         encode: Vec<f64>,
         decode: Vec<f64>,
-        samples: Vec<f64>,
+        samples: Arc<[f64]>,
     },
     /// An array of one-output functions.
     Array(Vec<Func>),
@@ -202,17 +221,26 @@ fn ps_parse(lx: &mut crate::object::Lexer, depth: usize) -> Vec<PsOp> {
         match o {
             Obj::Num(n) => out.push(PsOp::Num(n)),
             Obj::Bool(b) => out.push(PsOp::Num(if b { 1.0 } else { 0.0 })),
-            Obj::Op(op) if op == "{" => {
-                if depth < 32 {
-                    out.push(PsOp::Proc(ps_parse(lx, depth + 1)));
-                }
-            }
+            Obj::Op(op) if op == "{" && depth < 32 => out.push(PsOp::Proc(ps_parse(lx, depth + 1))),
+            // Nested too deep: skip the procedure's opening brace (never push it as an operator).
+            Obj::Op(op) if op == "{" => {}
             Obj::Op(op) if op == "}" => return out,
             Obj::Op(op) => out.push(PsOp::Op(op)),
             _ => {}
         }
     }
     out
+}
+
+/// A calculator function's operand stack holds at most 100 values (the PDF specification's
+/// implementation limits); a real program uses a handful.
+const MAX_STACK: usize = 100;
+
+/// Push onto a calculator's operand stack; a full stack takes nothing more.
+fn ps_push(st: &mut Vec<f64>, v: f64) {
+    if st.len() < MAX_STACK {
+        st.push(v);
+    }
 }
 
 fn ps_run(code: &[PsOp], st: &mut Vec<f64>, depth: usize) {
@@ -222,7 +250,7 @@ fn ps_run(code: &[PsOp], st: &mut Vec<f64>, depth: usize) {
     let mut procs: Vec<&[PsOp]> = vec![];
     for op in code {
         match op {
-            PsOp::Num(n) => st.push(*n),
+            PsOp::Num(n) => ps_push(st, *n),
             PsOp::Proc(p) => procs.push(p),
             PsOp::Op(o) => {
                 let pop = |st: &mut Vec<f64>| st.pop().unwrap_or(0.0);
@@ -243,14 +271,14 @@ fn ps_run(code: &[PsOp], st: &mut Vec<f64>, depth: usize) {
                             ps_run(p, st, depth + 1);
                         }
                     }
-                    "true" => st.push(1.0),
-                    "false" => st.push(0.0),
+                    "true" => ps_push(st, 1.0),
+                    "false" => ps_push(st, 0.0),
                     "pop" => {
                         st.pop();
                     }
                     "dup" => {
                         let v = st.last().copied().unwrap_or(0.0);
-                        st.push(v);
+                        ps_push(st, v);
                     }
                     "exch" => {
                         let n = st.len();
@@ -261,15 +289,16 @@ fn ps_run(code: &[PsOp], st: &mut Vec<f64>, depth: usize) {
                     "copy" => {
                         let k = pop(st).max(0.0) as usize;
                         let n = st.len();
-                        if k <= n {
-                            let tail = st[n - k..].to_vec();
+                        // A copy that would pass the cap copies nothing.
+                        if k <= n && n + k <= MAX_STACK {
+                            let tail = st.get(n - k..).unwrap_or_default().to_vec();
                             st.extend(tail);
                         }
                     }
                     "index" => {
                         let k = pop(st).max(0.0) as usize;
-                        let v = st.len().checked_sub(k + 1).map(|i| st[i]).unwrap_or(0.0);
-                        st.push(v);
+                        let v = k.checked_add(1).and_then(|k| st.len().checked_sub(k)).and_then(|i| st.get(i)).copied().unwrap_or(0.0);
+                        ps_push(st, v);
                     }
                     "roll" => {
                         let j = pop(st) as i64;
@@ -309,7 +338,7 @@ fn ps_run(code: &[PsOp], st: &mut Vec<f64>, depth: usize) {
                         };
                         if let Some(f) = unary {
                             let x = pop(st);
-                            st.push(f(x));
+                            ps_push(st, f(x));
                             continue;
                         }
                         let y = pop(st);
@@ -325,20 +354,10 @@ fn ps_run(code: &[PsOp], st: &mut Vec<f64>, depth: usize) {
                                     0.0
                                 }
                             }
-                            "idiv" => {
-                                if y as i64 != 0 {
-                                    ((x as i64) / (y as i64)) as f64
-                                } else {
-                                    0.0
-                                }
-                            }
-                            "mod" => {
-                                if y as i64 != 0 {
-                                    ((x as i64) % (y as i64)) as f64
-                                } else {
-                                    0.0
-                                }
-                            }
+                            // `checked_*` give 0 both for a zero divisor and for the one overflowing
+                            // case, `i64::MIN / -1` (`/` and `%` panic on it in every build).
+                            "idiv" => (x as i64).checked_div(y as i64).unwrap_or(0) as f64,
+                            "mod" => (x as i64).checked_rem(y as i64).unwrap_or(0) as f64,
                             "exp" => x.powf(y),
                             "atan" => {
                                 let a = x.atan2(y).to_degrees();
@@ -358,11 +377,11 @@ fn ps_run(code: &[PsOp], st: &mut Vec<f64>, depth: usize) {
                                 (if s >= 0 { v << s.min(62) } else { v >> (-s).min(62) }) as f64
                             }
                             _ => {
-                                st.push(x);
+                                ps_push(st, x);
                                 y
                             }
                         };
-                        st.push(v);
+                        ps_push(st, v);
                     }
                 }
             }
@@ -370,11 +389,111 @@ fn ps_run(code: &[PsOp], st: &mut Vec<f64>, depth: usize) {
     }
 }
 
+/// The most `f64`s one sampled table holds: 16 Mi (128 MiB), room for a 33 × 33 × 33 × 33 grid
+/// with four outputs (4_743_684 samples). One table this large is allowed; what stops a file from
+/// building many of them is [`Budget`], which caps the samples decoded across a whole
+/// [`Func::read`] at the same figure.
+const MAX_SAMPLES: usize = 1 << 24;
+
+/// The most inputs or outputs of a function: no colour space has more than 32 components (the most
+/// a DeviceN space may have), so a sampled function needs no more. Also the most one-output
+/// functions a [`Func::Array`] holds (one per output). It is NOT a limit on the pieces of a
+/// stitching function — a repeating gradient lists one piece once per repeat, often many more.
+const MAX_IO: usize = 32;
+
+/// The most `Func` nodes one top-level [`Func::read`] builds, across the whole structure of
+/// references. A real function is a handful of nodes; a cyclic or fan-out reference graph would
+/// build far more, so past this the whole function is unreadable. It is a soft limit, and the only
+/// one on the pieces of a stitching function: past it a colour space takes its fallback (a
+/// Separation tint reads as grey), nothing unsafe.
+const MAX_NODES: usize = 10_000;
+
+/// Samples in a table of `total` entries × `outputs`; `None` when that overflows or passes
+/// [`MAX_SAMPLES`].
+fn sample_count(total: usize, outputs: usize) -> Option<usize> {
+    total.checked_mul(outputs).filter(|n| *n <= MAX_SAMPLES)
+}
+
+/// What one top-level [`Func::read`] may build before the whole function is treated as unreadable:
+/// a running cap on `Func` nodes and on sampled-table samples across the entire structure, so a
+/// reference graph that is cyclic or fans out (one object listed many times at each of several
+/// levels) cannot build an unbounded tree or decode unbounded memory. Samples of a table shared by
+/// repeat references (one `Arc`) are charged once; its nodes are charged per copy.
+struct Budget {
+    nodes: usize,
+    samples: usize,
+    /// Set once either cap is passed; the top-level read then yields [`Func::Unsupported`].
+    overrun: bool,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Budget { nodes: MAX_NODES, samples: MAX_SAMPLES, overrun: false }
+    }
+
+    /// Charge `n` nodes; `false` (and the read is abandoned) once the cap is passed.
+    fn take_nodes(&mut self, n: usize) -> bool {
+        match self.nodes.checked_sub(n) {
+            Some(left) => {
+                self.nodes = left;
+                true
+            }
+            None => {
+                self.overrun = true;
+                false
+            }
+        }
+    }
+
+    /// Charge `n` samples; `false` once the cap is passed.
+    fn take_samples(&mut self, n: usize) -> bool {
+        match self.samples.checked_sub(n) {
+            Some(left) => {
+                self.samples = left;
+                true
+            }
+            None => {
+                self.overrun = true;
+                false
+            }
+        }
+    }
+}
+
+/// `v` limited to the range between `a` and `b`, in either order. Unlike [`f64::clamp`] this never
+/// panics, whether a file gives the bounds reversed (`/Domain [1 0]`) or a bound is NaN.
+fn clamp(v: f64, a: f64, b: f64) -> f64 {
+    let (lo, hi) = (a.min(b), a.max(b));
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
 impl Func {
     pub fn read(file: &File, o: &Obj) -> Func {
+        let mut budget = Budget::new();
+        let f = Func::read_at(file, o, 0, &mut budget);
+        // Either cap passed anywhere in the structure: the whole function is unreadable.
+        if budget.overrun { Func::Unsupported } else { f }
+    }
+
+    /// [`Func::read`] nested `depth` levels deep, charging `budget`: unsupported past [`MAX_DEPTH`]
+    /// or once the budget is spent.
+    fn read_at(file: &File, o: &Obj, depth: usize, budget: &mut Budget) -> Func {
+        if depth >= MAX_DEPTH || !budget.take_nodes(1) {
+            return Func::Unsupported;
+        }
         let o = file.resolve(o);
         if let Obj::Array(a) = o {
-            return Func::Array(a.iter().map(|f| Func::read(file, f)).collect());
+            // An array of one-output functions: one per output, so at most `MAX_IO`.
+            if a.len() > MAX_IO {
+                return Func::Unsupported;
+            }
+            return Func::read_all(file, a, depth + 1, budget).map_or(Func::Unsupported, Func::Array);
         }
         let Some(d) = o.dict() else { return Func::Unsupported };
         let dom = file.get(d, "Domain").map(|x| file.nums(x)).unwrap_or_default();
@@ -386,12 +505,21 @@ impl Func {
                 c1: file.get(d, "C1").map(|x| file.nums(x)).unwrap_or_else(|| vec![1.0]),
                 n: file.get_num(d, "N").unwrap_or(1.0),
             },
-            3 => Func::Stitch {
-                domain,
-                funcs: file.get(d, "Functions").and_then(Obj::array).map(|a| a.iter().map(|f| Func::read(file, f)).collect()).unwrap_or_default(),
-                bounds: file.get(d, "Bounds").map(|x| file.nums(x)).unwrap_or_default(),
-                encode: file.get(d, "Encode").map(|x| file.nums(x)).unwrap_or_default(),
-            },
+            3 => {
+                // A stitching function's pieces: no element cap (a repeating gradient lists one
+                // piece once per repeat); the budget bounds the total work.
+                let funcs = match file.get(d, "Functions").and_then(Obj::array) {
+                    Some(a) => Func::read_all(file, a, depth + 1, budget),
+                    None => Some(vec![]),
+                };
+                let Some(funcs) = funcs else { return Func::Unsupported };
+                Func::Stitch {
+                    domain,
+                    funcs,
+                    bounds: file.get(d, "Bounds").map(|x| file.nums(x)).unwrap_or_default(),
+                    encode: file.get(d, "Encode").map(|x| file.nums(x)).unwrap_or_default(),
+                }
+            }
             0 => {
                 let Obj::Stream(sd, raw) = o else { return Func::Unsupported };
                 let Some(data) = decode_stream(file, sd, raw) else { return Func::Unsupported };
@@ -400,26 +528,31 @@ impl Func {
                 let bps = file.get_num(d, "BitsPerSample").unwrap_or(8.0) as usize;
                 let range = file.get(d, "Range").map(|x| file.nums(x)).unwrap_or_default();
                 let outputs = range.len() / 2;
-                if size == 0 || outputs == 0 || !matches!(bps, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
+                if size == 0 || outputs == 0 || outputs > MAX_IO || sizes.len() > MAX_IO || !matches!(bps, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
                     return Func::Unsupported;
                 }
                 let total = sizes.iter().try_fold(1usize, |a, b| a.checked_mul(*b)).filter(|t| *t > 0 && *t <= 1 << 22);
                 let Some(total) = total else { return Func::Unsupported };
+                let Some(count) = sample_count(total, outputs) else { return Func::Unsupported };
+                if !budget.take_samples(count) {
+                    return Func::Unsupported;
+                }
                 let enc = file.get(d, "Encode").map(|x| file.nums(x)).unwrap_or_default();
                 let encode = [enc.first().copied().unwrap_or(0.0), enc.get(1).copied().unwrap_or(size as f64 - 1.0)];
                 let decode = file.get(d, "Decode").map(|x| file.nums(x)).filter(|v| v.len() >= outputs * 2).unwrap_or_else(|| range.clone());
                 let max = ((1u64 << bps) - 1) as f64;
-                let mut samples = Vec::with_capacity(size * outputs);
                 let mut bit = 0usize;
-                for _ in 0..total * outputs {
-                    let mut v = 0u64;
-                    for _ in 0..bps {
-                        let byte = data.get(bit / 8).copied().unwrap_or(0);
-                        v = (v << 1) | ((byte >> (7 - bit % 8)) & 1) as u64;
-                        bit += 1;
-                    }
-                    samples.push(v as f64 / max);
-                }
+                let samples: Arc<[f64]> = (0..count)
+                    .map(|_| {
+                        let mut v = 0u64;
+                        for _ in 0..bps {
+                            let byte = data.get(bit / 8).copied().unwrap_or(0);
+                            v = (v << 1) | ((byte >> (7 - bit % 8)) & 1) as u64;
+                            bit += 1;
+                        }
+                        v as f64 / max
+                    })
+                    .collect();
                 if sizes.len() > 1 {
                     let m = sizes.len();
                     let encode =
@@ -444,22 +577,59 @@ impl Func {
         }
     }
 
+    /// The functions of an array (of one-output functions, or a stitching function's
+    /// `/Functions`) read at `depth`, charging `budget`; `None` once the budget is spent. An object
+    /// the array refers to more than once is read once and copied: the copies share its samples
+    /// (one `Arc`, charged once), but each copy is charged its nodes again — so a reference listed
+    /// many times at each of several levels spends the node budget quickly rather than expanding.
+    fn read_all(file: &File, a: &[Obj], depth: usize, budget: &mut Budget) -> Option<Vec<Func>> {
+        let mut cache: HashMap<(u32, u16), (Func, usize)> = HashMap::new();
+        let mut funcs = Vec::with_capacity(a.len());
+        for o in a {
+            if budget.overrun {
+                return None;
+            }
+            let f = match o {
+                Obj::Ref(n, g) => {
+                    if let Some((cached, cost)) = cache.get(&(*n, *g)) {
+                        let (cached, cost) = (cached.clone(), *cost);
+                        if !budget.take_nodes(cost) {
+                            return None;
+                        }
+                        cached
+                    } else {
+                        let before = budget.nodes;
+                        let f = Func::read_at(file, o, depth, budget);
+                        let cost = before.saturating_sub(budget.nodes);
+                        cache.insert((*n, *g), (f.clone(), cost));
+                        f
+                    }
+                }
+                _ => Func::read_at(file, o, depth, budget),
+            };
+            funcs.push(f);
+        }
+        Some(funcs)
+    }
+
     /// Evaluate at the first input (the functions used by shadings and tints take one input
     /// in practice; extra inputs of DeviceN tints are averaged in).
     pub fn eval(&self, input: &[f64]) -> Vec<f64> {
         if let Func::Calc { domain, range, code } = self {
+            // The inputs start the operand stack, which holds at most `MAX_STACK` values.
             let mut st: Vec<f64> = input
                 .iter()
+                .take(MAX_STACK)
                 .enumerate()
                 .map(|(i, v)| match (domain.get(2 * i), domain.get(2 * i + 1)) {
-                    (Some(a), Some(b)) => v.clamp(a.min(*b), a.max(*b)),
+                    (Some(a), Some(b)) => clamp(*v, *a, *b),
                     _ => *v,
                 })
                 .collect();
             ps_run(code, &mut st, 0);
             let n = range.len() / 2;
             let k = st.len().saturating_sub(n);
-            return st[k..].iter().enumerate().map(|(i, v)| v.clamp(range[2 * i], range[2 * i + 1])).collect();
+            return st.get(k..).unwrap_or_default().iter().zip(range.as_chunks::<2>().0).map(|(v, [a, b])| clamp(*v, *a, *b)).collect();
         }
         match self {
             Func::SampledN { domain, size, outputs, encode, decode, samples } => {
@@ -470,9 +640,9 @@ impl Func {
                 for i in 0..m {
                     let x = input.get(i).copied().unwrap_or(0.0);
                     let (d0, d1) = (domain[2 * i], domain[2 * i + 1]);
-                    let x = x.clamp(d0.min(d1), d0.max(d1));
+                    let x = clamp(x, d0, d1);
                     let e = if d1 != d0 { encode[2 * i] + (x - d0) / (d1 - d0) * (encode[2 * i + 1] - encode[2 * i]) } else { encode[2 * i] };
-                    let e = if e.is_finite() { e.clamp(0.0, size[i] as f64 - 1.0) } else { 0.0 };
+                    let e = if e.is_finite() { clamp(e, 0.0, size[i] as f64 - 1.0) } else { 0.0 };
                     base[i] = e.floor() as usize;
                     frac[i] = e - e.floor();
                 }
@@ -510,7 +680,7 @@ impl Func {
     pub fn eval1(&self, t: f64) -> Vec<f64> {
         match self {
             Func::Exp { domain, c0, c1, n } => {
-                let t = t.clamp(domain[0].min(domain[1]), domain[0].max(domain[1]));
+                let t = clamp(t, domain[0], domain[1]);
                 let x = if *n == 1.0 { t } else { t.max(0.0).powf(*n) };
                 (0..c0.len().max(c1.len()))
                     .map(|i| c0.get(i).copied().unwrap_or(0.0) + x * (c1.get(i).copied().unwrap_or(1.0) - c0.get(i).copied().unwrap_or(0.0)))
@@ -520,7 +690,7 @@ impl Func {
                 if funcs.is_empty() {
                     return vec![0.0];
                 }
-                let t = t.clamp(domain[0], domain[1]);
+                let t = clamp(t, domain[0], domain[1]);
                 let k = bounds.iter().take_while(|b| t >= **b).count().min(funcs.len() - 1);
                 let lo = if k == 0 { domain[0] } else { bounds[k - 1] };
                 let hi = bounds.get(k).copied().unwrap_or(domain[1]);
@@ -529,9 +699,9 @@ impl Func {
                 funcs[k].eval1(u)
             }
             Func::Sampled { domain, size, outputs, encode, decode, samples } => {
-                let t = t.clamp(domain[0], domain[1]);
+                let t = clamp(t, domain[0], domain[1]);
                 let e = if domain[1] > domain[0] { encode[0] + (t - domain[0]) / (domain[1] - domain[0]) * (encode[1] - encode[0]) } else { encode[0] };
-                let e = e.clamp(0.0, *size as f64 - 1.0);
+                let e = clamp(e, 0.0, *size as f64 - 1.0);
                 let (i0, f) = (e.floor() as usize, e.fract());
                 let i1 = (i0 + 1).min(size - 1);
                 (0..*outputs)
@@ -574,6 +744,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sample_count_at_and_over_the_cap() {
+        // 4 Mi entries × 4 outputs fill the cap exactly; a fifth output passes it.
+        assert_eq!(sample_count(1 << 22, 4), Some(MAX_SAMPLES));
+        assert_eq!(sample_count(1 << 22, 5), None);
+        // A 33 × 33 × 33 × 33 grid with four outputs fits (4_743_684 samples, under the cap, so
+        // `Some`).
+        assert_eq!(sample_count(33 * 33 * 33 * 33, 4), Some(4_743_684));
+        // A product that overflows is refused (on 64-bit targets that takes a `/Range` of at least
+        // 2^41 numbers, too big to build in a test).
+        assert_eq!(sample_count(1 << 22, usize::MAX / (1 << 22) + 1), None);
+    }
+
+    #[test]
     fn calculator_functions() {
         // Two inputs → three outputs: { 2 copy mul 3 1 roll add 2 div  dup 0.5 gt { pop 1 } if  0 }
         let code = b"{ 2 copy mul 3 1 roll add 2 div dup 0.5 gt { pop 1 } { 0.25 mul } ifelse 0 }";
@@ -582,5 +765,63 @@ mod tests {
         let f = Func::Calc { domain: vec![0.0, 1.0, 0.0, 1.0], range: vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0], code };
         assert_eq!(f.eval(&[0.5, 0.4]), vec![0.2, 0.1125, 0.0]);
         assert_eq!(f.eval(&[1.0, 0.8]), vec![0.8, 1.0, 0.0]);
+    }
+
+    /// Run the calculator program `{ src }` on the stack `st`.
+    fn run(src: &str, mut st: Vec<f64>) -> Vec<f64> {
+        let src = format!("{{ {src} }}");
+        let mut lx = crate::object::Lexer::new(src.as_bytes(), 0);
+        let Some(PsOp::Proc(code)) = ps_parse(&mut lx, 0).into_iter().next() else { panic!() };
+        ps_run(&code, &mut st, 0);
+        st
+    }
+
+    #[test]
+    fn calculator_stack_holds_at_most_100_values() {
+        // `1 copy 2 copy 4 copy …`: 40 doublings asked for 2^40 values (8 TiB). The copies stop at
+        // 64 values, since the next would pass 100.
+        let doublings: String = (0..40).map(|i| format!("{} copy ", 1u64 << i)).collect();
+        assert_eq!(run(&doublings, vec![0.0]).len(), 64);
+        // A copy up to exactly 100 values is made; after it nothing grows the stack.
+        let fifty: Vec<f64> = (0..50).map(f64::from).collect();
+        let full = run("50 copy", fifty.clone());
+        assert_eq!(full.len(), 100);
+        assert_eq!(full[50..], fifty[..]);
+        for op in ["7", "true", "false", "dup", "0 index", "1 copy", "neg", "add", "nonsense"] {
+            assert!(run(op, full.clone()).len() <= 100, "{op}");
+        }
+        // Nor does a long program without loops: one push per operator, up to the cap.
+        for op in ["1 ", "true ", "dup ", "0 index "] {
+            assert_eq!(run(&op.repeat(1000), vec![1.0]).len(), 100, "{op}");
+        }
+    }
+
+    #[test]
+    fn calculator_index_past_the_stack_pushes_zero() {
+        // 10^20 is past usize::MAX: `k + 1` overflowed (a panic), or wrapped to read past the stack.
+        assert_eq!(run("99999999999999999999 index", vec![1.0, 2.0]), vec![1.0, 2.0, 0.0]);
+        assert_eq!(run("2 index", vec![1.0, 2.0]), vec![1.0, 2.0, 0.0]);
+        assert_eq!(run("1 index", vec![1.0, 2.0]), vec![1.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn calculator_copy_index_and_roll_below_the_cap() {
+        assert_eq!(run("3 copy 1 index 4 1 roll", vec![1.0, 2.0, 3.0]), vec![1.0, 2.0, 3.0, 2.0, 1.0, 2.0, 3.0]);
+        assert_eq!(run("3 -1 roll dup", vec![1.0, 2.0, 3.0]), vec![2.0, 3.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn calculator_idiv_and_mod_of_i64_min_by_minus_one() {
+        // `i64::MIN / -1` and `i64::MIN % -1` overflow and panic (in debug and release); `idiv` and
+        // `mod` must fall back like a zero divisor does. -2^63 is below any f64 the program sees,
+        // but the cast saturates to i64::MIN, which is enough to trigger it.
+        let min = -(2f64.powi(63));
+        assert_eq!(run("idiv", vec![min, -1.0]), vec![0.0]);
+        assert_eq!(run("mod", vec![min, -1.0]), vec![0.0]);
+        // Divide by zero still gives 0, ordinary division still works.
+        assert_eq!(run("idiv", vec![7.0, 0.0]), vec![0.0]);
+        assert_eq!(run("mod", vec![7.0, 0.0]), vec![0.0]);
+        assert_eq!(run("idiv", vec![7.0, 2.0]), vec![3.0]);
+        assert_eq!(run("mod", vec![7.0, 2.0]), vec![1.0]);
     }
 }

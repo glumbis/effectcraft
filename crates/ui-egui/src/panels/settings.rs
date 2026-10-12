@@ -8,12 +8,12 @@
 //! `settings.cancel`, `settings.previous`, `settings.next`.
 
 use crate::i18n::{tr, tr_args};
-use effectcraft_engine::prefs::{Item, Kind, Page, pages};
+use effectcraft_engine::prefs::{APPEARANCE_MODES, DARK_THEMES, Item, Kind, LIGHT_THEMES, Page, pages};
 use effectcraft_engine::segment::Task;
-use egui::{Color32, RichText, vec2};
+use egui::{Color32, Rect, RichText, vec2};
 use serde_json::{Value, json};
 
-use crate::theme::Tokens;
+use crate::theme::{ThemeKind, Tokens};
 use crate::{Dialog, EffectcraftApp};
 
 /// Open the dialog on a page, remembering the settings for Cancel.
@@ -38,6 +38,12 @@ fn hex(c: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
+/// sRGB components (0–1) as bytes.
+fn srgb_bytes(c: [f32; 3]) -> [u8; 3] {
+    let col = crate::widgets::srgb32(c);
+    [col.r(), col.g(), col.b()]
+}
+
 fn reg(app: &mut EffectcraftApp, id: &str, r: &egui::Response, label: &str) {
     app.auto.add(id, r.rect, label);
 }
@@ -50,14 +56,14 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
         match *item {
             Item::Section(title) => {
                 ui.add_space(6.0);
-                ui.label(RichText::new(title).font(Tokens::semibold(12.5)).color(t.tab_text_active));
+                ui.label(RichText::new(tr(title)).font(Tokens::semibold(12.5)).color(t.tab_text_active));
                 ui.separator();
             }
             Item::Note(text) => {
-                ui.label(RichText::new(text).color(t.text_dim));
+                ui.label(RichText::new(tr(text)).color(t.text_dim));
             }
             Item::Button { label, command, params } => {
-                let r = ui.button(label);
+                let r = ui.button(tr(label));
                 reg(app, &format!("settings.button.{}", label.trim_end_matches('.')), &r, label);
                 if r.clicked() {
                     acts.push(Act::Run(command.into(), serde_json::from_str(params).unwrap_or(json!({}))));
@@ -88,6 +94,10 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                     ui.label(RichText::new(tr("No device list from this host; the system default output is used.")).color(t.text_dim));
                 }
             }
+            // Appearance Mode with the light and dark theme cards (the per-mode themes are
+            // chosen on the cards).
+            Item::Setting { key: "appearance.appearanceMode", .. } => appearance_ui(app, ui, cur, t, acts),
+            Item::Setting { key: "appearance.lightTheme" | "appearance.darkTheme", .. } => {}
             Item::Setting { key, label, kind, live } => {
                 let v = get(key);
                 let id = format!("settings.{key}");
@@ -96,7 +106,7 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                 match kind {
                     Kind::Bool => {
                         let mut b = v.as_bool().unwrap_or(false);
-                        let r = ui.checkbox(&mut b, label);
+                        let r = ui.checkbox(&mut b, tr(label));
                         if r.changed() {
                             acts.push(Act::Set(key.into(), json!(b)));
                         }
@@ -104,11 +114,14 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                     }
                     _ => {
                         ui.horizontal(|ui| {
-                            ui.add_sized(vec2(label_w, 18.0), egui::Label::new(format!("{label}:")).truncate());
+                            ui.add_sized(vec2(label_w, 18.0), egui::Label::new(format!("{}:", tr(label))).truncate());
                             let r = match kind {
                                 Kind::Int(lo, hi, unit) => {
                                     let mut x = v.as_i64().unwrap_or(0);
-                                    let r = ui.add(egui::DragValue::new(&mut x).range(lo..=hi).speed(0.25));
+                                    // A typed number applies once entered: typing 85 into UI Scale
+                                    // doesn't resize the interface to 75 % at its first digit.
+                                    let drag = egui::DragValue::new(&mut x).range(lo..=hi).speed(0.25).update_while_editing(false);
+                                    let r = ui.add(crate::widgets::drag_value(drag));
                                     if !unit.is_empty() {
                                         ui.label(RichText::new(unit).color(t.text_dim));
                                     }
@@ -119,7 +132,7 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                                 }
                                 Kind::Float(lo, hi, unit) => {
                                     let mut x = v.as_f64().unwrap_or(0.0);
-                                    let r = ui.add(egui::DragValue::new(&mut x).range(lo..=hi).speed(0.1).max_decimals(3));
+                                    let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut x).range(lo..=hi).speed(0.1).max_decimals(3)));
                                     if !unit.is_empty() {
                                         ui.label(RichText::new(unit).color(t.text_dim));
                                     }
@@ -142,15 +155,14 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                                     r
                                 }
                                 Kind::Choice(opts) => {
-                                    // (A number with choices, UI Scale, shows as its text.)
                                     let curv = v.as_str().map_or_else(|| v.to_string(), str::to_string);
                                     let shown = opts.iter().find(|o| o.1 == curv).map(|o| o.0).unwrap_or(curv.as_str()).to_string();
                                     egui::ComboBox::from_id_salt(("settings", key))
-                                        .selected_text(shown)
+                                        .selected_text(tr(&shown))
                                         .width(220.0)
                                         .show_ui(ui, |ui| {
                                             for (l, val) in opts {
-                                                if ui.selectable_label(*val == curv, *l).clicked() {
+                                                if ui.selectable_label(*val == curv, tr(l)).clicked() {
                                                     acts.push(Act::Set(key.into(), json!(val)));
                                                 }
                                             }
@@ -174,8 +186,9 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                                 }
                                 Kind::Color => {
                                     let c = crate::panels::viewer::hex_rgb(v.as_str().unwrap_or("")).unwrap_or([128, 128, 128]);
-                                    let mut rgb = c;
-                                    let r = ui.color_edit_button_srgb(&mut rgb);
+                                    let mut f = c.map(|v| v as f32 / 255.0);
+                                    let r = crate::widgets::srgb_color_button(ui, &mut f);
+                                    let rgb = if r.changed() { srgb_bytes(f) } else { c };
                                     ui.label(RichText::new(hex(rgb)).monospace().color(t.text_dim));
                                     if rgb != c {
                                         acts.push(Act::Set(key.into(), json!(hex(rgb))));
@@ -199,6 +212,194 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
             }
         }
     }
+}
+
+/// A small EffectCraft window painted with theme `kind`'s tokens: the Tools bar, the Project
+/// panel, the Composition panel, the Preview and Properties column and the Timeline with its
+/// layer bars.
+fn theme_preview(ui: &mut egui::Ui, kind: ThemeKind, width: f32) {
+    use egui::{Rect, pos2};
+    let p = Tokens::for_kind(kind);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 118.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, p.app_bg);
+    let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 13.0));
+    painter.rect_filled(bar, 0.0, p.header_bg);
+    // The brand mark, the tools (the Selection tool is active) and the Discord pill.
+    painter.rect_filled(Rect::from_min_size(bar.min + vec2(4.0, 3.0), vec2(7.0, 7.0)), 2.0, p.accent);
+    for i in 0..7 {
+        let c = if i == 0 { p.accent } else { p.icon };
+        painter.rect_filled(Rect::from_min_size(bar.min + vec2(16.0 + i as f32 * 8.0, 4.0), vec2(5.0, 5.0)), 1.0, c);
+    }
+    painter.rect_filled(
+        Rect::from_min_max(pos2(bar.right() - 22.0, bar.top() + 3.0), pos2(bar.right() - 4.0, bar.bottom() - 3.0)),
+        3.5,
+        egui::Color32::from_rgb(0x58, 0x65, 0xf2),
+    );
+    let gap = 2.0;
+    let body = Rect::from_min_max(pos2(rect.left() + gap, bar.bottom() + gap), pos2(rect.right() - gap, rect.bottom() - gap));
+    let right_w = (body.width() * 0.22).round();
+    let timeline_h = (body.height() * 0.42).round();
+    let left_w = (body.width() * 0.2).round();
+    let upper = Rect::from_min_max(body.min, pos2(body.right() - right_w - gap, body.bottom() - timeline_h - gap));
+    let panel = |r: Rect, title_w: f32| {
+        painter.rect_filled(r, 2.0, p.panel_bg);
+        painter.rect_filled(Rect::from_min_size(r.min + vec2(4.0, 3.0), vec2(title_w, 2.0)), 1.0, p.tab_text_active);
+    };
+    // Project panel: rows with label swatches.
+    let project = Rect::from_min_max(upper.min, pos2(upper.left() + left_w, upper.bottom()));
+    panel(project, 14.0);
+    for (i, label) in [5usize, 5, 2, 2].into_iter().enumerate() {
+        let y = project.top() + 10.0 + i as f32 * 6.0;
+        painter.rect_filled(Rect::from_min_size(pos2(project.left() + 4.0, y), vec2(3.0, 3.0)), 0.5, p.labels.get(label).copied().unwrap_or(p.icon));
+        painter.rect_filled(Rect::from_min_size(pos2(project.left() + 9.0, y + 0.5), vec2(project.width() * 0.45, 2.0)), 1.0, p.text_dim);
+    }
+    // Composition panel: the pasteboard and the comp frame with a title.
+    let comp = Rect::from_min_max(pos2(project.right() + gap, upper.top()), upper.max);
+    panel(comp, 22.0);
+    let paste = Rect::from_min_max(comp.min + vec2(2.0, 8.0), comp.max - vec2(2.0, 2.0));
+    painter.rect_filled(paste, 0.0, p.pasteboard);
+    let frame_h = (paste.height() - 6.0).max(4.0);
+    let frame = Rect::from_center_size(paste.center(), vec2((frame_h * 16.0 / 9.0).min(paste.width() - 6.0), frame_h));
+    painter.rect_filled(frame, 0.0, egui::Color32::from_rgb(0x14, 0x1c, 0x4a));
+    painter.circle_stroke(frame.center(), frame.height() * 0.36, egui::Stroke::new(0.8, egui::Color32::from_rgb(0x4a, 0x7c, 0xe8)));
+    painter.rect_filled(Rect::from_center_size(frame.center(), vec2(frame.width() * 0.5, 2.5)), 1.0, egui::Color32::WHITE);
+    // Preview and Properties.
+    let column = Rect::from_min_max(pos2(body.right() - right_w, body.top()), body.max);
+    let preview = Rect::from_min_max(column.min, pos2(column.right(), column.top() + column.height() * 0.3));
+    panel(preview, 12.0);
+    painter.rect_filled(Rect::from_min_size(preview.left_bottom() + vec2(4.0, -5.0), vec2(preview.width() * 0.25, 1.5)), 0.5, p.cache_green);
+    let props = Rect::from_min_max(pos2(column.left(), preview.bottom() + gap), column.max);
+    panel(props, 18.0);
+    for i in 0..5 {
+        let y = props.top() + 10.0 + i as f32 * 6.0;
+        painter.rect_filled(Rect::from_min_size(pos2(props.left() + 4.0, y), vec2(props.width() * 0.35, 2.0)), 1.0, p.text_dim);
+        painter.rect_filled(Rect::from_min_size(pos2(props.left() + props.width() * 0.55, y), vec2(props.width() * 0.25, 2.0)), 1.0, p.hot_text);
+    }
+    // Timeline: the layer list and the time graph, with coloured layer bars and the time marker.
+    let timeline = Rect::from_min_max(pos2(body.left(), upper.bottom() + gap), pos2(upper.right(), body.bottom()));
+    panel(timeline, 18.0);
+    painter.rect_filled(Rect::from_min_size(timeline.min + vec2(4.0, 8.0), vec2(14.0, 3.0)), 1.0, p.timecode);
+    let graph = Rect::from_min_max(pos2(timeline.left() + timeline.width() * 0.38, timeline.top() + 8.0), timeline.max - vec2(2.0, 2.0));
+    painter.rect_filled(graph, 0.0, p.tl_bg);
+    painter.rect_filled(Rect::from_min_size(graph.min, vec2(graph.width(), 4.0)), 0.0, p.tl_ruler_bg);
+    for (i, label) in [1usize, 1, 8, 8, 1].into_iter().enumerate() {
+        let y = graph.top() + 7.0 + i as f32 * 5.5;
+        if y + 3.5 > graph.bottom() {
+            break;
+        }
+        let swatch = p.labels.get(label).copied().unwrap_or(p.icon);
+        let row_l = timeline.left() + 4.0;
+        if i == 1 {
+            painter.rect_filled(Rect::from_min_max(pos2(timeline.left(), y - 1.0), pos2(graph.left(), y + 4.5)), 0.0, p.row_selected);
+        }
+        painter.rect_filled(Rect::from_min_size(pos2(row_l, y), vec2(3.0, 3.0)), 0.5, swatch);
+        painter.rect_filled(Rect::from_min_size(pos2(row_l + 6.0, y + 0.5), vec2(graph.left() - row_l - 14.0, 2.0)), 1.0, p.text_dim);
+        let bar = Rect::from_min_max(pos2(graph.left() + 1.0, y), pos2(graph.right() - 1.0, y + 3.5));
+        painter.rect_filled(bar, 1.0, swatch.gamma_multiply(0.8));
+    }
+    let cti = graph.left() + graph.width() * 0.3;
+    painter.line_segment([pos2(cti, graph.top()), pos2(cti, graph.bottom())], egui::Stroke::new(1.0, p.cti));
+}
+
+/// One theme family's card: its (translated) name, Active when the appearance shows it now, a preview of the
+/// chosen theme and a radio button per theme.
+fn theme_card(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    key: &str,
+    title: &str,
+    active: bool,
+    cur: &str,
+    options: &[(&str, &str)],
+    acts: &mut Vec<Act>,
+) {
+    egui::Frame::new()
+        .fill(t.field_bg)
+        .stroke(egui::Stroke::new(1.0, if active { t.accent } else { t.field_border }))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).font(Tokens::semibold(12.5)).color(t.text));
+                if active {
+                    ui.label(RichText::new(tr("Active")).color(t.accent).small());
+                }
+            });
+            ui.add_space(4.0);
+            let kind = ThemeKind::from_name(cur).unwrap_or(if key.ends_with("lightTheme") { ThemeKind::Light } else { ThemeKind::Dark });
+            theme_preview(ui, kind, ui.available_width());
+            ui.add_space(4.0);
+            for (label, value) in options {
+                let row = egui::Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 24.0));
+                let hovered = ui.ctx().pointer_hover_pos().is_some_and(|p| row.contains(p));
+                ui.horizontal(|ui| {
+                    let r = ui.radio(cur == *value, tr(label));
+                    reg(app, &format!("settings.{key}.{value}"), &r, label);
+                    if r.clicked() && cur != *value {
+                        acts.push(Act::Set(key.into(), json!(value)));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut favorites = app.session.prefs.appearance.favorite_themes.clone();
+                        let favorite = favorites.iter().any(|id| id == value);
+                        let tip = tr(if favorite { "Remove from favorites" } else { "Add to favorites" });
+                        let r = ui.add_visible(favorite || hovered, egui::Button::new("").min_size(vec2(24.0, 24.0)).frame(false)).on_hover_text(tip);
+                        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{}: {}", tip, tr(label))));
+                        reg(app, &format!("settings.appearance.favoriteThemes.{value}"), &r, tip);
+                        if favorite || hovered {
+                            crate::icons::paint(
+                                ui.painter(),
+                                r.rect.shrink(4.0),
+                                if favorite { crate::icons::Icon::StarFilled } else { crate::icons::Icon::Star },
+                                if favorite { t.accent } else { t.text_dim },
+                            );
+                        }
+                        if r.clicked() {
+                            if favorite {
+                                favorites.retain(|id| id != value);
+                            } else {
+                                favorites.push((*value).into());
+                            }
+                            acts.push(Act::Set("appearance.favoriteThemes".into(), json!(favorites)));
+                        }
+                    });
+                });
+            }
+        });
+}
+
+/// Settings ▸ Appearance: Appearance Mode (Sync with System, Dark, Light) above the light and dark
+/// theme cards.
+fn appearance_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, cur: &Value, t: &Tokens, acts: &mut Vec<Act>) {
+    let get = |key: &str| cur.pointer(&format!("/appearance/{key}")).and_then(Value::as_str).unwrap_or_default().to_string();
+    let (mode, light, dark) = (get("appearanceMode"), get("lightTheme"), get("darkTheme"));
+    ui.horizontal(|ui| {
+        ui.add_sized(vec2(250.0, 18.0), egui::Label::new(format!("{}:", tr("Appearance Mode"))).truncate());
+        let shown = APPEARANCE_MODES.iter().find(|(_, v)| *v == mode).map_or(mode.as_str(), |(l, _)| *l);
+        let r = egui::ComboBox::from_id_salt(("settings", "appearance.appearanceMode"))
+            .selected_text(tr(shown))
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                for (l, v) in APPEARANCE_MODES {
+                    if ui.selectable_label(*v == mode, tr(l)).clicked() {
+                        acts.push(Act::Set("appearance.appearanceMode".into(), json!(v)));
+                    }
+                }
+            })
+            .response;
+        reg(app, "settings.appearance.appearanceMode", &r, "Appearance Mode");
+    });
+    ui.add_space(6.0);
+    let system_light = app.system_light(ui.ctx());
+    let light_active = mode == "light" || (mode == "auto" && system_light == Some(true));
+    ui.columns(2, |cols| {
+        let [l, d] = cols else { return };
+        theme_card(app, l, t, "appearance.lightTheme", tr("Light Theme"), light_active, &light, LIGHT_THEMES, acts);
+        theme_card(app, d, t, "appearance.darkTheme", tr("Dark Theme"), !light_active, &dark, DARK_THEMES, acts);
+    });
+    ui.add_space(6.0);
 }
 
 /// Bytes as "12.3 MB".
@@ -395,8 +596,9 @@ fn labels_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, cur: &Value, acts: &mu
     egui::Grid::new("settings-labels").num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
         for (i, l) in labels.iter().enumerate() {
             let c = crate::panels::viewer::hex_rgb(l["color"].as_str().unwrap_or("")).unwrap_or([128, 128, 128]);
-            let mut rgb = c;
-            let r = ui.color_edit_button_srgb(&mut rgb);
+            let mut f = c.map(|v| v as f32 / 255.0);
+            let r = crate::widgets::srgb_color_button(ui, &mut f);
+            let rgb = if r.changed() { srgb_bytes(f) } else { c };
             app.auto.add(&format!("settings.labels.{i}.color"), r.rect, "label colour");
             if rgb != c {
                 acts.push(Act::Set(format!("labels.{i}.color"), json!(hex(rgb))));
@@ -430,52 +632,12 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let cur = serde_json::to_value(&app.session.prefs).unwrap_or_default();
     let mut acts: Vec<Act> = vec![];
     let (mut ok, mut cancel) = (false, false);
-    super::dialogs::modal(ctx, "Settings", vec2(820.0, 600.0), t, |ui| {
-        let body_h = (ctx.content_rect().height() - 170.0).clamp(120.0, 470.0);
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), body_h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
-            ui.set_height(body_h);
-            // Page list (left, like After Effects).
-            ui.vertical(|ui| {
-                ui.set_width(180.0);
-                egui::ScrollArea::vertical().id_salt("settings-pages").max_height(body_h).auto_shrink([false, false]).show(ui, |ui| {
-                    for p in &all {
-                        let (r, resp) = ui.allocate_exact_size(vec2(176.0, 24.0), egui::Sense::click());
-                        let sel = page == p.id;
-                        if sel {
-                            ui.painter().rect_filled(r, 3.0, t.accent);
-                        } else if resp.hovered() {
-                            ui.painter().rect_filled(r, 3.0, t.hover);
-                        }
-                        ui.painter().text(
-                            r.left_center() + vec2(10.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            p.title,
-                            Tokens::ui(12.5),
-                            if sel { Color32::WHITE } else { t.text },
-                        );
-                        app.auto.add(&format!("settings.page.{}", p.id), r, p.title);
-                        if resp.clicked() {
-                            page = p.id.to_string();
-                        }
-                    }
-                });
-            });
-            ui.separator();
-            ui.vertical(|ui| {
-                // The rest of the dialog's width: a fixed width ran past it, so the whole
-                // dialog scrolled sideways a little (#284).
-                ui.set_width(ui.available_width());
-                let p = &all[idx];
-                ui.label(RichText::new(p.title).font(Tokens::semibold(14.0)).color(t.tab_text_active));
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical().max_height(body_h - 30.0).auto_shrink([false, false]).show(ui, |ui| {
-                    page_ui(app, ui, p, &cur, t, &mut acts);
-                });
-            });
-        });
-        ui.add_space(8.0);
-        ui.separator();
-        ui.horizontal(|ui| {
+    super::dialogs::modal_fit(ctx, "Settings", vec2(820.0, 600.0), t, |ui, height| {
+        // The buttons go first, from the bottom up, and the pages get the height they leave: at
+        // a high UI Scale the pages scroll and the buttons stay in view.
+        let area = ui.allocate_space(vec2(ui.available_width(), height)).1;
+        let mut foot = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::bottom_up(egui::Align::Min)));
+        foot.horizontal(|ui| {
             let r = ui.add_enabled(idx > 0, egui::Button::new(tr("Previous")));
             app.auto.add("settings.previous", r.rect, "Previous");
             if r.clicked() {
@@ -495,6 +657,54 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 cancel |= r.clicked();
             });
         });
+        foot.separator();
+        foot.add_space(8.0);
+        let body_h = (foot.min_rect().top() - area.top()).max(0.0);
+        // (A child, clipped to its share, so a wide page can't widen the dialog under the buttons.)
+        let pages = Rect::from_min_size(area.min, vec2(area.width(), body_h));
+        let mut body = ui.new_child(egui::UiBuilder::new().max_rect(pages).layout(egui::Layout::left_to_right(egui::Align::Min)));
+        body.set_clip_rect(pages.intersect(body.clip_rect()));
+        {
+            let ui = &mut body;
+            // Page list (left, like After Effects).
+            ui.vertical(|ui| {
+                ui.set_width(180.0);
+                egui::ScrollArea::vertical().id_salt("settings-pages").max_height(body_h).auto_shrink([false, false]).show(ui, |ui| {
+                    for p in &all {
+                        let (r, resp) = ui.allocate_exact_size(vec2(176.0, 24.0), egui::Sense::click());
+                        let sel = page == p.id;
+                        if sel {
+                            ui.painter().rect_filled(r, 3.0, t.accent);
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(r, 3.0, t.hover);
+                        }
+                        ui.painter().text(
+                            r.left_center() + vec2(10.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            tr(p.title),
+                            Tokens::ui(12.5),
+                            if sel { Color32::WHITE } else { t.text },
+                        );
+                        app.auto.add(&format!("settings.page.{}", p.id), r, p.title);
+                        if resp.clicked() {
+                            page = p.id.to_string();
+                        }
+                    }
+                });
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                // The rest of the dialog's width: a fixed width ran past it, so the whole
+                // dialog scrolled sideways a little (#284).
+                ui.set_width(ui.available_width());
+                let p = &all[idx];
+                ui.label(RichText::new(tr(p.title)).font(Tokens::semibold(14.0)).color(t.tab_text_active));
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height((body_h - 30.0).max(0.0)).auto_shrink([false, false]).show(ui, |ui| {
+                    page_ui(app, ui, p, &cur, t, &mut acts);
+                });
+            });
+        }
     });
     app.dialog_state.settings_page = page;
     for a in acts {

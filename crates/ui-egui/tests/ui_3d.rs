@@ -47,6 +47,37 @@ fn viewer_registers_3d_controls() {
     assert!(ids.iter().any(|i| i.starts_with("viewer.camera.")), "camera wireframe registered");
 }
 
+/// Click the centre of the automation element `id`.
+fn click_id(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
+    let [x, y, w, hh] = h.state().auto.find(id).unwrap_or_else(|| panic!("{id} is registered")).rect;
+    let p = egui::pos2(x + w / 2.0, y + hh / 2.0);
+    h.input_mut().events.push(egui::Event::PointerMoved(p));
+    h.input_mut().events.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.step();
+    h.input_mut().events.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(3);
+}
+
+/// #307: the viewer's 3D Renderer menu shows the comp's renderer (it always read "Classic 3D")
+/// and switches it, as After Effects' Composition panel does.
+#[test]
+fn renderer_menu_shows_and_switches_the_comp_renderer() {
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| app());
+    h.state_mut().session.execute("comp.settings", json!({"renderer": "classic3D"})).unwrap();
+    h.run_steps(3);
+    let label = |h: &Harness<'_, EffectcraftApp>| h.state().auto.find("viewer.renderer3d").map(|e| e.label.clone());
+    assert_eq!(label(&h).as_deref(), Some("Classic 3D"));
+    click_id(&mut h, "viewer.renderer3d");
+    click_id(&mut h, "viewer.renderer3dItem.1");
+    let renderer = h.state().session.active_comp().unwrap().renderer;
+    assert_eq!(renderer, effectcraft_engine::project::Renderer::Advanced3D);
+    h.run_steps(2);
+    assert_eq!(label(&h).as_deref(), Some("Advanced 3D"));
+    // One undoable Composition Settings step.
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(h.state().session.active_comp().unwrap().renderer, effectcraft_engine::project::Renderer::Classic3D);
+}
+
 #[test]
 fn camera_and_light_dialogs_create_layers() {
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| app());

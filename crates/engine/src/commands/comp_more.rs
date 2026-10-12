@@ -1,7 +1,6 @@
 //! Composition menu, part two: crop to region of interest / layer bounds, Save Frame As ▸ File,
-//! Responsive Design — Time.
+//! Copy Frame to Clipboard, Responsive Design — Time.
 
-use effectcraft_keyframe::Value as KV;
 use effectcraft_project::Marker;
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
@@ -18,20 +17,15 @@ fn has_roi(s: &Session) -> std::result::Result<(), String> {
 /// (all position keys too) so nothing moves on screen.
 fn crop(s: &mut Session, cid: effectcraft_project::ItemId, r: [f64; 4], label: &str) -> Result<Value> {
     let (x, y) = (r[0].round(), r[1].round());
-    let (w, h) = (r[2].round().max(1.0) as u32, r[3].round().max(1.0) as u32);
+    // At most 30,000 px a side, like any composition (#788).
+    let (w, h) = (effectcraft_project::limits::size_f64(r[2]), effectcraft_project::limits::size_f64(r[3]));
     s.edit(label, None, |proj, st| {
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         c.width = w;
         c.height = h;
         for l in c.layers.iter_mut().filter(|l| l.parent.is_none()) {
-            let Some(pos) = l.transform_mut().and_then(|tr| tr.get_mut("position")) else { continue };
-            let mv = |v: &KV| {
-                let a = v.as_vec3();
-                KV::Vec3([a[0] - x, a[1] - y, a[2]])
-            };
-            pos.value = mv(&pos.value);
-            for k in &mut pos.keys {
-                k.value = mv(&k.value);
+            if let Some(tr) = l.transform_mut() {
+                super::layer::offset_position(tr, -x, -y);
             }
         }
         for g in &mut c.guides {
@@ -127,6 +121,26 @@ fn save_frame(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"path": path, "width": img.width, "height": img.height, "time": t.seconds()}))
 }
 
+/// Composition ▸ Copy Frame to Clipboard (After Effects 26.3): render the frame as Save Frame As
+/// ▸ File does and hand it to the frontend, which puts it on the system clipboard.
+fn copy_frame(s: &mut Session, p: &Value) -> Result<Value> {
+    let cid = comp_id(s, p)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let t = f_p(p, "time").map(Tick::from_seconds_f64).unwrap_or(s.time());
+    let scale = f_p(p, "scale").unwrap_or(1.0).clamp(0.01, 4.0);
+    let bg = comp.background;
+    let img = s.render(cid, t, effectcraft_render::RenderOpts { scale, backend: effectcraft_render::Backend::Auto, ..Default::default() });
+    let (width, height) = (img.width, img.height);
+    let rgba = img.to_rgba8_over(bg);
+    let expected = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4));
+    if width == 0 || height == 0 || expected != Some(rgba.len()) {
+        return Err(EngineError::Other(format!("cannot copy an empty or malformed {width}×{height} frame")));
+    }
+    s.events.push(crate::Event::CopyImage { width, height, rgba });
+    s.toast("Copied frame to the clipboard");
+    Ok(json!({"width": width, "height": height, "time": t.seconds()}))
+}
+
 /// Responsive Design — Time: protected comp markers for an intro, an outro or the work area.
 fn responsive_time(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
@@ -163,6 +177,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_comp,
             save_frame
         ),
+        cmd!("comp.copyFrame", "Copy Frame to Clipboard", ["Composition"], None, "{comp?, time?, scale?}", has_comp, copy_frame),
         cmd!("comp.responsiveTime", "Responsive Design — Time", [], None, "{op: intro|outro|workArea}", has_comp, responsive_time),
     ]
 }

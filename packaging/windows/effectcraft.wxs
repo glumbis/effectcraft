@@ -2,11 +2,10 @@
 <!--
   EffectCraft MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
 
-    wix build effectcraft.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -o out.msi
+    wix build effectcraft.wxs installer-ui.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -o out.msi
 
-  Per-machine install into Program Files, a Start Menu shortcut, `.pcraft` owned by EffectCraft,
-  and EffectCraft offered under "Open with" for PSD/PSB and the image formats it reads (without
-  taking over the user's default app for them).
+  Per-machine install into Program Files (or a folder the user picks), a Start Menu shortcut and,
+  unless DESKTOPSHORTCUT=0 (the wizard's "Create a desktop shortcut" box), a desktop shortcut.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
@@ -23,6 +22,8 @@
     <MajorUpgrade AllowSameVersionUpgrades="yes"
         DowngradeErrorMessage="A newer version of EffectCraft is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <!-- The setup wizard (installer-ui.wxs): pick the folder on a fresh install. -->
+    <UIRef Id="EffectcraftUI" />
 
     <Icon Id="EffectcraftIcon.ico" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="EffectcraftIcon.ico" />
@@ -30,10 +31,40 @@
     <Property Id="ARPURLUPDATEINFO" Value="https://getartcraft.com/apps/effectcraft" />
     <Property Id="ARPHELPLINK" Value="https://discord.gg/artcraft" />
 
+    <!-- An upgrade, repair or silent reinstall goes where the installed copy already is: the App Paths
+         "Path" value written below, or for releases before this installer change (no Path value; they
+         could be put elsewhere with INSTALLFOLDER=...) the folder of the effectcraft.exe that App Paths names. A
+         "file" search with no FileSearch inside yields that file's folder. A folder passed on the
+         command line (INSTALLFOLDER=...) wins. -->
+    <Property Id="INSTALLFOLDER" Secure="yes" />
+    <Property Id="PREVIOUSINSTALLFOLDER" Secure="yes">
+      <RegistrySearch Id="PreviousInstallFolder" Root="HKLM" Type="directory"
+          Key="Software\Microsoft\Windows\CurrentVersion\App Paths\effectcraft.exe" Name="Path" />
+    </Property>
+    <Property Id="PREVIOUSEXEFOLDER" Secure="yes">
+      <RegistrySearch Id="PreviousExeFolder" Root="HKLM" Type="file"
+          Key="Software\Microsoft\Windows\CurrentVersion\App Paths\effectcraft.exe" />
+    </Property>
+    <SetProperty Id="INSTALLFOLDER" Value="[PREVIOUSINSTALLFOLDER]" After="AppSearch" Sequence="both"
+        Condition="PREVIOUSINSTALLFOLDER AND NOT INSTALLFOLDER" />
+    <SetProperty Id="INSTALLFOLDER" Action="SetINSTALLFOLDERFromExe" Value="[PREVIOUSEXEFOLDER]"
+        After="SetINSTALLFOLDER" Sequence="both" Condition="PREVIOUSEXEFOLDER AND NOT INSTALLFOLDER" />
+
+    <!-- The desktop shortcut: on by default for a fresh install (a box in the wizard, or
+         DESKTOPSHORTCUT=0 silently); an upgrade keeps what the installed copy chose, and adds none
+         to an install from before this option. -->
+    <Property Id="DESKTOPSHORTCUT" Value="1" Secure="yes" />
+    <Property Id="PREVIOUSDESKTOPSHORTCUT" Secure="yes">
+      <RegistrySearch Id="PreviousDesktopShortcut" Root="HKLM" Type="raw" Key="Software\EffectCraft" Name="DesktopShortcut" />
+    </Property>
+    <SetProperty Id="DESKTOPSHORTCUT" Value="[PREVIOUSDESKTOPSHORTCUT]" After="SetINSTALLFOLDERFromExe" Sequence="both"
+        Condition="WIX_UPGRADE_DETECTED" />
+
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="EffectCraft" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
 
     <Feature Id="Main" Title="EffectCraft" Level="1">
       <ComponentGroupRef Id="EffectcraftFiles" />
@@ -50,10 +81,20 @@
         </File>
 
         <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\effectcraft.exe" Value="[#EffectcraftExe]" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\effectcraft.exe" Name="Path" Value="[INSTALLFOLDER]" Type="string" />
+        <!-- The desktop shortcut choice, for the next upgrade (empty: none). -->
+        <RegistryValue Root="HKLM" Key="Software\EffectCraft" Name="DesktopShortcut" Value="[DESKTOPSHORTCUT]" Type="string" />
       </Component>
 
       <Component Id="EffectcraftCli">
         <File Id="EffectcraftCliExe" Source="$(var.BinDir)\effectcraft-cli.exe" KeyPath="yes" />
+      </Component>
+
+      <!-- A component under the user's profile folders needs an HKCU key path (ICE38, ICE43). -->
+      <Component Id="DesktopShortcut" Directory="DesktopFolder" Condition="DESKTOPSHORTCUT = &quot;1&quot;">
+        <Shortcut Id="DesktopShortcut" Name="EffectCraft" Description="EffectCraft motion graphics and visual effects"
+            Target="[#EffectcraftExe]" WorkingDirectory="INSTALLFOLDER" Icon="EffectcraftIcon.ico" IconIndex="0" />
+        <RegistryValue Root="HKCU" Key="Software\EffectCraft" Name="DesktopShortcut" Value="1" Type="string" KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>

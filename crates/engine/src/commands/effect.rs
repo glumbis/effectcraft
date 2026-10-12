@@ -435,7 +435,8 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit(&format!("Reset {name}"), None, |proj, _| {
         let g = layer_mut(proj, cid, lid)?.props.find_group_mut(uid).ok_or_else(|| bad("effect.reset", "gone"))?;
         for ps in &spec.params {
-            if let Some(pr) = g.get_mut(ps.id) {
+            // (`group/param` ids live in twirl-down groups.)
+            if let Some(pr) = g.prop_mut(ps.id) {
                 pr.set_value_at(lt, effectcraft_effects::default_value(ps, size));
             }
         }
@@ -463,7 +464,24 @@ fn list(_: &mut Session, p: &Value) -> Result<Value> {
             filter.as_ref().is_none_or(|f| effectcraft_effects::name_matches(e, f) || e.id.contains(f.as_str()) || e.category.to_ascii_lowercase().contains(f))
         })
         .map(|e| {
-            json!({"id": e.id, "name": e.name, "category": e.category, "gpu": e.gpu, "float": e.float, "params": e.params.iter().map(|p| json!({"id": p.id, "name": p.name, "default": p.default.to_json()})).collect::<Vec<_>>()})
+            json!({"id": e.id, "name": e.name, "category": e.category, "gpu": e.gpu, "float": e.float, "params": e.params.iter().map(|p| {
+                let mut out = json!({"id": p.id, "name": p.name, "type": p.default.kind_name(), "default": p.default.to_json()});
+                match &p.ui {
+                    effectcraft_project::ParamUi::Popup { options } => {
+                        // Engine/MCP popup values are zero-based; JSX exposes one-based values.
+                        out["options"] = json!(options.iter().enumerate().map(|(value, label)| json!({"value": value, "label": label})).collect::<Vec<_>>());
+                    }
+                    effectcraft_project::ParamUi::Slider { min, max, slider_min, slider_max, decimals } => {
+                        out["min"] = json!(min);
+                        out["max"] = json!(max);
+                        out["sliderMin"] = json!(slider_min);
+                        out["sliderMax"] = json!(slider_max);
+                        out["decimals"] = json!(decimals);
+                    }
+                    _ => {}
+                }
+                out
+            }).collect::<Vec<_>>()})
         })
         .collect();
     Ok(json!(v))
@@ -517,7 +535,12 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("effect.copy", "Copy Effects", [], None, "{layer?, effect? | effects?: [uid|name|index]} (default: the selected effects)", has_layers, copy),
         cmd!("effect.paste", "Paste Effects", [], None, "{layers?} — adds the copied effects to the layers", has_layers, paste),
         cmd!("effect.reset", "Reset Effect", [], None, "{layer?, effect}", has_layers, reset),
-        crate::query!("effect.list", "List Effects", "{filter?}", list),
+        crate::query!(
+            "effect.list",
+            "List Effects",
+            "{filter?} → [{params: [{id, name, type, default, options?, min?, max?, sliderMin?, sliderMax?, decimals?}]}]; popup indices are zero-based (JSX uses one-based values)",
+            list
+        ),
         crate::query!(
             "effect.warning",
             "Effect Warning",
@@ -558,4 +581,37 @@ pub fn specs() -> Vec<CommandSpec> {
             plugins_scan_ofx
         ),
     ]
+}
+
+#[cfg(test)]
+mod list_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn effect_list_exposes_popup_labels_and_numeric_slider_limits() {
+        let mut s = Session::default();
+        let menus = s.execute("effect.list", json!({"filter": "ec.control.dropdown"})).unwrap();
+        assert_eq!(menus.as_array().map(Vec::len), Some(1));
+        let menu = &menus[0]["params"][0];
+        assert_eq!(menu["type"], "enum");
+        assert_eq!(menu["default"], 0);
+        assert_eq!(
+            menu["options"],
+            json!([
+                {"value": 0, "label": "Item 1"},
+                {"value": 1, "label": "Item 2"},
+                {"value": 2, "label": "Item 3"}
+            ])
+        );
+        let sliders = s.execute("effect.list", json!({"filter": "ec.control.slider"})).unwrap();
+        assert_eq!(sliders.as_array().map(Vec::len), Some(1));
+        let slider = &sliders[0]["params"][0];
+        assert_eq!(slider["type"], "scalar");
+        assert_eq!(slider["min"], -1_000_000.0);
+        assert_eq!(slider["max"], 1_000_000.0);
+        assert_eq!(slider["sliderMin"], 0.0);
+        assert_eq!(slider["sliderMax"], 100.0);
+        assert_eq!(slider["decimals"], 2);
+        assert!(slider["options"].is_null());
+    }
 }

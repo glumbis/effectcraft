@@ -61,6 +61,17 @@ const TEXT: &[(&str, &str)] = &[
     ("animators", "ADBE Text Animators"),
 ];
 
+// Match names of the six properties below Text ▸ Path Options, as named by
+// After Effects' scripting API (rather than EffectCraft's internal ids).
+const TEXT_PATH_OPTIONS: &[(&str, &str)] = &[
+    ("path", "ADBE Text Path"),
+    ("reversePath", "ADBE Text Reverse Path"),
+    ("perpendicular", "ADBE Text Perpendicular To Path"),
+    ("forceAlignment", "ADBE Text Force Align Path"),
+    ("firstMargin", "ADBE Text First Margin"),
+    ("lastMargin", "ADBE Text Last Margin"),
+];
+
 const TEXT_ANIMATOR: &[(&str, &str)] = &[("selectors", "ADBE Text Selectors"), ("properties", "ADBE Text Animator Properties")];
 
 const CAMERA: &[(&str, &str)] = &[
@@ -411,6 +422,7 @@ pub fn node(chain: &[&Node]) -> String {
             }
         }
         "text" if chain.len() == 2 => find(TEXT, id).map(str::to_string).unwrap_or_else(own),
+        "text" if pid == "pathOptions" => find(TEXT_PATH_OPTIONS, id).map(str::to_string).unwrap_or_else(own),
         "text" if pid == "animators" => "ADBE Text Animator".into(),
         "text" if grand.map(|g| g.match_id()) == Some("animators") => find(TEXT_ANIMATOR, id).map(str::to_string).unwrap_or_else(own),
         "cameraOptions" => find(CAMERA, id).map(str::to_string).unwrap_or_else(own),

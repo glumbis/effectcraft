@@ -41,6 +41,17 @@ pub fn parse_angle(s: &str) -> Option<f64> {
     s.parse().ok()
 }
 
+/// The angle after the degrees field of `v` (which shows `shown`, the remainder's size) went to
+/// `new`. A drag moves the angle by the pointer's distance, so it runs through zero into negative
+/// angles; a typed number is a size, so the remainder keeps its sign.
+fn degrees_edit(v: f64, shown: f64, new: f64, dragging: bool) -> f64 {
+    if dragging {
+        return v + (new - shown);
+    }
+    let (rev, deg) = split_angle(v);
+    rev as f64 * 360.0 + if deg < 0.0 || (deg == 0.0 && v < 0.0) { -new } else { new }
+}
+
 /// An angle value, `0x+45.0°`, at `at` (top left): the revolutions and the degrees
 /// are hot numbers of their own (drag to scrub, click to type) and changing one keeps the other.
 /// Returns the revolutions' rect, the degrees' rect and the new angle when either changed.
@@ -49,10 +60,10 @@ pub fn angle_field(ui: &mut egui::Ui, at: Pos2, id: egui::Id, v: f64, decimals: 
     let (rr, new_rev, _) = widgets::hot_int_at(ui, at, id.with("rev"), rev, 0.1, "x", t);
     let sign = ui.painter().text(pos2(rr.max.x - 2.0, rr.center().y), Align2::LEFT_CENTER, if deg < 0.0 { "-" } else { "+" }, Tokens::ui(12.0), t.hot_text);
     let (dr, new_deg, _) = widgets::hot_number_at(ui, pos2(sign.max.x - 2.0, at.y), id, deg.abs(), 0.5, (-1e9, 1e9), decimals, "°", t);
+    let dragging = new_deg.is_some() && ui.ctx().is_being_dragged(id);
     let out = match (new_rev, new_deg) {
         (Some(r), _) => Some(r as f64 * 360.0 + deg),
-        // The degrees field shows the remainder's size; its sign stays.
-        (None, Some(d)) => Some(rev as f64 * 360.0 + if deg < 0.0 || (deg == 0.0 && v < 0.0) { -d } else { d }),
+        (None, Some(d)) => Some(degrees_edit(v, deg.abs(), d, dragging)),
         (None, None) => None,
     };
     (rr, dr, out)
@@ -549,6 +560,23 @@ mod tests {
         assert_eq!(format_angle(-400.0, 1), "-1x-40.0°");
         assert_eq!(format_angle(720.0, 0), "2x+0°");
         assert_eq!(split_angle(-360.0), (-1, 0.0));
+    }
+
+    #[test]
+    fn dragging_degrees_crosses_zero_into_negative_angles() {
+        // The field shows the size (0.3), so a 1-degree drag left lands on -0.7, and keeps going.
+        let mut v = 0.3;
+        for _ in 0..3 {
+            let (_, deg) = split_angle(v);
+            v = degrees_edit(v, deg.abs(), deg.abs() - 1.0, true);
+        }
+        assert!((v + 2.7).abs() < 1e-9, "{v}");
+        // And back up through zero.
+        let (_, deg) = split_angle(v);
+        assert!((degrees_edit(v, deg.abs(), deg.abs() + 3.0, true) - 0.3).abs() < 1e-9);
+        // Typing keeps the sign shown.
+        assert_eq!(degrees_edit(-30.0, 30.0, 45.0, false), -45.0);
+        assert_eq!(degrees_edit(405.0, 45.0, 10.0, false), 370.0);
     }
 
     #[test]

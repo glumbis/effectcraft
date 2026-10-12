@@ -8,6 +8,7 @@ use effectcraft_engine::render::{EvalCtx, RenderOpts, Renderer};
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
+use crate::i18n::tr;
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
 
@@ -167,6 +168,32 @@ pub fn interact(
         let sign = if kind == "bg" || kind == "refineErase" { "−" } else { "+" };
         painter.text(hp, Align2::CENTER_CENTER, sign, Tokens::semibold(12.0), col);
     }
+    // ⌘/Ctrl-drag resizes the brush (After Effects): the circle stays at the press point and its
+    // edge follows the pointer. No stroke is painted.
+    let rid = egui::Id::new("layer-panel-roto-resize");
+    if resp.drag_started()
+        && mods.command
+        && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
+    {
+        ctx.data_mut(|d| d.insert_temp(rid, pos));
+    }
+    if let Some(origin) = ctx.data(|d| d.get_temp::<Pos2>(rid)) {
+        if let Some(pos) = resp.interact_pointer_pos()
+            && zoom > 0.0
+        {
+            let dia = (2.0 * f64::from(origin.distance(pos)) / zoom).clamp(1.0, 5000.0).round();
+            let key = if refine { "refineDiameter" } else { "diameter" };
+            if let Err(e) = app.session.execute("roto.options", json!({key: dia})) {
+                app.ui.status = e.to_string();
+            }
+            painter.circle_stroke(origin, (dia * 0.5 * zoom) as f32, Stroke::new(1.5, col));
+            painter.text(origin + vec2(0.0, -14.0), Align2::CENTER_BOTTOM, format!("{dia:.0} px"), Tokens::ui(11.0), col);
+        }
+        if resp.drag_stopped() || !resp.dragged() {
+            ctx.data_mut(|d| d.remove::<Pos2>(rid));
+        }
+        return true;
+    }
     let did = egui::Id::new("layer-panel-roto-drag");
     if resp.drag_started()
         && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
@@ -292,7 +319,7 @@ pub fn bar_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     let t = app.tokens;
     let mut x = x;
     let view = app.session.state.roto.view.clone();
-    for (id, label) in [("alpha", "Alpha"), ("alphaBoundary", "Boundary"), ("alphaOverlay", "Overlay")] {
+    for (id, label) in [("alpha", tr("Alpha")), ("alphaBoundary", tr("Boundary")), ("alphaOverlay", tr("Overlay"))] {
         let r = Rect::from_min_size(pos2(x, bar.center().y - 10.0), vec2(66.0, 20.0));
         let on = view == id;
         if widgets::text_button(ui, r, label, on, &t, egui::Id::new(("roto-view", id))).clicked() {
@@ -309,7 +336,7 @@ pub fn bar_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     let running = app.session.is_roto_running();
     x += 8.0;
     let r = Rect::from_min_size(pos2(x, bar.center().y - 10.0), vec2(74.0, 20.0));
-    let label = if frozen { "Unfreeze" } else { "Freeze" };
+    let label = if frozen { tr("Unfreeze") } else { tr("Freeze") };
     if widgets::text_button(ui, r, label, frozen, &t, egui::Id::new(("roto-freeze", uid))).clicked() {
         let id = if frozen { "roto.unfreeze" } else { "roto.freeze" };
         if let Err(e) = app.session.execute(id, json!({"layer": layer.id.0, "effect": uid})) {
@@ -320,7 +347,7 @@ pub fn bar_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     x += 80.0;
     if running {
         let r = Rect::from_min_size(pos2(x, bar.center().y - 10.0), vec2(60.0, 20.0));
-        if widgets::text_button(ui, r, "Stop", false, &t, egui::Id::new("roto-stop")).clicked() {
+        if widgets::text_button(ui, r, tr("Stop"), false, &t, egui::Id::new("roto-stop")).clicked() {
             let _ = app.session.execute("roto.cancel", json!({}));
         }
         app.auto.add("layerPanel.roto.stop", r, "Stop");

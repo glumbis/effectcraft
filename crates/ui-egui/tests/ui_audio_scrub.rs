@@ -119,7 +119,13 @@ fn cmd_dragging_the_current_time_scrubs_and_an_idle_scrub_closes() {
 #[test]
 fn preview_with_audio_shows_every_frame_and_sounds_once_cached() {
     let fake = Fake::default();
-    let (app, cid) = setup(true, &fake);
+    let (mut app, cid) = setup(true, &fake);
+    // Playback requests at most twice as many frames ahead per step as there are render threads.
+    // Four times that many frames take at least four steps to cache, so frames are shown silently
+    // first however fast the renderer is (with a fixed 2 s comp, a machine with many cores cached
+    // all of it before the first step and the sound started at once).
+    let ahead = (app.frames.parallelism() * 2).max(4);
+    app.session.execute("comp.settings", json!({"comp": cid.0, "duration": (4 * ahead) as f64 / 30.0})).unwrap();
     // A little under one frame of input time per step.
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 31.0).build_eframe(|_| app);
     h.run_steps(2);

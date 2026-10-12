@@ -202,6 +202,23 @@ fn cache_budgets_leave_reserved_ram_and_shrink_when_low() {
     assert!(!p.cache_budgets(Some(low)).reduced);
 }
 
+/// Eight stacked 1080p clips ran the browser build out of its 4 GiB of memory: the footage and
+/// layer caches kept their desktop sizes there, beside the decoders' own frames.
+#[test]
+fn web_cache_budgets_leave_room_for_the_decoders() {
+    use crate::prefs::{WEB_LAYER_CACHE, WEB_MEDIA_CACHE};
+    let mut p = crate::prefs::Prefs::default();
+    p.memory.layer_cache_mb = 4096;
+    p.memory.media_cache_mb = 4096;
+    let web = p.cache_budgets_in(None, true);
+    assert_eq!((web.layer as u64, web.media as u64), (WEB_LAYER_CACHE, WEB_MEDIA_CACHE));
+    assert_eq!(web.preview, p.cache_budgets_in(None, false).preview, "the RAM preview keeps its budget");
+    // Smaller settings stay as they are; the desktop is unchanged.
+    p.memory.media_cache_mb = 128;
+    assert_eq!(p.cache_budgets_in(None, true).media, 128 << 20);
+    assert_eq!(p.cache_budgets_in(None, false).layer, 4096 << 20);
+}
+
 #[test]
 fn motion_path_span_follows_the_composition_setting() {
     let mut p = crate::prefs::Prefs::default();
@@ -438,6 +455,15 @@ fn compatibility_report_and_logging() {
     }
     let text = crate::commands::report_text_for_tests(&r);
     assert!(text.contains("Operating system") && text.contains("Import:"));
+    // #596: without a GPU compositor the report says why, and names the window's adapter.
+    s.accel_note = Some("GPU compositor unavailable: no storage textures".into());
+    s.window_adapter = Some("NVIDIA GeForce RTX 4070 (Gl, DiscreteGpu)".into());
+    let r = s.execute("help.systemReport", json!({"quiet": true})).unwrap();
+    assert_eq!(r["gpuNote"], "GPU compositor unavailable: no storage textures");
+    let text = crate::commands::report_text_for_tests(&r);
+    assert!(text.contains("GPU: none (CPU compositing): GPU compositor unavailable: no storage textures"), "{text}");
+    assert!(text.contains("Window graphics: NVIDIA GeForce RTX 4070 (Gl, DiscreteGpu)"), "{text}");
+    assert!(r["issues"][0].as_str().is_some_and(|i| i.contains("no storage textures")), "{r}");
     s.drain_events();
     s.execute("help.systemReport", json!({})).unwrap();
     assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "app.showReport")));
@@ -664,4 +690,14 @@ fn dynamic_menus_and_window_viewer_labels() {
     ] {
         assert!(labels.iter().any(|x| x == l), "{l}");
     }
+}
+
+#[test]
+fn unsaved_project_renders_to_movies_or_home_not_the_working_directory() {
+    // A Finder-launched app has `/` as its working directory, where renders fail (#446).
+    let home = tmp("home446");
+    assert_eq!(crate::render_queue::default_output_base(Some(home.clone())), Some(home.clone()));
+    std::fs::create_dir_all(home.join("Movies")).unwrap();
+    assert_eq!(crate::render_queue::default_output_base(Some(home.clone())), Some(home.join("Movies")));
+    assert_eq!(crate::render_queue::default_output_base(None), None);
 }

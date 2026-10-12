@@ -139,12 +139,18 @@ fn blended(mut g: PropGroup, paint: &ToolPaint) -> PropGroup {
     g
 }
 
+/// A gradient's Start and End Points across `bounds` (`[x, y, w, h]`): left to right, or out
+/// from the centre.
+pub(crate) fn gradient_ends(radial: bool, bounds: [f64; 4]) -> ([f64; 2], [f64; 2]) {
+    let [x, y, w, h] = bounds;
+    let mid = [x + w / 2.0, y + h / 2.0];
+    if radial { (mid, [mid[0] + w.max(h).max(2.0) / 2.0, mid[1]]) } else { ([x, mid[1]], [x + w.max(1.0), mid[1]]) }
+}
+
 /// The Stroke and Fill a new shape gets from `paint`; gradients run across `bounds` (`[x, y, w,
 /// h]` in the group's space): left to right, or out from the centre.
 pub(crate) fn paint_items(ids: &mut Ids, paint: &ShapeTool, bounds: [f64; 4]) -> Vec<PropGroup> {
-    let [x, y, w, h] = bounds;
-    let mid = [x + w / 2.0, y + h / 2.0];
-    let ends = |radial: bool| if radial { (mid, [mid[0] + w.max(h).max(2.0) / 2.0, mid[1]]) } else { ([x, mid[1]], [x + w.max(1.0), mid[1]]) };
+    let ends = |radial: bool| gradient_ends(radial, bounds);
     let mut items = vec![];
     let (s, width) = (&paint.stroke, paint.stroke_width);
     let stroke = match s.kind {
@@ -205,8 +211,10 @@ pub(crate) fn shape_group(ids: &mut Ids, kind: &str, size: [f64; 2], paint: &Sha
     Some(build::shape_group(ids, gname, items))
 }
 
-/// The mask a shape tool draws: `kind` of `size` centred at `centre` (layer space).
-pub(crate) fn mask_path(kind: &str, centre: [f64; 2], size: [f64; 2]) -> Option<ShapePath> {
+/// The path a shape tool draws: `kind` of `size` centred at `centre` (layer space). The geometry
+/// of every one of the five kinds, so a caller that only wants to draw it (the viewer's
+/// drag ghost) cannot drift from what `shape.newShape` / `layer.addMask` commit.
+pub fn mask_path(kind: &str, centre: [f64; 2], size: [f64; 2]) -> Option<ShapePath> {
     let bez = match kind {
         "rect" | "rectangle" => return Some(ShapePath::rect(centre, size[0], size[1])),
         "ellipse" => return Some(ShapePath::ellipse(centre, size[0], size[1])),
@@ -219,12 +227,18 @@ pub(crate) fn mask_path(kind: &str, centre: [f64; 2], size: [f64; 2]) -> Option<
     effectcraft_path::from_kurbo(&bez).into_iter().next()
 }
 
+/// The layer a shape tool draws into when no `layer` is given: the first selected unlocked shape
+/// layer, else none (a new shape layer).
+pub fn selected_shape_target(s: &Session, comp: &Comp) -> Option<LayerId> {
+    s.state.selected_layers.iter().copied().find(|l| comp.layer(*l).is_some_and(|l| matches!(l.source, LayerSource::Shape) && !l.switches.locked))
+}
+
 /// The shape layer a shape tool or the Pen draws into: `layer` (which must be a shape layer),
 /// else the first selected unlocked shape layer, else none (a new shape layer).
 pub(crate) fn draw_target(s: &Session, comp: &Comp, p: &Value, cmd: &str) -> Result<Option<LayerId>> {
     let target = match p.get("layer") {
         Some(l) => Some(super::resolve_layer(comp, l).ok_or_else(|| bad(cmd, format!("no layer {l}")))?),
-        None => s.state.selected_layers.iter().copied().find(|l| comp.layer(*l).is_some_and(|l| matches!(l.source, LayerSource::Shape) && !l.switches.locked)),
+        None => selected_shape_target(s, comp),
     };
     if target.and_then(|l| comp.layer(l)).is_some_and(|l| !matches!(l.source, LayerSource::Shape)) {
         return Err(bad(cmd, "the layer is not a shape layer"));

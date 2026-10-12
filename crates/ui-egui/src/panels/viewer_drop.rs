@@ -23,32 +23,37 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &egui::Ui, painter: &egui::Pain
     let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()).filter(|_| ui.rect_contains_pointer(map.area)) else { return };
     let stroke = Stroke::new(2.0, app.tokens.accent);
     let at = map.to_comp(ptr);
-    let action: Option<(&str, Value)> = match payload.as_ref() {
-        DragPayload::Effect(effect) => layer_at(ectx, at).map(|l| {
-            if let Some((_, q, _)) = layer_quad(ectx, l) {
-                painter.add(egui::Shape::closed_line(q.iter().map(|c| map.to_screen(*c)).collect(), stroke));
-            }
-            ("effect.apply", json!({"effect": effect, "layers": [l.id.0]}))
-        }),
+    let actions: Vec<(&str, Value)> = match payload.as_ref() {
+        DragPayload::Effect(effect) => layer_at(ectx, at)
+            .map(|l| {
+                if let Some((_, q, _)) = layer_quad(ectx, l) {
+                    painter.add(egui::Shape::closed_line(q.iter().map(|c| map.to_screen(*c)).collect(), stroke));
+                }
+                ("effect.apply", json!({"effect": effect, "layers": [l.id.0]}))
+            })
+            .into_iter()
+            .collect(),
         DragPayload::Item(item) => {
             // The layer's frame, centred on the pointer.
             if let Some([w, h]) = app.session.project.item(ItemId(*item)).and_then(|it| frame_size(&it.kind, ectx.comp.pixel_aspect)) {
                 painter.rect_stroke(Rect::from_center_size(ptr, vec2(w, h) * map.zoom), 0.0, Stroke::new(1.0, app.tokens.accent), StrokeKind::Middle);
             }
-            Some(("layer.addItem", json!({"item": item, "position": at})))
+            // New layers go above the current selection, so insert in reverse
+            // to preserve the order of the dragged Project items.
+            crate::panels::project_drop_items(app, *item).into_iter().rev().map(|item| ("layer.addItem", json!({"item": item, "position": at}))).collect()
         }
-        DragPayload::Files(paths) => Some(("mediaBrowser.import", json!({"paths": paths, "addToComp": true, "position": at}))),
-        DragPayload::Property { .. } => None,
+        DragPayload::Files(paths) => vec![("mediaBrowser.import", json!({"paths": paths, "addToComp": true, "position": at}))],
+        DragPayload::Property { .. } => vec![],
     };
-    if action.as_ref().is_some_and(|(id, _)| *id != "effect.apply") {
+    if actions.first().is_some_and(|(id, _)| *id != "effect.apply") {
         painter.rect_stroke(map.area, 0.0, stroke, StrokeKind::Inside);
     }
     if ctx.input(|i| i.pointer.any_released()) {
         egui::DragAndDrop::clear_payload(&ctx);
-        if let Some((id, params)) = action
-            && let Err(e) = crate::menus::invoke(app, &ctx, id, params)
-        {
-            app.ui.status = e;
+        for (id, params) in actions {
+            if let Err(e) = crate::menus::invoke(app, &ctx, id, params) {
+                app.ui.status = e;
+            }
         }
     }
 }

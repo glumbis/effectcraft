@@ -188,13 +188,13 @@ pub fn camera(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             ui.end_row();
             ui.label(tr("Zoom"));
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut d.zoom).range(1.0..=100000.0).speed(1.0).suffix(" px"));
+                ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.zoom).range(1.0..=100000.0).speed(1.0).suffix(" px")));
                 let mut aov = angle_of_view(w, d.zoom);
-                if ui.add(egui::DragValue::new(&mut aov).range(0.1..=179.0).speed(0.1).suffix("°")).changed() {
+                if ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut aov).range(0.1..=179.0).speed(0.1).suffix("°"))).changed() {
                     d.zoom = w * 0.5 / (aov.to_radians() * 0.5).tan();
                 }
                 let mut fl = focal_for_zoom(w, d.zoom);
-                if ui.add(egui::DragValue::new(&mut fl).range(0.1..=10000.0).speed(0.1).suffix(" mm")).changed() {
+                if ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut fl).range(0.1..=10000.0).speed(0.1).suffix(" mm"))).changed() {
                     d.zoom = zoom_for_focal(w, fl);
                 }
             });
@@ -204,15 +204,15 @@ pub fn camera(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             ui.end_row();
             ui.label(tr("Focus Distance"));
             ui.horizontal(|ui| {
-                ui.add_enabled(!d.lock_to_zoom, egui::DragValue::new(&mut d.focus).range(0.0..=100000.0).suffix(" px"));
+                ui.add_enabled(!d.lock_to_zoom, crate::widgets::drag_value(egui::DragValue::new(&mut d.focus).range(0.0..=100000.0).suffix(" px")));
                 ui.checkbox(&mut d.lock_to_zoom, tr("Lock to Zoom"));
             });
             ui.end_row();
             ui.label(tr("Aperture"));
-            ui.add(egui::DragValue::new(&mut d.aperture).range(0.0..=10000.0).speed(0.1).suffix(" px"));
+            ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.aperture).range(0.0..=10000.0).speed(0.1).suffix(" px")));
             ui.end_row();
             ui.label(tr("Blur Level"));
-            ui.add(egui::DragValue::new(&mut d.blur).range(0.0..=10000.0).suffix(" %"));
+            ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.blur).range(0.0..=10000.0).suffix(" %")));
             ui.end_row();
         });
         ui.add_space(14.0);
@@ -268,18 +268,18 @@ pub fn light(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             });
             ui.end_row();
             ui.label(tr("Color"));
-            ui.color_edit_button_rgb(&mut d.color);
+            crate::widgets::srgb_color_button(ui, &mut d.color);
             ui.end_row();
             ui.label(tr("Intensity"));
-            ui.add(egui::DragValue::new(&mut d.intensity).range(-10000.0..=10000.0).suffix(" %"));
+            ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.intensity).range(-10000.0..=10000.0).suffix(" %")));
             ui.end_row();
             let kind = KINDS[d.kind.min(3)];
             if kind == LightKind::Spot {
                 ui.label(tr("Cone Angle"));
-                ui.add(egui::DragValue::new(&mut d.cone_angle).range(0.0..=180.0).suffix("°"));
+                ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.cone_angle).range(0.0..=180.0).suffix("°")));
                 ui.end_row();
                 ui.label(tr("Cone Feather"));
-                ui.add(egui::DragValue::new(&mut d.cone_feather).range(0.0..=100.0).suffix(" %"));
+                ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.cone_feather).range(0.0..=100.0).suffix(" %")));
                 ui.end_row();
             }
             if kind != LightKind::Ambient {
@@ -292,20 +292,20 @@ pub fn light(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 ui.end_row();
                 if d.falloff > 0 {
                     ui.label(tr("Radius"));
-                    ui.add(egui::DragValue::new(&mut d.radius).range(0.0..=100000.0).suffix(" px"));
+                    ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.radius).range(0.0..=100000.0).suffix(" px")));
                     ui.end_row();
                     ui.label(tr("Falloff Distance"));
-                    ui.add(egui::DragValue::new(&mut d.falloff_distance).range(0.0..=100000.0).suffix(" px"));
+                    ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.falloff_distance).range(0.0..=100000.0).suffix(" px")));
                     ui.end_row();
                 }
                 ui.label(tr("Shadows"));
                 ui.checkbox(&mut d.casts_shadows, tr("Casts Shadows"));
                 ui.end_row();
                 ui.label(tr("Shadow Darkness"));
-                ui.add_enabled(d.casts_shadows, egui::DragValue::new(&mut d.shadow_darkness).range(0.0..=100.0).suffix(" %"));
+                ui.add_enabled(d.casts_shadows, crate::widgets::drag_value(egui::DragValue::new(&mut d.shadow_darkness).range(0.0..=100.0).suffix(" %")));
                 ui.end_row();
                 ui.label(tr("Shadow Diffusion"));
-                ui.add_enabled(d.casts_shadows, egui::DragValue::new(&mut d.shadow_diffusion).range(0.0..=1000.0).suffix(" px"));
+                ui.add_enabled(d.casts_shadows, crate::widgets::drag_value(egui::DragValue::new(&mut d.shadow_diffusion).range(0.0..=1000.0).suffix(" px")));
                 ui.end_row();
             }
         });

@@ -402,7 +402,9 @@ fn fp2_point(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         // u[0] = (_, composite original, mode, rgb only); f[0].x = opacity.
         default: {
-            let orig = px * P.f[0].x;
+            var source = px;
+            if (P.u[1].x != 0u) { source = textureLoad(aux, p, 0); }
+            let orig = source * P.f[0].x;
             if (P.u[0].y == 1u) {
                 o = blend_pixel(P.u[0].z, orig, px, 0.5);
             } else {

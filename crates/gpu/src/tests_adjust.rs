@@ -103,3 +103,19 @@ fn adjustment_stacks_split_into_gpu_runs_and_cpu_steps() {
     r.run_effects_on(&ctx, adj, true, &mut p);
     assert_eq!((p.gpu, p.cpu), (3, 1));
 }
+
+#[test]
+fn composite_reads_the_original_adjustment_input_on_gpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for mode in [0, 1, 2, 4, 15] {
+            for rgb in [false, true] {
+                let stack = vec![
+                    ("ec.channel.invert", vec![]),
+                    ("ec.channel.cccomposite", vec![("compositeOriginal", Value::Enum(mode)), ("opacity", n(65.0)), ("rgbOnly", Value::Bool(rgb))]),
+                ];
+                let s = adjustment_scene(depth, &stack, true);
+                check(&format!("original adjustment {depth:?} mode {mode} rgb {rgb}"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, Tick::ZERO), 0.0);
+            }
+        }
+    }
+}

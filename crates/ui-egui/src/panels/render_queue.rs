@@ -183,7 +183,7 @@ fn output_menu(it: &RenderQueueItem, available: &[OutputFormat], templates: &Ren
             }
             v.push(("-".into(), Value::Null));
             for kbps in [24u32, 32, 64, 96, 128, 192, 256] {
-                v.push((mark(o.opus_bitrate_kbps == kbps, &format!("Opus Bitrate: {kbps} kbps")), json!({"audioBitrate": kbps})));
+                v.push((mark(o.opus_bitrate_kbps == kbps, &tr_args("Opus Bitrate: {} kbps", &[&kbps])), json!({"audioBitrate": kbps})));
             }
             for (a, k) in [(OpusApplication::Audio, "audio"), (OpusApplication::Voip, "voice")] {
                 v.push((mark(o.opus_application == a, &tr_args("Opus Tuning: {}", &[&(a.label())])), json!({"opusApplication": k})));
@@ -245,7 +245,7 @@ fn output_menu(it: &RenderQueueItem, available: &[OutputFormat], templates: &Ren
         }
         v.push((mark(o.audio_channels == 1, "Audio Channels: Mono"), json!({"audioChannels": "mono"})));
         v.push((mark(o.audio_channels != 1, "Audio Channels: Stereo"), json!({"audioChannels": "stereo"})));
-        if matches!(o.format, OutputFormat::ProRes | OutputFormat::Wav | OutputFormat::Aiff) {
+        if matches!(o.format, OutputFormat::ProRes | OutputFormat::Uncompressed | OutputFormat::Wav | OutputFormat::Aiff) {
             for f in [AudioFormat::S16, AudioFormat::S24, AudioFormat::F32] {
                 v.push((mark(o.audio_format == f, &tr_args("Sample Format: {}", &[&(f.label())])), json!({"audioFormat": f.label()})));
             }
@@ -559,7 +559,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.focused = crate::dock::PanelKind::RenderQueue;
         }
         let item_id = it.id;
-        row_resp.context_menu(|ui| {
+        crate::widgets::context_menu(&row_resp, |ui| {
             if ui.button(tr("Duplicate")).clicked() {
                 actions.push(("renderQueue.duplicate", json!({"item": item_id})));
                 ui.close();

@@ -6,11 +6,13 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
-use effectcraft_render::FootageSource;
+use effectcraft_render::{FloatCurve, FootageSource};
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
+use image::metadata::Orientation;
 
-use crate::convert::{AlphaOp, dynamic_to_image, frame_to_image_in};
+use crate::convert::{AlphaOp, dynamic_to_image, frame_to_image_in, frame_to_image_scaled, turned};
+use crate::gif_anim::{self, Anim};
 use crate::{MediaError, Result};
 
 /// Default frame-cache budget: 1 GiB of decoded frames.
@@ -37,10 +39,12 @@ fn colour_bars(w: u32, h: u32) -> Image {
 struct Key {
     path: Arc<str>,
     frame: i64,
-    /// The alpha interpretation (bits 0–1) and Preserve RGB (bit 2): they change the decoded
-    /// pixels.
+    /// The alpha interpretation (bits 0–1) and how float values are encoded (bits 2–3: sRGB,
+    /// as stored, a 2.4 power curve): they change the decoded pixels.
     interp: u8,
     matte: [u32; 3],
+    /// A movie frame made at this size for a reduced-resolution render ((0, 0): as decoded).
+    size: (u32, u32),
 }
 
 struct Entry {
@@ -50,8 +54,10 @@ struct Entry {
 }
 
 /// Conformed audio files written by builds before this version are ignored (and written again):
-/// version 1 files of sources longer than about 12:36 at 48 kHz were silent from there on (#172).
-const CONFORM_VERSION: u32 = 2;
+/// version 1 files of sources longer than about 12:36 at 48 kHz were silent from there on (#172);
+/// version 2 files were written silent where the source failed to decode, and kept the footage
+/// silent from then on (#324).
+const CONFORM_VERSION: u32 = 3;
 
 /// Footage longer than this (24 hours) is read from its decoder rather than conformed: its
 /// duration comes from the file's header, and a damaged one claiming days of audio had the
@@ -165,9 +171,13 @@ struct CacheState {
     last: HashMap<Arc<str>, i64>,
 }
 
-/// A movie/audio source by path, opened by the first caller while the others wait for it
+/// A movie/audio source by path and the turn its picture is shown with
+/// ([`crate::probe::video_turn`]), opened by the first caller while the others wait for it
 /// (`None`: failed to open; not retried until `forget`).
-type SourceSlot = Arc<OnceLock<Option<SharedSource>>>;
+type SourceSlot = Arc<OnceLock<Option<(SharedSource, Orientation)>>>;
+
+/// An animated GIF by path, as [`SourceSlot`] (the error message when it failed to load).
+type GifSlot = Arc<OnceLock<std::result::Result<Arc<Anim>, String>>>;
 
 struct Inner {
     /// Opened movie/audio sources by path.
@@ -178,6 +188,9 @@ struct Inner {
     files: Mutex<HashMap<String, Arc<[u8]>>>,
     /// Parsed 3D models by path (`None`: failed to load; not retried until `forget`).
     models: Mutex<HashMap<String, Option<Arc<effectcraft_model::Model>>>>,
+    /// Decoded animated GIFs and WebPs by path, loaded by the first caller while the others wait (an
+    /// `Err` is not retried until `forget`).
+    gifs: Mutex<HashMap<Arc<str>, GifSlot>>,
     cache: Mutex<CacheState>,
     done: Condvar,
     budget: AtomicU64,
@@ -191,6 +204,10 @@ struct Inner {
     /// Conformed files being written right now.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     conforming: Mutex<HashSet<std::path::PathBuf>>,
+    /// Conformed files that failed to write (the source didn't decode) this session: their
+    /// audio is read from the decoder instead of trying again on every read.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    conform_failed: Mutex<HashSet<std::path::PathBuf>>,
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -218,6 +235,8 @@ struct Loc {
     key: Key,
     /// Media time for movies (`None`: an image file, `key.path`).
     media_t: Option<Tick>,
+    /// How float values are encoded (also in `key.interp`).
+    float: FloatCurve,
 }
 
 /// Removes an in-flight key and wakes waiters, also when decoding panics.
@@ -246,6 +265,7 @@ impl MediaPool {
                 sources: Mutex::default(),
                 files: Mutex::default(),
                 models: Mutex::default(),
+                gifs: Mutex::default(),
                 cache: Mutex::default(),
                 done: Condvar::new(),
                 budget: AtomicU64::new(bytes as u64),
@@ -256,6 +276,7 @@ impl MediaPool {
                 opened: AtomicU64::new(0),
                 conform: Mutex::default(),
                 conforming: Mutex::default(),
+                conform_failed: Mutex::default(),
             }),
         }
     }
@@ -294,6 +315,9 @@ impl MediaPool {
         let mut c = lock(&self.inner.cache);
         c.lru = Lru::default();
         c.last.clear();
+        drop(c);
+        // Decoded GIFs sit outside the frame budget; Purge frees them too.
+        lock(&self.inner.gifs).clear();
     }
 
     /// Drop every cached frame and decoder.
@@ -306,12 +330,15 @@ impl MediaPool {
     pub fn forget(&self, path: &str) {
         lock(&self.inner.sources).remove(path);
         lock(&self.inner.models).remove(path);
+        lock(&self.inner.gifs).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
             c.lru.remove(&k);
         }
         c.last.remove(path);
+        drop(c);
+        crate::exr_channels::forget(path);
     }
 
     /// Provide the contents of `path` from memory (used instead of the file system; web builds).
@@ -322,7 +349,23 @@ impl MediaPool {
 
     /// Decode (or fetch from cache) the frame of `footage` at source time `t`.
     pub fn frame_at(&self, footage: &Footage, t: Tick) -> Result<Arc<Image>> {
-        Inner::frame_at(&self.inner, footage, t, true)
+        Inner::frame_at(&self.inner, footage, t, true, None, FloatCurve::Srgb)
+    }
+
+    /// [`FootageSource::frame`] / [`FootageSource::frame_at_size`]: `None` (logged) on errors.
+    fn frame_sized(&self, _item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Option<Arc<Image>> {
+        if footage.missing {
+            return None;
+        }
+        match Inner::frame_at(&self.inner, footage, t, true, size, float) {
+            Ok(img) => Some(img),
+            // nobody wants the frame any more (`cancellable`): not an error
+            Err(MediaError::Cancelled) => None,
+            Err(e) => {
+                log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
+                None
+            }
+        }
     }
 
     /// Settings ▸ Disk ▸ Conformed Audio Folder: write each footage file's decoded audio there
@@ -367,18 +410,23 @@ impl MediaPool {
     /// thread (once).
     #[cfg(not(target_arch = "wasm32"))]
     fn conform(&self, footage: &Footage, file: std::path::PathBuf, frames: usize, rate: u32) {
-        if !lock(&self.inner.conforming).insert(file.clone()) {
+        if lock(&self.inner.conform_failed).contains(&file) || !lock(&self.inner.conforming).insert(file.clone()) {
             return;
         }
         let (pool, f) = (self.clone(), footage.clone());
         let spawned = std::thread::Builder::new().name("ec-conform-audio".into()).spawn(move || {
             let tmp = file.with_extension("tmp");
-            let ok = file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-                && pool.write_conformed(&f, &tmp, frames, rate).is_ok()
-                && std::fs::rename(&tmp, &file).is_ok();
-            if !ok {
+            let written = match file.parent().map(std::fs::create_dir_all) {
+                Some(Ok(())) => pool.write_conformed(&f, &tmp, frames, rate).and_then(|()| std::fs::rename(&tmp, &file)),
+                Some(Err(e)) => Err(e),
+                None => Err(std::io::Error::other("no folder")),
+            };
+            // A failed decode leaves no file: one written silent would keep the footage silent
+            // in every later session (#324).
+            if let Err(e) = written {
                 let _ = std::fs::remove_file(&tmp);
-                log::warn!("media: could not write conformed audio {}", file.display());
+                log::warn!("media: could not write conformed audio {} of {}: {e}", file.display(), f.path);
+                lock(&pool.inner.conform_failed).insert(file.clone());
             }
             lock(&pool.inner.conforming).remove(&file);
         });
@@ -389,6 +437,7 @@ impl MediaPool {
 
     /// Write `frames` sample frames of `footage`'s audio at `rate` to `path` (raw interleaved
     /// stereo `f32`) a chunk at a time: the whole track was held in memory before it was written.
+    /// Fails when any chunk doesn't decode.
     #[cfg(not(target_arch = "wasm32"))]
     fn write_conformed(&self, footage: &Footage, path: &std::path::Path, frames: usize, rate: u32) -> std::io::Result<()> {
         use std::io::Write;
@@ -396,7 +445,7 @@ impl MediaPool {
         let mut at = 0usize;
         while at < frames {
             let n = (frames - at).min(1 << 16);
-            for v in self.decode_audio(footage, sample_time(at, rate), n, rate) {
+            for v in self.try_decode_audio(footage, sample_time(at, rate), n, rate).map_err(std::io::Error::other)? {
                 out.write_all(&v.to_le_bytes())?;
             }
             at += n;
@@ -440,19 +489,27 @@ impl MediaPool {
     /// applied the edit list's priming offset twice and ramped the start of every read: AAC
     /// footage not at the mix rate stuttered in previews and exports (#274).
     fn decode_audio(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> Vec<f32> {
+        self.try_decode_audio(footage, start, frames, rate).unwrap_or_else(|e| {
+            log::warn!("media: audio of {}: {e}", footage.path);
+            vec![0.0; frames * 2]
+        })
+    }
+
+    /// [`MediaPool::decode_audio`], failing when the source can't be opened or read.
+    fn try_decode_audio(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
         let path: Arc<str> = footage.path.as_str().into();
-        let Some(src) = self.inner.source(&path) else { return vec![0.0; frames * 2] };
+        let src = self.inner.source(&path).ok_or("the file can't be opened")?;
         let s0 = start.to_units_floor(rate as i64);
         let native = src.info().audio.as_ref().map_or(rate, |a| a.sample_rate);
         if native == 0 || rate == 0 || native == rate {
-            return read_stereo(&src, &path, s0, frames, rate);
+            return read_stereo(&src, s0, frames, rate);
         }
         // Output sample `n` sits at source position n × native / rate.
         let (native_i, rate_i) = (i128::from(native), i128::from(rate));
         let first = (i128::from(s0) * native_i).div_euclid(rate_i);
         let last = ((i128::from(s0) + frames as i128) * native_i).div_euclid(rate_i) + 1;
-        let (Ok(first64), Ok(count)) = (i64::try_from(first), usize::try_from(last - first + 1)) else { return vec![0.0; frames * 2] };
-        let buf = read_stereo(&src, &path, first64, count, native);
+        let (Ok(first64), Ok(count)) = (i64::try_from(first), usize::try_from(last - first + 1)) else { return Ok(vec![0.0; frames * 2]) };
+        let buf = read_stereo(&src, first64, count, native)?;
         let mut out = Vec::with_capacity(frames * 2);
         for k in 0..frames as i128 {
             let pos = (i128::from(s0) + k) * native_i;
@@ -464,12 +521,12 @@ impl MediaPool {
                 out.push(a + (b - a) * f);
             }
         }
-        out
+        Ok(out)
     }
 
     /// A thumbnail of `footage` (its first frame) fitting in `max_side` × `max_side`, aspect kept.
     pub fn thumbnail(&self, footage: &Footage, max_side: u32) -> Result<Image> {
-        let img = Inner::frame_at(&self.inner, footage, Tick::ZERO, false)?;
+        let img = Inner::frame_at(&self.inner, footage, Tick::ZERO, false, None, FloatCurve::Srgb)?;
         let (w, h) = (img.width.max(1), img.height.max(1));
         let s = (max_side.max(1) as f64 / w.max(h) as f64).min(1.0);
         if s >= 1.0 {
@@ -521,12 +578,29 @@ impl Inner {
     /// it again: a preview's frame workers, audio feeder, conform and waveform threads each
     /// decoded a long FLAC in full at once (#408).
     fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
+        self.opened(path).map(|(src, _)| src)
+    }
+
+    /// [`Self::source`] and the turn the movie's picture is shown with.
+    fn opened(&self, path: &Arc<str>) -> Option<(SharedSource, Orientation)> {
         let slot = lock(&self.sources).entry(path.clone()).or_default().clone();
         slot.get_or_init(|| {
             self.opened.fetch_add(1, Ordering::Relaxed);
-            let opened = self.read(path).and_then(|bytes| {
-                let name = std::path::Path::new(&**path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                filmcraft_codecs::open_bytes(&name, bytes).map_err(MediaError::from)
+            // Files on disk are read in place (the index, then samples on demand) rather than
+            // whole; in-memory files (`add_bytes`) and wasm32 builds open from bytes.
+            let in_memory = lock(&self.files).contains_key(&**path);
+            let file = std::path::Path::new(&**path);
+            let in_place = if in_memory { None } else { crate::stream::open_source(file) };
+            let in_place = in_place.map(|src| {
+                let turn = crate::stream::movie_header(file).map_or(Orientation::NoTransforms, |h| crate::probe::video_turn(&h));
+                src.map(|src| (src, turn))
+            });
+            let opened = in_place.unwrap_or_else(|| {
+                self.read(path).and_then(|bytes| {
+                    let name = std::path::Path::new(&**path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let turn = crate::probe::video_turn(&bytes);
+                    filmcraft_codecs::open_bytes(&name, bytes).map(|src| (src, turn)).map_err(MediaError::from)
+                })
             });
             match opened {
                 Ok(s) => Some(s),
@@ -537,6 +611,20 @@ impl Inner {
             }
         })
         .clone()
+    }
+
+    /// The decoded frames of the animated GIF or WebP at `path`. The first caller decodes it, outside the
+    /// map's lock; callers asking for the same file meanwhile wait for that.
+    fn gif(&self, path: &Arc<str>) -> Result<Arc<Anim>> {
+        let slot = lock(&self.gifs).entry(path.clone()).or_default().clone();
+        let loaded = slot.get_or_init(|| {
+            let loaded = self.read(path).and_then(|bytes| Anim::load(&bytes));
+            loaded.map(Arc::new).map_err(|e| {
+                log::warn!("media: cannot decode {path}: {e}");
+                e.to_string()
+            })
+        });
+        loaded.clone().map_err(|e| MediaError::Decode(format!("{path}: {e}")))
     }
 
     /// The frame index (in the footage's interpreted rate) shown at source time `t`, after
@@ -553,22 +641,28 @@ impl Inner {
         ((d.0 as i128 * rate.num as i128 + den / 2) / den) as i64
     }
 
-    fn locate(footage: &Footage, t: Tick) -> Loc {
+    fn locate(footage: &Footage, t: Tick, float: FloatCurve) -> Loc {
         let alpha = match footage.alpha {
             AlphaMode::Straight => 0,
             AlphaMode::Premultiplied => 1,
             AlphaMode::Ignore => 2,
         };
-        let interp = alpha | (u8::from(footage.preserve_rgb) << 2);
+        let float = AlphaOp::of(footage, float).float_curve();
+        let interp = alpha
+            | (match float {
+                FloatCurve::Srgb => 0,
+                FloatCurve::Linear => 1,
+                FloatCurve::Gamma24 => 2,
+            } << 2);
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
-        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte };
+        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, size: (0, 0) };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
                 match footage.sequence_file(i) {
-                    Some(path) => Loc { key: key(path, 0), media_t: None },
+                    Some(path) => Loc { key: key(path, 0), media_t: None, float },
                     // A gap in the numbering: colour bars, as in After Effects.
-                    None => Loc { key: key(PLACEHOLDER, ((footage.width as i64) << 32) | footage.height as i64), media_t: None },
+                    None => Loc { key: key(PLACEHOLDER, ((footage.width as i64) << 32) | footage.height as i64), media_t: None, float },
                 }
             }
             // A layer of a layered still is keyed by its layer index and size mode (smart objects
@@ -576,9 +670,9 @@ impl Inner {
             FootageKind::Still if footage.layer.is_some() || footage.page != 0 => {
                 let l = footage.layer.as_ref().map_or(0, |l| 1 + l.index as i64 * 2 + l.layer_size as i64 + if l.embedded.is_some() { 1 << 40 } else { 0 })
                     + ((footage.page as i64) << 42);
-                Loc { key: key(&footage.path, l), media_t: None }
+                Loc { key: key(&footage.path, l), media_t: None, float }
             }
-            FootageKind::Still | FootageKind::Sequence | FootageKind::Model | FootageKind::Data => Loc { key: key(&footage.path, 0), media_t: None },
+            FootageKind::Still | FootageKind::Sequence | FootageKind::Model | FootageKind::Data => Loc { key: key(&footage.path, 0), media_t: None, float },
             FootageKind::Video | FootageKind::Audio => {
                 let rate = footage.frame_rate;
                 let n = Self::frame_count(rate, footage.duration);
@@ -586,26 +680,32 @@ impl Inner {
                 // Middle of the frame in the file's own timing (robust to timestamp rounding).
                 let native = footage.native_rate.unwrap_or(rate);
                 let mt = native.tick_of(i) + Tick(native.frame_duration().0 / 2);
-                Loc { key: key(&footage.path, i), media_t: Some(mt) }
+                Loc { key: key(&footage.path, i), media_t: Some(mt), float }
             }
         }
     }
 
-    fn frame_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Arc<Image>> {
+    /// The frame of `footage` at `t`; a movie's resampled to `size` when it can be made at that
+    /// size directly (see [`FootageSource::frame_at_size`]).
+    fn frame_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool, size: Option<(u32, u32)>, float: FloatCurve) -> Result<Arc<Image>> {
         if !footage.has_video {
             return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
         }
-        let loc = Self::locate(footage, t);
+        let mut loc = Self::locate(footage, t, float);
         let movie = loc.media_t.is_some();
+        if movie && let Some(size) = size {
+            loc.key.size = size;
+        }
         let mut c = lock(&self.cache);
         // sequential playback of a movie: read the next frame ahead
         if playback && movie {
             let prev = c.last.insert(loc.key.path.clone(), loc.key.frame);
             if prev == Some(loc.key.frame - 1) && self.read_ahead.load(Ordering::Relaxed) {
                 let next_t = t + footage.frame_rate.frame_duration();
-                let next = Self::locate(footage, next_t);
+                let mut next = Self::locate(footage, next_t, float);
+                next.key.size = loc.key.size;
                 if next.key != loc.key && !c.lru.map.contains_key(&next.key) && !c.inflight.contains(&next.key) {
-                    self.prefetch(footage, next_t);
+                    self.prefetch(footage, next_t, size, float);
                 }
             }
         }
@@ -638,40 +738,68 @@ impl Inner {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick) {
+    fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) {
         let (me, f) = (self.clone(), footage.clone());
         self.prefetched.fetch_add(1, Ordering::Relaxed);
         // A plain thread, not a rayon job: the decode below parallelises with rayon itself.
         std::thread::spawn(move || {
-            let _ = me.frame_at(&f, t, false);
+            let _ = me.frame_at(&f, t, false, size, float);
         });
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick) {}
+    fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick, _size: Option<(u32, u32)>, _float: FloatCurve) {}
 
     fn decode(&self, loc: &Loc, footage: &Footage) -> Result<Image> {
-        let op = AlphaOp::of(footage);
+        let op = AlphaOp::of(footage, loc.float);
         let path = &loc.key.path;
         match loc.media_t {
             None if &**path == PLACEHOLDER => Ok(colour_bars(footage.width, footage.height)),
             None => {
                 let bytes = self.read(path)?;
+                if let Some(img) = crate::dpx::decode(path, &bytes)? {
+                    return Ok(dynamic_to_image(&img, op));
+                }
                 if let Some(img) = crate::layered::decode(path, &bytes, footage, op)? {
                     return Ok(img);
                 }
-                let img = match image::load_from_memory(&bytes) {
+                // (an OpenEXR compression the decoder lacks came out transparent or as a missing
+                // channel error)
+                if path.to_ascii_lowercase().ends_with(".exr")
+                    && let Some(why) = crate::exr_channels::unsupported_compression(&bytes)
+                {
+                    return Err(MediaError::Decode(format!("{path}: {why}")));
+                }
+                let loaded = crate::probe::load_oriented(&bytes, crate::still_format(path, &bytes));
+                let img = match loaded {
                     Ok(img) => img,
                     // A multi-layer OpenEXR file without an unnamed RGB layer: its colour layer.
-                    Err(e) => crate::exr_channels::layered_image(&bytes).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
+                    Err(e) => crate::exr_channels::cached_layered_image(path, bytes).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
                 };
                 Ok(dynamic_to_image(&img, op))
             }
+            Some(mt) if gif_anim::is_animated(footage) => {
+                let anim = self.gif(path)?;
+                let frame = anim.frame_at(Tick(mt.0)).ok_or_else(|| MediaError::Decode(format!("{path}: no frames")))?;
+                Ok(dynamic_to_image(frame, op))
+            }
             Some(mt) => {
-                let src = self.source(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+                let (src, turn) = self.opened(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
                 let vf = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
+                // A movie shown turned a quarter (a phone held upright): the footage's size and
+                // the render's are the turned picture's, the decoded frame's are the file's.
+                let side = |(w, h): (u32, u32)| if crate::probe::swaps_sides(turn) { (h, w) } else { (w, h) };
+                // A reduced-resolution render's frame, made at its size (a frame of the footage's
+                // own size only, as the renderer resamples only those).
+                let (w, h) = side(loc.key.size);
+                if w > 0
+                    && (vf.width, vf.height) == side((footage.width, footage.height))
+                    && let Some(img) = frame_to_image_scaled(&vf, w, h)
+                {
+                    return Ok(turned(img, turn));
+                }
                 let buf = lock(&self.cache).lru.take_spare(vf.width as usize * vf.height as usize);
-                Ok(frame_to_image_in(&vf, op, buf))
+                Ok(turned(frame_to_image_in(&vf, op, buf), turn))
             }
         }
     }
@@ -693,20 +821,26 @@ impl FootageSource for MediaPool {
     fn purge(&self) {
         self.clear_frames();
     }
+    fn forget(&self, path: &str) {
+        MediaPool::forget(self, path);
+    }
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
     }
-    fn frame(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
-        if footage.missing {
-            return None;
-        }
-        match self.frame_at(footage, t) {
-            Ok(img) => Some(img),
-            Err(e) => {
-                log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
-                None
-            }
-        }
+    /// A movie's decoder gives up on a seek (before it, and between samples while it decodes
+    /// forward from the keyframe) once `cancel` is set: a scrub's superseded frames no longer
+    /// hold the decoder the frame under the pointer waits for (#329).
+    fn cancellable(&self, cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
+        filmcraft_media::cancel::with_cancel(cancel, f)
+    }
+    fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
+        self.frame_sized(item, footage, t, None, FloatCurve::Srgb)
+    }
+    fn frame_at_size(&self, item: ItemId, footage: &Footage, t: Tick, width: u32, height: u32) -> Option<Arc<Image>> {
+        self.frame_sized(item, footage, t, Some((width, height)), FloatCurve::Srgb)
+    }
+    fn frame_with(&self, item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Option<Arc<Image>> {
+        self.frame_sized(item, footage, t, size, float)
     }
 
     fn vector_frame(&self, _item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
@@ -721,7 +855,7 @@ impl FootageSource for MediaPool {
         if footage.missing || !footage.has_video {
             return None;
         }
-        let loc = Inner::locate(footage, t);
+        let loc = Inner::locate(footage, t, FloatCurve::Srgb);
         if loc.media_t.is_some() || !loc.key.path.to_ascii_lowercase().ends_with(".exr") {
             return None;
         }
@@ -739,27 +873,21 @@ impl FootageSource for MediaPool {
 
 /// `frames` stereo sample frames (interleaved) of `src` from sample `s0` at `rate` Hz, which
 /// FilmCraft serves as decoded when it is the source's own rate. Mono is duplicated to both
-/// channels; silence before the start and where decoding fails.
-fn read_stereo(src: &SharedSource, path: &str, s0: i64, frames: usize, rate: u32) -> Vec<f32> {
+/// channels; silence before the start. An error where decoding fails.
+fn read_stereo(src: &SharedSource, s0: i64, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
     let mut out = vec![0.0; frames * 2];
     let skip = usize::try_from(s0.saturating_neg()).unwrap_or(0);
     if skip >= frames {
-        return out;
+        return Ok(out);
     }
-    let buf = match src.audio(s0.max(0), frames - skip, rate) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("media: audio of {path}: {e}");
-            return out;
-        }
-    };
-    let (Some(l), Some(r)) = (buf.channels.first(), buf.channels.get(1).or(buf.channels.first())) else { return out };
-    let Some(dst) = skip.checked_mul(2).and_then(|i| out.get_mut(i..)) else { return out };
+    let buf = src.audio(s0.max(0), frames - skip, rate).map_err(|e| e.to_string())?;
+    let (Some(l), Some(r)) = (buf.channels.first(), buf.channels.get(1).or(buf.channels.first())) else { return Ok(out) };
+    let Some(dst) = skip.checked_mul(2).and_then(|i| out.get_mut(i..)) else { return Ok(out) };
     for ([o0, o1], (a, b)) in dst.as_chunks_mut::<2>().0.iter_mut().zip(l.iter().zip(r)) {
         *o0 = *a;
         *o1 = *b;
     }
-    out
+    Ok(out)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -819,6 +947,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #324: audio that fails to decode isn't conformed. A conformed file of silence was written
+    /// instead, and as it is found by the file's path, size and date the footage stayed silent
+    /// in every later session (a renamed copy played).
+    #[test]
+    fn audio_that_fails_to_decode_is_not_conformed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-conform-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.mp3");
+        std::fs::write(&path, b"ID3, not really").unwrap();
+        let footage = Footage {
+            path: path.to_string_lossy().into(),
+            kind: FootageKind::Audio,
+            duration: Tick::from_seconds_f64(2.0),
+            has_audio: true,
+            ..Default::default()
+        };
+        let pool = MediaPool::new();
+        let conformed = dir.join("conformed");
+        pool.set_conform_folder(Some(conformed.clone()));
+        let file = pool.conformed_path(&footage.path, 48_000).unwrap();
+        assert!(pool.audio_samples(&footage, Tick::ZERO, 1024, 48_000).iter().all(|v| *v == 0.0));
+        for _ in 0..500 {
+            if lock(&pool.inner.conforming).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(lock(&pool.inner.conforming).is_empty(), "the conform thread finished");
+        assert!(!file.exists() && !file.with_extension("tmp").exists(), "no conformed file was left");
+        assert!(lock(&pool.inner.conform_failed).contains(&file));
+        // Later reads go to the decoder without trying again.
+        pool.audio_samples(&footage, Tick::ZERO, 1024, 48_000);
+        assert!(lock(&pool.inner.conforming).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn frame_index_loops_and_clamps() {
         let r = FrameRate::FPS_30;
@@ -834,7 +999,7 @@ mod tests {
     fn lru_respects_budget_and_recycles() {
         let mut c = Lru::default();
         let img = || Arc::new(Image::new(16, 16)); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3] };
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], size: (0, 0) };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);
@@ -848,6 +1013,32 @@ mod tests {
         assert_eq!(c.spare.len(), MAX_SPARE);
         assert_eq!(c.take_spare(256).len(), 256);
         assert!(c.take_spare(17).is_empty());
+    }
+
+    /// #482: an OpenEXR file with HTJ2K compression (which the decoder lacks) says so on import
+    /// and when its frame is read, instead of "no non-deep rgb channels" or a transparent frame.
+    #[test]
+    fn htj2k_exr_is_reported_as_unsupported() {
+        use exr::prelude::*;
+        let channels =
+            AnyChannels::sort(vec![AnyChannel::new("R", FlatSamples::F32(vec![0.5; 4])), AnyChannel::new("G", FlatSamples::F32(vec![0.5; 4]))].into());
+        let image = exr::image::Image::from_layer(Layer::new((2, 2), LayerAttributes::default(), Encoding::UNCOMPRESSED, channels));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        let mut bytes = bytes.into_inner();
+        assert_eq!(crate::exr_channels::unsupported_compression(&bytes), None);
+        // The header's compression attribute (name, type, size 1, value) says HTJ2K32 (11).
+        let tag = b"compression\0compression\0\x01\0\0\0";
+        let at = bytes.windows(tag.len()).position(|w| w == tag).unwrap() + tag.len();
+        bytes[at] = 11;
+        let b: Arc<[u8]> = bytes.into();
+        let e = crate::probe_bytes("/shot.exr", b.clone()).unwrap_err().to_string();
+        assert!(e.contains("/shot.exr: OpenEXR HTJ2K compression isn't supported yet"), "{e}");
+        let pool = MediaPool::new();
+        pool.add_bytes("/shot.exr", b);
+        let f = Footage { path: "/shot.exr".into(), kind: FootageKind::Still, width: 2, height: 2, has_video: true, ..Default::default() };
+        let e = pool.frame_at(&f, Tick::ZERO).unwrap_err().to_string();
+        assert!(e.contains("HTJ2K compression isn't supported yet"), "{e}");
     }
 
     /// #411: Interpret Footage ▸ Preserve RGB reads a float OpenEXR's values as the file stores
@@ -871,5 +1062,36 @@ mod tests {
         let raw = pool.frame_at(&Footage { preserve_rgb: true, ..f.clone() }, Tick::ZERO).unwrap().get(0, 0);
         assert_eq!(raw, [0.18, 0.5, 2.0, 1.0]);
         assert_eq!(pool.frame_at(&f, Tick::ZERO).unwrap().get(0, 0), encoded, "the default interpretation is cached apart");
+    }
+
+    /// #750: float footage is handed over as the renderer asks: sRGB-encoded, with Working
+    /// Gamma 2.4's pure power curve, or as stored (Interpret As Linear Light encodes it then);
+    /// Preserve RGB reads it as stored whatever is asked. Each decodes and caches apart.
+    #[test]
+    fn float_exr_is_encoded_with_the_requested_curve() {
+        use exr::prelude::*;
+        let (w, h) = (2usize, 2usize);
+        let ch = |n: &str, v: f32| AnyChannel::new(n, FlatSamples::F32(vec![v; w * h]));
+        let channels = AnyChannels::sort(vec![ch("R", 0.051), ch("G", 0.18), ch("B", 2.0), ch("A", 1.0)].into());
+        let image = exr::image::Image::from_layer(Layer::new((w, h), LayerAttributes::default(), Encoding::FAST_LOSSLESS, channels));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        let b: Arc<[u8]> = bytes.into_inner().into();
+        let pool = MediaPool::new();
+        pool.add_bytes("/linear.exr", b.clone());
+        let f = crate::probe_bytes("/linear.exr", b).unwrap();
+        let px = |f: &Footage, float| pool.frame_with(ItemId(1), f, Tick::ZERO, None, float).unwrap().get(0, 0);
+        let near = |o: [f32; 4], want: [f32; 3]| (0..3).all(|i| (o[i] - want[i]).abs() < 1e-3);
+        let srgb = px(&f, FloatCurve::Srgb);
+        assert!(near(srgb, [0.2503, 0.4614, 1.3532]), "sRGB: {srgb:?}");
+        assert_eq!(pool.frame(ItemId(1), &f, Tick::ZERO).unwrap().get(0, 0), srgb, "frame() is sRGB");
+        let g24 = px(&f, FloatCurve::Gamma24);
+        assert!(near(g24, [0.2898, 0.4898, 2.0f32.powf(1.0 / 2.4)]), "2.4: {g24:?}");
+        assert_eq!(px(&f, FloatCurve::Linear), [0.051, 0.18, 2.0, 1.0]);
+        let preserve = Footage { preserve_rgb: true, ..f.clone() };
+        assert_eq!(px(&preserve, FloatCurve::Gamma24), [0.051, 0.18, 2.0, 1.0]);
+        // Each curve is cached apart: asking again returns the same pixels.
+        assert_eq!(px(&f, FloatCurve::Srgb), srgb);
+        assert_eq!(px(&f, FloatCurve::Gamma24), g24);
     }
 }

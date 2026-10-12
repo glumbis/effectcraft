@@ -102,28 +102,30 @@ impl McpServer {
     }
 
     /// Serve until EOF on `input`. Input is read on its own thread so a long render can report
-    /// progress, be cancelled and let other requests through while it runs (`long_job`).
-    pub fn serve(&mut self, input: impl BufRead + Send, mut output: impl Write) -> std::io::Result<()> {
+    /// progress, be cancelled and let other requests through while it runs (`long_job`). The
+    /// reader thread is detached: when writing a reply fails, the server returns at once instead
+    /// of waiting for a read that may never complete.
+    pub fn serve(&mut self, input: impl BufRead + Send + 'static, mut output: impl Write) -> std::io::Result<()> {
         let (tx, inbox) = std::sync::mpsc::channel::<Option<String>>();
         // A read error ends the input like EOF and is returned once the queued requests are answered.
-        let read_error = std::sync::Mutex::new(None::<std::io::Error>);
-        let served = std::thread::scope(|scope| {
-            let read_error = &read_error;
-            std::thread::Builder::new().name("mcp-input".into()).spawn_scoped(scope, move || {
-                for line in input.lines() {
-                    let line = match line {
-                        Ok(line) => line,
-                        Err(e) => {
-                            *read_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
-                            break;
-                        }
-                    };
-                    if tx.send(Some(line)).is_err() {
-                        return;
+        let read_error = std::sync::Arc::new(std::sync::Mutex::new(None::<std::io::Error>));
+        let reader_error = read_error.clone();
+        std::thread::Builder::new().name("mcp-input".into()).spawn(move || {
+            for line in input.lines() {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(e) => {
+                        *reader_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                        break;
                     }
+                };
+                if tx.send(Some(line)).is_err() {
+                    return;
                 }
-                let _ = tx.send(None);
-            })?;
+            }
+            let _ = tx.send(None);
+        })?;
+        let served = (|| {
             while let Ok(Some(line)) = inbox.recv() {
                 let long = serde_json::from_str::<Value>(line.trim()).ok().and_then(|m| crate::long_job::long_call(self, &m));
                 if let Some(call) = long {
@@ -142,7 +144,7 @@ impl McpServer {
                 Some(e) => Err(e),
                 None => Ok(()),
             }
-        });
+        })();
         match (served, self.checkpoint(true)) {
             (r, Ok(())) => r,
             (Ok(()), Err(e)) => Err(e),

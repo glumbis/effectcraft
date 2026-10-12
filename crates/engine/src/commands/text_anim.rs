@@ -246,7 +246,7 @@ fn enable_per_char(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// JSON → property value shaped like `like`.
-fn json_value(v: &Value, like: &KV) -> Option<KV> {
+pub(super) fn json_value(v: &Value, like: &KV) -> Option<KV> {
     Some(match v {
         Value::Bool(b) => match like {
             KV::Bool(_) => KV::Bool(*b),
@@ -431,7 +431,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Animate Text",
             [],
             None,
-            "{layer?, properties: [anchor|position|scale|skew|rotation|opacity|transformAll|lineAnchor|lineSpacing|characterOffset|characterValue|blur|fillColor|fillHue|fillSaturation|fillBrightness|fillOpacity|strokeColor|strokeHue|strokeSaturation|strokeBrightness|strokeOpacity|strokeWidth|tracking|perChar3d], name?}",
+            "{layer?, properties: [anchor|position|scale|skew|rotation|opacity|transformAll|lineAnchor|lineSpacing|characterOffset|characterValue|blur|fillColor|fillHue|fillSaturation|fillBrightness|fillOpacity|strokeColor|strokeHue|strokeSaturation|strokeBrightness|strokeOpacity|strokeWidth|tracking|frontColor|bevelColor|sideColor|backColor|perChar3d], name?}",
             has_text_layer,
             add_animator
         ),
