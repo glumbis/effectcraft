@@ -304,8 +304,9 @@ restart EffectCraft. (Effect ▸ **Open OpenFX Scan Report** opens `ofx_scan.txt
 
 All of these are searched including everything below them, system folders first, then the per-user
 ones, the folder next to the app, and `OFX_PLUGIN_PATH`. A folder reached twice is searched once. If
-the same plug-in is installed in two places, one copy is used: the newest within one folder tree,
-otherwise the one in the folder searched first. The report's **Notes** list the copies it skipped.
+the same plug-in is installed in more than one place, only one copy is used: **the newest version
+wins, wherever it is**. If the versions are equal, the copy in the folder searched first is used.
+The report's **Notes** list the copies it skipped.
 A bundle looks like this, and **the platform folder must match your system**:
 
 ```
@@ -406,9 +407,9 @@ Topaz says to install only the newest bundle and to have its main app installed 
 - **Curves can't be edited.** Plug-ins that have curve parameters (a colour curve, say) load and
   work, but EffectCraft has no curve editor yet. The curves don't appear in Effect Controls, and
   they aren't saved with the project: they start from the plug-in's own default every time.
-- **Effects that need the GPU don't load:** a plug-in that only renders on the GPU is reported in
-  `ofx_scan.txt` as "needs GPU rendering". Plug-ins that only work with 16-bit float ("half-float")
-  images do load.
+- **Effects that need the GPU are skipped:** a plug-in that only renders on the GPU is not
+  registered (it doesn't appear in Effects & Presets), and `ofx_scan.txt` says why: "needs GPU
+  rendering". Plug-ins that only work with 16-bit float ("half-float") images do load.
 - **A plug-in is native code.** It runs inside EffectCraft with full access to your computer. Install
   only plug-ins you trust.
 
@@ -509,7 +510,8 @@ What the common messages mean:
 | `declined this host` (Notes) or `exports no OpenFX plug-ins` (Notes) | The plug-in looked at the host name and said it isn't for it. Try [step 4](#4-try-a-different-host-name). |
 | `Load failed: ... declined to load` (Problems) | Often a licence check or a host check. Run the vendor's activation tool, then try [step 4](#4-try-a-different-host-name). |
 | `Describe failed: ...` (Problems) | The plug-in couldn't describe itself. Read what "the plug-in said" and "asked for something this host does not provide" at the end of the line, and [report it](#reporting-a-problem). |
-| `needs GPU rendering` | It only renders on the GPU, which EffectCraft doesn't use. No fix on your side. |
+| `needs GPU rendering` | It only renders on the GPU, which EffectCraft doesn't use, so it is skipped and doesn't appear in Effects & Presets. No fix on your side. |
+| `no OpenFX plug-ins found` | The folder exists but has no plug-in bundle in it (an empty `OFX` folder, say). Harmless. |
 | `no supported context` / `needs an unsupported pixel depth` | It's a kind of OFX effect EffectCraft can't host yet. [Open an issue](https://github.com/glumbis/effectcraft/issues) with the report. |
 | `N duplicate plug-in(s) skipped, the newest copy is kept` (Notes) | You have several copies of one plug-in installed. The newest runs. See [step 2](#2-keep-only-the-newest-copy-of-each-plug-in). |
 | `skipped, it is not an OpenFX image effect` (Notes) | The file belongs to another kind of OFX plug-in, which EffectCraft doesn't run. |
@@ -530,9 +532,9 @@ on Linux (installer), and `/Applications/EffectCraft.app/Contents/MacOS/effectcr
 #### 2. Keep only the newest copy of each plug-in
 
 Some vendors leave older versions installed beside the new one (alpha, beta and release folders).
-EffectCraft uses only one copy of a plug-in (within a folder, the newest; if the copies are in
-different folders, the one in the folder searched first) and lists the others under Notes, but old
-copies are still opened, and some have known problems. Delete the old `.ofx.bundle` folders and
+EffectCraft uses only one copy of a plug-in, the newest version in any of the folders it searches
+(with equal versions, the copy in the folder searched first), and lists the others under Notes. Old
+copies are still opened, though, and some have known problems. Delete the old `.ofx.bundle` folders and
 restart. If you use Topaz, keep only the newest bundle.
 
 #### 3. Check the folder and the platform binary
@@ -608,7 +610,10 @@ lists third-party effects in its report; apply the OFX version by hand from Effe
     about it: the action, the time and, on Windows, the error code and the file it happened in.
   - A plug-in that crashed EffectCraft **twice in a row** while rendering is **skipped** from then
     on. The report says `skipped: it crashed EffectCraft while rendering 2 times in a row`. The
-    strikes are kept in `ofx_render_crashes.txt`.
+    strikes are kept in `ofx_render_crashes.txt`. A session that ends abnormally while exactly one
+    plug-in action is running counts as a strike for that plug-in even if no error was recorded.
+    That includes ending EffectCraft with End Task or Force Quit during a render, so don't do that
+    twice in a row with the same plug-in, or it gets skipped (un-skip it as below).
   - To bring a skipped plug-in back: update or reinstall it, or delete its line from
     `ofx_render_crashes.txt`, or on Linux or macOS run
     `effectcraft-cli exec effect.plugins.scanOfx '{"retry": true}' --empty` (this also clears the

@@ -63,10 +63,11 @@ The order is: the OS's standard folders, the per-user folders, `<config dir>/OFX
 to the executable, `OFX_PLUGIN_PATH`. A folder that is reached twice (spelled differently, or
 through a link) is searched once; folders are compared by their canonical path, case-folded on
 Windows and macOS. A folder that doesn't exist stays in the list, so `ofx_scan.txt` shows it as
-`missing`. The folders are scanned in that order, one `load_path` each, so if one plug-in
-identifier is installed in two of them, the copy in the folder searched first is kept (within one
-folder, the newest, see [How a scan works](#how-a-scan-works)). Folders are scanned recursively (up
-to eight levels) for bundles; links and junctions are followed. Effect ▸ Open OpenFX Plug-in Folder
+`missing`. The existing folders are handed to the loader as **one scan** (`load_paths_with`, which
+collects the binaries below every path in this order), so if one plug-in identifier is installed in
+several of them, the **newest version wins whichever folder it is in**; with equal versions the copy
+found first, that is in the folder searched first, is kept ([How a scan works](#how-a-scan-works)).
+Folders are scanned recursively (up to eight levels) for bundles; links and junctions are followed. Effect ▸ Open OpenFX Plug-in Folder
 (`effect.plugins.openOfxUserFolder`) creates and opens `<config dir>/OFX`.
 
 The `OFX` folder next to the executable is where the fork's downloads keep the **EC Test** plug-in,
@@ -179,21 +180,24 @@ shown; `kOfxStatReplyDefault` from `Load` is accepted.
 ## How a scan works
 
 A binary that is in the [scan cache](#the-scan-cache) and has not changed skips all of this. For the
-others, loading a path is two phases, so that copies of one plug-in can be told apart before any of
-their code is started.
+others, loading is two phases, so that copies of one plug-in can be told apart before any of their
+code is started. A scan hands every existing search folder to the loader at once (one list, in
+search order), so the phases see all the copies of a plug-in in all the folders.
 
 1. **Probe**, per binary: open the library, call `OfxSetHost` if it exports it, call
    `OfxGetNumberOfPlugins`, then `OfxGetPlugin` for each. Nothing is described yet (no `Load`). A
    binary that answers a failure status to `OfxSetHost` ("not for this host"), or exports no
    plug-ins, is skipped with a note that names the host name it was shown. Only a failure status
    counts: an older plug-in that declares no return value leaves whatever was in the register.
-2. **Duplicates**: an identifier offered more than once keeps its **highest version** (equal
-   versions: the copy found first); the others are skipped before their `Load`, with one note per
+2. **Duplicates**: an identifier offered more than once, **in any of the folders**, keeps its
+   **highest version** (equal versions: the copy found first, in search order: system folders, per-user
+   folders, `<config dir>/OFX`, the folder next to the executable, `OFX_PLUGIN_PATH`); the others
+   are skipped before their `Load`, with one note per
    binary (`N duplicate plug-in(s) skipped, the newest copy is kept: ...`) and a transcript line
    per plug-in. Vendors such as Topaz leave alpha, beta and release bundles side by side in the
    OFX folder and document crashes from the older ones. An identifier that an earlier scan in the
-   same process already registered keeps its place: registrations are permanent, so even a newer
-   copy loses.
+   same process already registered keeps its place (a later explicit load, say): registrations are
+   permanent, so even a newer copy loses.
 3. **Describe**, per plug-in that was kept: `setHost`, `Load`, `Describe`, then the checks and the
    context attempts below, and the registration as an effect.
 
@@ -203,8 +207,9 @@ What can stop a plug-in at the describe phase (each is an entry under Problems u
   or no `setHost` / `mainEntry`: a problem.
 * `Load` or `Describe` fails (see above).
 * **GPU only.** `OfxImageEffectPropCPURenderSupported` is `"false"` (OFX 1.5.1), or OpenGL, CUDA,
-  Metal or OpenCL render support is `"needed"`: reported after `Describe` as "needs GPU rendering,
-  which this host does not offer" with the reasons, instead of registering and failing every render.
+  Metal or OpenCL render support is `"needed"`: the plug-in is **skipped**, not registered, and
+  reported after `Describe` as "needs GPU rendering, which this host does not offer" with the
+  reasons, instead of registering and failing every render.
 * None of the contexts the plug-in lists is one this host runs, or `DescribeInContext` fails in
   every one of them.
 * None of the pixel depths the plug-in lists is supported ([How OFX maps onto
@@ -341,7 +346,9 @@ would know nothing about it. `inflight.rs` keeps a small in-flight record so tha
   slot, the exception code and the faulting module and address to the header, so a crash with
   several plug-ins active is pinned on the right one. Elsewhere, or when the filter doesn't run, a
   record with several plug-ins active can't say which one crashed: they are all listed and nobody is
-  struck, so an innocent plug-in is never skipped.
+  struck, so an innocent plug-in is never skipped. A record with **exactly one** action in progress
+  names that plug-in and strikes it even with no exception recorded: that covers End Task or force
+  quit during a render, a `__fastfail` abort, and crashes on Linux and macOS.
 * **The next start** reads the record files of dead processes (the lock can be taken), at the first
   plug-in load (not when the config folder is set, so a tool that only builds a session doesn't
   consume the report). A slot still marked active means the process died inside that action. The
@@ -420,16 +427,21 @@ would know nothing about it. `inflight.rs` keeps a small in-flight record so tha
   * A plug-in that sets `kOfxImageEffectPluginPropSingleInstance` gets **one shared instance** for
     every application of it, one render at a time; an effect applied inside itself fails with a
     message.
-  * Instances are created one at a time. A plug-in whose `CreateInstance` takes 250 ms or more (it
-    loads a model, say) is held to **two live instances**: a render at the limit takes the instance
-    idle longest of another applied effect (unless the plug-in declared that it keeps state between
-    frames), else waits for one. A nested render that would wait for itself, or a wait of 20 s,
-    makes one more instance, which is destroyed when it comes back.
+  * Instances are created one at a time. A plug-in whose `CreateInstance` takes 250 ms or more
+    twice in a row (it loads a model, say) is held to **two live instances**: a render at the limit
+    takes the instance idle longest of another applied effect (unless the plug-in declared that it
+    keeps state between frames), else waits for one that is in use. When nothing is in use no
+    instance is coming back, so the render destroys the instance idle longest to make room and
+    creates its own at once. A nested render that would wait for itself, or a wait of 20 s, makes
+    one more instance, which is destroyed when it comes back.
   * **Sequences.** The plug-in's declared `kOfxImageEffectInstancePropSequentialRender` is honoured.
-    `BeginSequenceRender` is sent once and the sequence **stays open** on the pooled instance while
-    frames advance one at a time (the pool gives a frame to the idle instance whose sequence
-    continues at it). A seek, another render scale, an eviction, a failed render, an idle instance or
-    shutdown ends it.
+    The engine renders frame by frame, so the effect works the sequences out: `BeginSequenceRender`
+    is sent **once per run of consecutive frames**, with the range from the current frame `t` to the
+    last frame of the source (`[t, end]`), and the sequence **stays open** on the pooled instance
+    while frames advance one at a time (the pool gives a frame to the idle instance whose sequence
+    continues at it). `EndSequenceRender` is sent on a seek (a frame that isn't the next one, also
+    another render scale or a parallel render taking another instance's turn), after 10 s idle, when
+    the instance is evicted from the pool or a render fails, and at quit.
   * `kOfxStatErrMemory` from `Render`: the host sends `kOfxActionPurgeCaches` once and retries once.
   * **At quit** every pooled instance gets `DestroyInstance` and every loaded plug-in `Unload`,
     bounded to 5 s.
