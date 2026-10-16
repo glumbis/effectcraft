@@ -1,16 +1,29 @@
-# CI for the OpenFX fork (branch `openfx`, see FORK.md): builds the test OFX
-# plug-in, runs the OFX integration tests against it, and publishes Windows binaries as an artifact
-# so the fork can be tried (e.g. with RSMB or Sapphire) on another PC without building locally.
+# CI and release builds for the OpenFX fork (see FORK.md): builds the test OFX plug-in, runs the OFX
+# integration tests against it on Windows, Linux and macOS (Apple Silicon), and packages the fork
+# (features `openfx aep`) for every platform so it can be tried, e.g. with RSMB or Sapphire, without
+# building locally:
+#
+#   EffectCraft-OFX-<label>-windows-x64.zip       Install EffectCraft.bat, the app, OFX/, aep-import/
+#   EffectCraft-OFX-<label>-linux-x86_64.tar.gz   install.sh (per user, no root), the app, OFX/, aep-import/
+#   EffectCraft-OFX-<label>-linux-x86_64.AppImage single file (carries OFX/ and aep-import/ inside)
+#   EffectCraft-OFX-<label>-macos-arm64.zip       EffectCraft.app (ad-hoc signed, not notarized)
+#   EffectCraft-OFX-<label>-macos-x86_64.zip      the same for Intel Macs
+#
+# <label> is the tag without its `v` for a tag like v0.10.0-ofx.1, else <Cargo version>-ofx-dev.
+# Pushing a tag `v*-ofx.*` also drafts a GitHub Release with all of the above attached; it is left
+# as a draft for the maintainer to publish. There is no code signing (the fork has no certificates).
 name: OFX host
 
 on:
   push:
-    branches: [openfx, openfx-aep]
+    branches: [openfx, "ci/**", "sync/**"]
+    tags: ["v*-ofx.*"]
   workflow_dispatch:
 
 concurrency:
   group: ofx-host-${{ github.ref }}
-  cancel-in-progress: true
+  # A release build for a tag is never cancelled by a later push.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read
@@ -18,88 +31,387 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # The fork's cargo features: the OpenFX host and .aep import.
+  FEATURES: openfx aep
 
 jobs:
-  windows:
-    name: Windows (test, build, artifact)
-    runs-on: windows-latest
-    timeout-minutes: 90
+  # The file name label for this run's downloads, and the version it is built from.
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      label: ${{ steps.v.outputs.label }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: v
+        run: |
+          # [workspace.package] version, the one place it lives (same as packaging/env.sh).
+          version="$(awk '/^\[/ { in_pkg = ($0 == "[workspace.package]"); next } in_pkg && $1 == "version" { gsub(/[" ]/, "", $3); print $3; exit }' Cargo.toml)"
+          [ -n "$version" ] || { echo "::error::could not read [workspace.package] version from Cargo.toml"; exit 1; }
+          if [[ "$GITHUB_REF" == refs/tags/v*-ofx.* ]]; then
+            label="${GITHUB_REF_NAME#v}"
+            case "$label" in
+              "$version"-ofx.*) ;;
+              *) echo "::warning::tag $GITHUB_REF_NAME does not start with v$version (the version in Cargo.toml)" ;;
+            esac
+          else
+            label="$version-ofx-dev"
+          fi
+          [[ "$label" =~ ^[0-9A-Za-z][0-9A-Za-z.+_-]*$ ]] || { echo "::error::unusable label '$label'"; exit 1; }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "label=$label" >>"$GITHUB_OUTPUT"
+          echo "EffectCraft $version, label $label" >>"$GITHUB_STEP_SUMMARY"
+
+  # The OFX host tests, on every OS the fork ships for.
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows, os: windows-latest, key: windows, tolerate: false }
+          - { name: Linux, os: ubuntu-22.04, key: linux, tolerate: false }
+          # First time the OFX host runs on Apple Silicon: the test step is allowed to fail so the
+          # packaging below still runs; the failure shows as a warning on the run.
+          - { name: macOS Apple Silicon, os: macos-15, key: macos-arm64, tolerate: true }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev pkg-config
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          key: ofx-host-windows
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ofx-host-test-${{ matrix.key }}
+          cache-on-failure: true
           workspaces: |
             .
             examples/ofx/ec-test-ofx
       - name: Build the test OFX plug-in and lay out its bundle
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          cargo build --release --manifest-path examples/ofx/ec-test-ofx/Cargo.toml
-          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-          $dir = 'target/ofx-test/ec-test-ofx.ofx.bundle/Contents/Win64'
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item examples/ofx/ec-test-ofx/target/release/ec_test_ofx.dll "$dir/ec-test-ofx.ofx"
+        run: bash tools/fork-installer/ci/build-test-bundle.sh
       - name: Test
-        shell: pwsh
+        id: test
+        continue-on-error: ${{ matrix.tolerate }}
         env:
-          EC_TEST_OFX_BUNDLE: ${{ github.workspace }}\target\ofx-test\ec-test-ofx.ofx.bundle
+          EC_TEST_OFX_BUNDLE: ${{ github.workspace }}/target/ofx-test/ec-test-ofx.ofx.bundle
+        run: cargo test -p effectcraft-ofx -p effectcraft-effects -p effectcraft-plugin -p effectcraft-host --features effectcraft-host/openfx
+      - name: Tolerated test failure
+        if: steps.test.outcome == 'failure'
         run: |
-          cargo test -p effectcraft-ofx -p effectcraft-effects -p effectcraft-plugin -p effectcraft-host --features effectcraft-host/openfx
-          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+          echo "::warning title=${{ matrix.name }} tests failed::The OFX tests failed on ${{ matrix.name }}; the job is allowed to pass (see the Test step)."
+          echo "### ${{ matrix.name }}: tests FAILED (tolerated)" >>"$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Package Windows x64
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      LABEL: ${{ needs.version.outputs.label }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ofx-host-package-windows
+          cache-on-failure: true
+          workspaces: |
+            .
+            examples/ofx/ec-test-ofx
+      - name: Build the test OFX plug-in and lay out its bundle
+        run: bash tools/fork-installer/ci/build-test-bundle.sh
       - name: Build the release binaries
+        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --features "$FEATURES"
+      - name: Runtime dependencies (DLLs the exe imports)
         shell: pwsh
         run: |
-          cargo build --release -p effectcraft -p effectcraft-cli --features "openfx aep"
-          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          # Which DLLs does the exe need? vcruntime140.dll in the list means the Visual C++
+          # Redistributable is required (the CRT is linked dynamically); none means it is static.
+          try {
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+            foreach ($exe in 'effectcraft.exe', 'effectcraft-cli.exe') {
+              Write-Host "== $exe"
+              & $dumpbin.FullName /nologo /dependents "target\release\$exe"
+            }
+          } catch { Write-Host "dumpbin not available: $_" }
       - name: Collect the artifact
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force dist/EffectCraft-OFX | Out-Null
           Copy-Item target/release/effectcraft.exe, target/release/effectcraft-cli.exe dist/EffectCraft-OFX/
           Copy-Item FORK.md dist/EffectCraft-OFX/README.md
-          Copy-Item tools/fork-installer/* dist/EffectCraft-OFX/
+          # The Windows installer scripts only (tools/fork-installer also holds the Linux and macOS ones in subfolders).
+          Copy-Item tools/fork-installer/*.bat, tools/fork-installer/*.ps1 dist/EffectCraft-OFX/
           # The test plug-in goes in OFX\ next to the app, which the app always scans.
           New-Item -ItemType Directory -Force dist/EffectCraft-OFX/OFX | Out-Null
           Copy-Item target/ofx-test/ec-test-ofx.ofx.bundle dist/EffectCraft-OFX/OFX/ -Recurse
           New-Item -ItemType Directory -Force dist/EffectCraft-OFX/aep-import | Out-Null
           Copy-Item tools/aep-import/*.py, tools/aep-import/README.md, tools/aep-import/requirements.txt dist/EffectCraft-OFX/aep-import/
-          Compress-Archive -Path dist/EffectCraft-OFX -DestinationPath dist/EffectCraft-OFX-windows.zip
-      - uses: actions/upload-artifact@v4
+          Compress-Archive -Path dist/EffectCraft-OFX -DestinationPath "dist/EffectCraft-OFX-$env:LABEL-windows-x64.zip"
+      - name: Check the packaged app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive "dist/EffectCraft-OFX-$env:LABEL-windows-x64.zip" -DestinationPath check
+          $dir = 'check/EffectCraft-OFX'
+          Get-ChildItem $dir -Recurse -File | ForEach-Object { $_.FullName.Substring((Resolve-Path $dir).Path.Length + 1) }
+          # (effectcraft.exe is a Windows-subsystem program: it prints nothing to a console.)
+          & "$dir/effectcraft-cli.exe" --version
+          # The test plug-in in OFX\ next to the exe is found and loads.
+          $scan = (& "$dir/effectcraft-cli.exe" exec effect.plugins.scanOfx --empty | Out-String)
+          Write-Host $scan
+          if ($scan -notmatch 'EC Test Invert') { throw 'the bundled EC Test plug-in was not found next to the executable' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: effectcraft-ofx-windows
-          path: dist/EffectCraft-OFX-windows.zip
+          name: EffectCraft-OFX-${{ needs.version.outputs.label }}-windows-x64
+          path: dist/EffectCraft-OFX-${{ needs.version.outputs.label }}-windows-x64.zip
           if-no-files-found: error
           retention-days: 30
 
+  # Built on Ubuntu 22.04 (glibc 2.35) so the binaries run on newer distributions.
   linux:
-    name: Linux (test)
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    name: Package Linux x86_64
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      LABEL: ${{ needs.version.outputs.label }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev pkg-config \
+            desktop-file-utils
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          key: ofx-host-linux
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ofx-host-package-linux
+          cache-on-failure: true
           workspaces: |
             .
             examples/ofx/ec-test-ofx
       - name: Build the test OFX plug-in and lay out its bundle
+        run: bash tools/fork-installer/ci/build-test-bundle.sh
+      - name: Build the release binaries
+        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --features "$FEATURES"
+      - name: Runtime dependencies (ldd)
         run: |
-          cargo build --release --manifest-path examples/ofx/ec-test-ofx/Cargo.toml
-          dir=target/ofx-test/ec-test-ofx.ofx.bundle/Contents/Linux-x86-64
-          mkdir -p "$dir"
-          cp examples/ofx/ec-test-ofx/target/release/libec_test_ofx.so "$dir/ec-test-ofx.ofx"
-      - name: Test
-        env:
-          EC_TEST_OFX_BUNDLE: ${{ github.workspace }}/target/ofx-test/ec-test-ofx.ofx.bundle
-        run: cargo test -p effectcraft-ofx -p effectcraft-effects -p effectcraft-plugin -p effectcraft-host --features effectcraft-host/openfx
+          for exe in effectcraft effectcraft-cli; do
+            echo "== ldd target/release/$exe"
+            ldd "target/release/$exe"
+            echo "== highest glibc symbol version needed by $exe"
+            objdump -T "target/release/$exe" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1
+          done
+          echo "== libraries the app opens at run time (dlopen), from the strings in the binary"
+          strings -a target/release/effectcraft | grep -oE '\blib[A-Za-z0-9_+-]+\.so(\.[0-9]+)*' | sort -u || true
+      - name: Package (tar.gz, AppImage)
+        run: bash tools/fork-installer/ci/package-linux.sh "$LABEL" dist
+      - name: Check the tar.gz and install.sh / uninstall.sh
+        run: |
+          set -euo pipefail
+          mkdir check
+          tar -xzf "dist/EffectCraft-OFX-$LABEL-linux-x86_64.tar.gz" -C check
+          pkg="check/EffectCraft-OFX-$LABEL-linux-x86_64"
+          (cd check && find . -mindepth 1 | sort)
+          "$pkg/effectcraft" --version
+          "$pkg/effectcraft-cli" --version
+          out="$("$pkg/effectcraft-cli" exec effect.plugins.scanOfx --empty)"
+          echo "$out"
+          grep -q 'EC Test Invert' <<<"$out" || { echo "::error::the bundled EC Test plug-in was not found next to the executable"; exit 1; }
+          # Install into a scratch home, use the installed commands, uninstall.
+          # (errexit ignores a failing test inside an && list, hence the helper.)
+          need() { test "$@" || { echo "::error::check failed: test $*"; exit 1; }; }
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME"
+          "$pkg/install.sh" --yes
+          dest="$HOME/.local/share/effectcraft-ofx"
+          need -x "$dest/effectcraft"
+          need -L "$HOME/.local/bin/effectcraft-ofx"
+          need -f "$dest/OFX/ec-test-ofx.ofx.bundle/Contents/Linux-x86-64/ec-test-ofx.ofx"
+          need -f "$HOME/.local/share/applications/effectcraft-ofx.desktop"
+          need -f "$HOME/.local/share/icons/hicolor/256x256/apps/effectcraft-ofx.png"
+          desktop-file-validate "$HOME/.local/share/applications/effectcraft-ofx.desktop"
+          "$HOME/.local/bin/effectcraft-ofx" --version
+          # Through the symlink, the app still finds OFX/ next to its real file.
+          out="$("$HOME/.local/bin/effectcraft-cli-ofx" exec effect.plugins.scanOfx --empty)"
+          grep -q 'EC Test Invert' <<<"$out" || { echo "::error::the installed copy did not find the EC Test plug-in"; exit 1; }
+          python3 "$dest/aep-import/aep2effectcraft.py" --help >/dev/null || { echo "::warning::py-aep is not importable after install.sh"; }
+          "$dest/uninstall.sh" --yes
+          need ! -e "$dest"
+          need ! -e "$HOME/.local/bin/effectcraft-ofx"
+          need ! -e "$HOME/.local/share/applications/effectcraft-ofx.desktop"
+      - name: Check the AppImage
+        run: |
+          set -euo pipefail
+          appimage="$PWD/dist/EffectCraft-OFX-$LABEL-linux-x86_64.AppImage"
+          chmod +x "$appimage"
+          ls -lh "$appimage"
+          # Extract-and-run: no FUSE needed (as on CI, containers and minimal installs).
+          APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
+          mkdir appimage-check
+          (cd appimage-check && APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --appimage-extract >/dev/null)
+          root=appimage-check/squashfs-root
+          ls -l "$root/usr/bin" "$root/usr/bin/OFX" "$root/usr/bin/aep-import"
+          out="$("$root/usr/bin/effectcraft-cli" exec effect.plugins.scanOfx --empty)"
+          echo "$out"
+          grep -q 'EC Test Invert' <<<"$out" || { echo "::error::the AppImage's EC Test plug-in was not found next to its executable"; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: EffectCraft-OFX-${{ needs.version.outputs.label }}-linux-x86_64-tar
+          path: dist/EffectCraft-OFX-${{ needs.version.outputs.label }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: EffectCraft-OFX-${{ needs.version.outputs.label }}-linux-x86_64-AppImage
+          path: dist/EffectCraft-OFX-${{ needs.version.outputs.label }}-linux-x86_64.AppImage
+          if-no-files-found: error
+          retention-days: 30
+
+  # Apple Silicon (arm64) and Intel (x86_64, cross-compiled on the same runner).
+  macos:
+    name: Package macOS ${{ matrix.arch }}
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, target: aarch64-apple-darwin }
+          - { arch: x86_64, target: x86_64-apple-darwin }
+    env:
+      LABEL: ${{ needs.version.outputs.label }}
+      # Keep in sync with LSMinimumSystemVersion in packaging/macos/Info.plist.in.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ofx-host-package-macos-${{ matrix.arch }}
+          cache-on-failure: true
+          workspaces: |
+            .
+            examples/ofx/ec-test-ofx
+      - name: Build the test OFX plug-in and lay out its bundle
+        run: bash tools/fork-installer/ci/build-test-bundle.sh --target "${{ matrix.target }}"
+      - name: Build the release binaries
+        run: cargo build --release --locked -p effectcraft -p effectcraft-cli --features "$FEATURES" --target "${{ matrix.target }}"
+      - name: Runtime dependencies and minimum macOS version
+        run: |
+          for exe in effectcraft effectcraft-cli; do
+            bin="target/${{ matrix.target }}/release/$exe"
+            echo "== $bin"
+            file "$bin"
+            lipo -info "$bin"
+            otool -L "$bin"
+            otool -l "$bin" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' || true
+          done
+      - name: Package EffectCraft.app (ad-hoc signed)
+        run: bash tools/fork-installer/macos/package-app.sh --label "$LABEL" --arch "${{ matrix.arch }}" --out dist
+      - name: Check the package
+        run: |
+          # Diagnostics: carry on after a failed command (the default shell is `bash -e`) and warn instead.
+          set +e
+          set -u
+          zip="dist/EffectCraft-OFX-$LABEL-macos-${{ matrix.arch }}.zip"
+          mkdir check
+          ditto -x -k "$zip" check
+          dir="check/EffectCraft-OFX-$LABEL-macos-${{ matrix.arch }}"
+          (cd check && find . -maxdepth 6 -not -path '*/Contents/Resources/*' | sort)
+          app="$dir/EffectCraft.app"
+          codesign --verify --deep --strict --verbose=2 "$app" || echo "::warning::codesign --verify failed on the extracted app"
+          # Gatekeeper's verdict, for the record: an ad-hoc signed app is rejected until the quarantine flag is cleared.
+          spctl --assess --type execute --verbose=4 "$app" || true
+          run=()
+          if [ "${{ matrix.arch }}" = x86_64 ]; then run=(arch -x86_64); fi
+          ${run[@]+"${run[@]}"} "$app/Contents/MacOS/EffectCraft" --version || echo "::warning::could not run the app (x86_64 needs Rosetta on this runner)"
+          ${run[@]+"${run[@]}"} "$app/Contents/MacOS/effectcraft-cli" --version || echo "::warning::could not run the CLI"
+          # The OFX host's first run on this CPU: scan the bundled test plug-in.
+          out="$(${run[@]+"${run[@]}"} "$app/Contents/MacOS/effectcraft-cli" exec effect.plugins.scanOfx --empty 2>&1)"; code=$?
+          echo "$out"
+          if [ $code -ne 0 ] || ! grep -q 'EC Test Invert' <<<"$out"; then
+            echo "::warning title=macOS ${{ matrix.arch }}: OFX scan::scanning the bundled EC Test plug-in failed (exit $code); see the log"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: EffectCraft-OFX-${{ needs.version.outputs.label }}-macos-${{ matrix.arch }}
+          path: dist/EffectCraft-OFX-${{ needs.version.outputs.label }}-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # A draft GitHub Release for a tag push (v*-ofx.*); the maintainer publishes it.
+  release:
+    name: Draft GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-ofx.')
+    needs: [version, test, windows, linux, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      LABEL: ${{ needs.version.outputs.label }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: EffectCraft-OFX-*
+          merge-multiple: true
+          path: dist
+      - name: Create the draft release
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum EffectCraft-OFX-* >SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cat >../notes.md <<NOTES
+          **Unofficial** build of [EffectCraft](https://github.com/storytold/effectcraft) with OpenFX plug-in support and After Effects project import. Please report problems [here](https://github.com/glumbis/effectcraft/issues), not to the EffectCraft maintainers or the plug-in vendors.
+
+          | Download | For |
+          |---|---|
+          | \`EffectCraft-OFX-$LABEL-windows-x64.zip\` | Windows 10/11 (64-bit): unzip, run \`Install EffectCraft.bat\` |
+          | \`EffectCraft-OFX-$LABEL-linux-x86_64.tar.gz\` | Linux (64-bit Intel/AMD): unpack, run \`./install.sh\` (no root needed) |
+          | \`EffectCraft-OFX-$LABEL-linux-x86_64.AppImage\` | Linux: make executable and run |
+          | \`EffectCraft-OFX-$LABEL-macos-arm64.zip\` | macOS on Apple Silicon (M1 and later): see \`READ ME FIRST.txt\` inside |
+          | \`EffectCraft-OFX-$LABEL-macos-x86_64.zip\` | macOS on Intel Macs |
+
+          The builds are not code-signed (Windows) or notarized (macOS); see the README in each download for the first-launch steps. SHA-256 checksums: \`SHA256SUMS.txt\`.
+          NOTES
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+            [ "$draft" = true ] || { echo "::error::release $GITHUB_REF_NAME already exists and is published; not touching it"; exit 1; }
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber EffectCraft-OFX-* SHA256SUMS.txt
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+              --title "EffectCraft + OpenFX $LABEL (Unofficial)" --notes-file ../notes.md \
+              EffectCraft-OFX-* SHA256SUMS.txt
+          fi

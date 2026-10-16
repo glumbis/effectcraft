@@ -1,0 +1,56 @@
+EffectCraft + OpenFX @LABEL@ (macOS @ARCH@, unofficial)
+==========================================================
+
+This is a build of EffectCraft that can run OpenFX plug-ins and open After Effects projects.
+It is NOT made by the EffectCraft maintainers; report problems to
+https://github.com/glumbis/effectcraft/issues
+
+1. Install
+----------
+Drag EffectCraft.app into your Applications folder.
+
+2. Open it the first time (the app is not notarized)
+----------------------------------------------------
+The app is signed only with a local ad-hoc signature, because this project has no Apple developer
+certificate. macOS therefore blocks it the first time ("EffectCraft can't be opened because Apple
+cannot check it for malicious software"). Either:
+
+  a) Open Terminal and run, once:
+
+         xattr -dr com.apple.quarantine /Applications/EffectCraft.app
+
+     (also run it for this folder if you want to use "Set up After Effects import.command":
+      xattr -dr com.apple.quarantine "<this folder>")
+
+  or
+
+  b) Try to open EffectCraft, then go to  System Settings > Privacy & Security, scroll down to
+     "EffectCraft was blocked" and click "Open Anyway". (On macOS 14 and older you can also
+     right-click the app and choose Open.)
+
+You only need to do this once per download.
+
+3. OpenFX plug-ins
+------------------
+Install your plug-ins with their own installers, choosing the OFX version. They go into
+/Library/OFX/Plugins, where EffectCraft finds them automatically. A tiny test plug-in ("EC Test" in
+Effects & Presets) is already inside the app. If you cannot see your plug-ins, look at the report
+EffectCraft writes at start-up: ~/Library/Application Support/EffectCraft/ofx_scan.txt
+
+Only macOS builds of plug-ins work (a "MacOS" folder inside the .ofx.bundle), and they must match
+this app's processor: this download is for @ARCH@ Macs.
+
+4. After Effects project import (.aep / .aepx)
+----------------------------------------------
+Needs Python 3 and the py-aep library. Double-click "Set up After Effects import.command" (run the
+xattr command from step 2 on this folder first), or in Terminal:
+
+    /usr/bin/python3 -m pip install --user py-aep
+
+Then use File > Import > After Effects Project... in EffectCraft.
+
+5. Command line
+---------------
+/Applications/EffectCraft.app/Contents/MacOS/effectcraft-cli --help
+
+Requires macOS 11 (Big Sur) or newer. More in README.md.

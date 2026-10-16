@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=EffectCraft (OFX)
+GenericName=Motion Graphics Editor
+Comment=EffectCraft with OpenFX plug-ins and After Effects project import (unofficial)
+Exec=@EXEC@ %F
+TryExec=@TRYEXEC@
+Icon=effectcraft-ofx
+Terminal=false
+StartupNotify=true
+StartupWMClass=ai.storyteller.effectcraft
+Categories=AudioVideo;Video;Graphics;2DGraphics;
+Keywords=motion;graphics;animation;compositor;effects;keyframe;vfx;openfx;ofx;

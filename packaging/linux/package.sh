@@ -62,6 +62,12 @@ rm -rf "$WORK"
 install -Dm755 "$BIN/effectcraft" "$STAGE/usr/bin/effectcraft"
 install -Dm755 "$BIN/effectcraft-cli" "$STAGE/usr/bin/effectcraft-cli"
 "${CROSS_COMPILE:-}strip" "$STAGE/usr/bin/effectcraft" "$STAGE/usr/bin/effectcraft-cli" 2>/dev/null || true
+# Fork hook (OpenFX fork, tools/fork-installer/ci/package-linux.sh): EFFECTCRAFT_STAGE_EXTRA names a
+# folder whose contents are copied next to the binaries, so the app finds its OFX/ plug-in folder and
+# aep-import/ converter beside its executable in every format. Unset upstream: nothing happens.
+if [ -n "${EFFECTCRAFT_STAGE_EXTRA:-}" ]; then
+  cp -R "$EFFECTCRAFT_STAGE_EXTRA"/. "$STAGE/usr/bin/"
+fi
 install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
 install -Dm644 "$HERE/$APP_ID.mime.xml" "$STAGE/usr/share/mime/packages/$APP_ID.xml"
 mkdir -p "$STAGE/usr/share/metainfo"
