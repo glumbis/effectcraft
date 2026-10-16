@@ -1,6 +1,8 @@
 //! Clips and images: the clip objects plug-ins define and query, the OFX image handles returned
 //! by `clipGetImage`, and the conversion between EffectCraft's premultiplied RGBA `f32` rows
-//! (row 0 = top) and OFX pixel buffers (any depth, RGBA / RGB / alpha, rows bottom-up).
+//! (row 0 = top) and OFX pixel buffers (any depth, RGBA / RGB / alpha, rows bottom-up). The depths are 8-bit, 16-bit
+//! integer, half float (IEEE 754 binary16, converted by hand: [`f32_to_f16`], [`f16_to_f32`]) and
+//! 32-bit float.
 //!
 //! OFX images are y-up. Instead of handing out negative row bytes (some plug-ins mishandle
 //! them), the conversion flips the rows: OFX row 0 is EffectCraft's bottom row and `rowBytes`
@@ -86,6 +88,8 @@ impl ClipObj {
 pub enum Depth {
     Byte,
     Short,
+    /// IEEE 754 binary16 (`OfxBitDepthHalf`).
+    Half,
     Float,
 }
 
@@ -94,6 +98,7 @@ impl Depth {
         match self {
             Depth::Byte => DEPTH_BYTE,
             Depth::Short => DEPTH_SHORT,
+            Depth::Half => DEPTH_HALF,
             Depth::Float => DEPTH_FLOAT,
         }
     }
@@ -101,6 +106,7 @@ impl Depth {
         match s {
             DEPTH_BYTE => Some(Depth::Byte),
             DEPTH_SHORT => Some(Depth::Short),
+            DEPTH_HALF => Some(Depth::Half),
             DEPTH_FLOAT => Some(Depth::Float),
             _ => None,
         }
@@ -108,10 +114,69 @@ impl Depth {
     pub fn bytes(self) -> usize {
         match self {
             Depth::Byte => 1,
-            Depth::Short => 2,
+            Depth::Short | Depth::Half => 2,
             Depth::Float => 4,
         }
     }
+}
+
+/// The IEEE 754 binary32 value `v` as binary16 bits: rounded to nearest, ties to even; values too
+/// large for half (65520 and up) become infinity, values below the smallest subnormal's half
+/// (2^-25) become zero (the sign is kept, also for zero); subnormals are produced where half has
+/// them; infinities stay infinite and every NaN stays a NaN (a quiet one, the top payload bits kept).
+pub fn f32_to_f16(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xFF) as i32;
+    let man = x & 0x007F_FFFF;
+    if exp == 0xFF {
+        // The quiet bit makes sure a NaN whose payload sits in the low bits is not an infinity.
+        return if man == 0 { sign | 0x7C00 } else { sign | 0x7E00 | (man >> 13) as u16 };
+    }
+    // The exponent re-biased for half (bias 15); 1..=30 are normal numbers there.
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        // Zero, subnormal in half, or too small to be anything but zero (f32 subnormals included).
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let kept = m >> shift;
+        let rest = m & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        // A carry out of the subnormals is the smallest normal number, which is what it should be.
+        let r = if rest > half || (rest == half && kept & 1 == 1) { kept + 1 } else { kept };
+        return sign | r as u16;
+    }
+    let kept = ((e as u32) << 10) | (man >> 13);
+    let rest = man & 0x1FFF;
+    // A carry out of the mantissa raises the exponent, up to infinity for the largest numbers.
+    let r = if rest > 0x1000 || (rest == 0x1000 && kept & 1 == 1) { kept + 1 } else { kept };
+    sign | r as u16
+}
+
+/// The binary16 bits `h` as the (exactly equal) binary32 value: subnormals are normalised,
+/// infinities and NaNs (payload kept) map to the same kind.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exp = u32::from((h >> 10) & 0x1F);
+    let man = u32::from(h & 0x03FF);
+    let bits = match (exp, man) {
+        (0, 0) => sign,
+        (0, m) => {
+            // m * 2^-24 with the leading one moved to bit 10.
+            let shift = m.leading_zeros() - 21;
+            sign | ((113 - shift) << 23) | (((m << shift) & 0x03FF) << 13)
+        }
+        (0x1F, 0) => sign | 0x7F80_0000,
+        (0x1F, m) => sign | 0x7F80_0000 | (m << 13),
+        (e, m) => sign | ((e + 112) << 23) | (m << 13),
+    };
+    f32::from_bits(bits)
 }
 
 /// OFX pixel components this host can produce.
@@ -387,6 +452,12 @@ fn encode_pixel(p: [f32; 4], depth: Depth, comps: Comps, out: &mut [u8]) {
                     o.copy_from_slice(&q.to_ne_bytes());
                 }
             }
+            Depth::Half => {
+                // Like float, half keeps values outside [0, 1] (up to 65504).
+                if let Some(o) = out.get_mut(i * 2..i * 2 + 2) {
+                    o.copy_from_slice(&f32_to_f16(*v).to_ne_bytes());
+                }
+            }
             Depth::Byte => {
                 if let Some(o) = out.get_mut(i) {
                     *o = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
@@ -403,6 +474,7 @@ fn decode_pixel(s: &[u8], depth: Depth, comps: Comps) -> [f32; 4] {
         *slot = match depth {
             Depth::Float => s.get(i * 4..i * 4 + 4).map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0),
             Depth::Short => s.get(i * 2..i * 2 + 2).map(|b| u16::from_ne_bytes([b[0], b[1]]) as f32 / 65535.0).unwrap_or(0.0),
+            Depth::Half => s.get(i * 2..i * 2 + 2).map(|b| f16_to_f32(u16::from_ne_bytes([b[0], b[1]]))).unwrap_or(0.0),
             Depth::Byte => s.get(i).map(|b| *b as f32 / 255.0).unwrap_or(0.0),
         };
     }
@@ -476,7 +548,7 @@ mod tests {
     #[test]
     fn buffers_are_aligned_and_rows_are_tight() {
         for (w, h) in [(1, 1), (3, 2), (5, 3), (16, 4), (17, 1), (1920, 2)] {
-            for depth in [Depth::Byte, Depth::Short, Depth::Float] {
+            for depth in [Depth::Byte, Depth::Short, Depth::Half, Depth::Float] {
                 for comps in [Comps::Rgba, Comps::Rgb, Comps::Alpha] {
                     let img = ClipImage::blank(rect(w, h), rect(w, h), depth, comps).unwrap();
                     assert_eq!(img.buf.ptr() as usize % IMAGE_ALIGN, 0, "{w}x{h} {depth:?} {comps:?}");
@@ -496,7 +568,7 @@ mod tests {
         let (w, h) = (5usize, 3usize);
         let src: Vec<[f32; 4]> = (0..w * h).map(|i| [i as f32 / 16.0, 0.25 + i as f32 / 32.0, 0.5, 1.0 - i as f32 / 32.0]).collect();
         for multiple in [1usize, IMAGE_ALIGN] {
-            for depth in [Depth::Float, Depth::Short, Depth::Byte] {
+            for depth in [Depth::Float, Depth::Half, Depth::Short, Depth::Byte] {
                 for comps in [Comps::Rgba, Comps::Rgb, Comps::Alpha] {
                     let b = rect(w as i32, h as i32);
                     let img = ClipImage::blank_strided(b, b, depth, comps, multiple).unwrap();
@@ -506,6 +578,7 @@ mod tests {
                     img.write_rows(&mut back, false);
                     let tol = match depth {
                         Depth::Float => 1e-6,
+                        Depth::Half => 1e-3,
                         Depth::Short => 1e-4,
                         Depth::Byte => 3e-3,
                     };
@@ -550,6 +623,137 @@ mod tests {
         let mut back = vec![[0.0f32; 4]; w * h];
         padded.write_rows(&mut back, false);
         assert_eq!(back, src);
+    }
+
+    /// Half-float images keep what half can hold: values above 1 and below 0, the tiny ones (half
+    /// subnormals), infinity (written as 0 coming back, like every non-finite value) and the two
+    /// bytes per channel the format has.
+    #[test]
+    fn half_images_hold_hdr_values_and_two_bytes_per_channel() {
+        let src = vec![[8.0f32, -0.5, 1.0e-6, 1.0], [65504.0, 0.0, 0.333_333_33, 0.999], [f32::INFINITY, f32::NAN, 1.0e6, 0.5]];
+        let b = rect(3, 1);
+        let img = ClipImage::from_rows(&src, 3, (0, 0, 3, 1), b, b, Depth::Half, Comps::Rgba).unwrap();
+        assert_eq!((img.pixel_bytes(), img.row_bytes), (8, 24));
+        // SAFETY: nothing else holds the image.
+        let bytes = unsafe { img.buf.bytes_ref() };
+        let half = |i: usize| u16::from_ne_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+        assert_eq!((half(0), half(1)), (0x4800, 0xB800)); // 8.0, -0.5
+        assert_eq!(half(4), 0x7BFF); // 65504
+        assert_eq!(half(8), 0x7C00); // infinity
+        assert_eq!(f16_to_f32(half(8 + 3)), 0.5);
+        let mut back = vec![[9.0f32; 4]; 3];
+        img.write_rows(&mut back, false);
+        assert_eq!(back[0][..2], [8.0, -0.5]);
+        assert!((back[0][2] - 1.0e-6).abs() < 6.0e-8, "{}", back[0][2]);
+        assert_eq!(back[1][0], 65504.0);
+        assert!((back[1][2] - 0.333_333_33).abs() < 3.0e-4);
+        // Infinity, NaN and the 1e6 that overflowed half are not finite: they come back as 0.
+        assert_eq!(back[2], [0.0, 0.0, 0.0, 0.5]);
+    }
+
+    /// The conversion's edge cases, against values worked out from the format (1 sign bit, 5 exponent
+    /// bits with bias 15, 10 mantissa bits).
+    #[test]
+    fn f32_to_f16_edge_cases() {
+        let bits = f32::from_bits;
+        // 2^-14 (the smallest normal half), 2^-24 (the smallest subnormal), 2^-25 (half of it), exactly.
+        let (p14, p24, p25) = (1.0f32 / 16_384.0, 1.0f32 / 16_777_216.0, 1.0f32 / 33_554_432.0);
+        let tie = 1.0f32 + 1.0 / 2048.0;
+        for (v, h) in [
+            (0.0f32, 0x0000u16),
+            (-0.0, 0x8000),
+            (1.0, 0x3C00),
+            (-2.0, 0xC000),
+            (0.5, 0x3800),
+            (65504.0, 0x7BFF),
+            (-65504.0, 0xFBFF),
+            // Overflow: the tie between 65504 and "65536" rounds to even = infinity; just below it stays finite.
+            (65520.0, 0x7C00),
+            (65519.996, 0x7BFF),
+            (1.0e9, 0x7C00),
+            (-1.0e9, 0xFC00),
+            (f32::MAX, 0x7C00),
+            (f32::INFINITY, 0x7C00),
+            (f32::NEG_INFINITY, 0xFC00),
+            // The smallest normal number, the largest subnormal, the smallest subnormal.
+            (p14, 0x0400),
+            (1023.0 * p24, 0x03FF),
+            (p24, 0x0001),
+            (-p24, 0x8001),
+            // Below half the smallest subnormal: zero (the sign stays); exactly half: ties to even (zero);
+            // just over: the smallest subnormal. f32's own subnormals are far below.
+            (2.0e-8, 0x0000),
+            (-2.0e-8, 0x8000),
+            (p25, 0x0000),
+            (bits(p25.to_bits() + 1), 0x0001),
+            (f32::MIN_POSITIVE, 0x0000),
+            (bits(1), 0x0000),
+            // Round to nearest even in the normal range: 1 + 2^-11 is a tie (down to 1.0), 1 + 3*2^-11 a tie (up).
+            (tie, 0x3C00),
+            (1.0 + 3.0 / 2048.0, 0x3C02),
+            (bits(tie.to_bits() + 1), 0x3C01),
+        ] {
+            assert_eq!(f32_to_f16(v), h, "{v:e} -> {h:#06x}, got {:#06x}", f32_to_f16(v));
+        }
+        // NaNs stay NaNs, in every payload and sign, also when the payload is in the bits that are cut off.
+        for pattern in [0x7FC0_0000u32, 0x7F80_0001, 0x7FBF_FFFF, 0xFFC0_0000, 0xFF80_0001, 0x7F80_2000] {
+            let h = f32_to_f16(bits(pattern));
+            assert!(h & 0x7C00 == 0x7C00 && h & 0x03FF != 0, "{pattern:#x} -> {h:#06x}");
+            assert_eq!(h & 0x8000, ((pattern >> 16) & 0x8000) as u16);
+            assert!(f16_to_f32(h).is_nan());
+        }
+    }
+
+    #[test]
+    fn f16_to_f32_edge_cases() {
+        let (p14, p24) = (1.0f32 / 16_384.0, 1.0f32 / 16_777_216.0);
+        for (h, v) in [
+            (0x0000u16, 0.0f32),
+            (0x3C00, 1.0),
+            (0xC000, -2.0),
+            (0x7BFF, 65504.0),
+            (0x0400, p14),
+            (0x03FF, 1023.0 * p24),
+            (0x0001, p24),
+            (0x8001, -p24),
+            (0x7C00, f32::INFINITY),
+            (0xFC00, f32::NEG_INFINITY),
+        ] {
+            assert_eq!(f16_to_f32(h), v, "{h:#06x}");
+        }
+        assert!(f16_to_f32(0x8000) == 0.0 && f16_to_f32(0x8000).is_sign_negative());
+        for h in [0x7C01u16, 0x7E00, 0xFE00, 0xFFFF] {
+            assert!(f16_to_f32(h).is_nan(), "{h:#06x}");
+        }
+    }
+
+    /// All 65536 half values: each one converts to an f32 and back to itself (NaNs to a NaN), the
+    /// values grow with the bits, and the f32 halfway between two neighbours rounds to the even one
+    /// while a hair either side rounds to the nearer.
+    #[test]
+    fn every_half_value_round_trips_and_rounds_to_nearest_even() {
+        for h in 0..=u16::MAX {
+            let v = f16_to_f32(h);
+            if (h & 0x7C00) == 0x7C00 && (h & 0x03FF) != 0 {
+                assert!(v.is_nan(), "{h:#06x}");
+                let back = f32_to_f16(v);
+                assert!((back & 0x7C00) == 0x7C00 && (back & 0x03FF) != 0 && (back & 0x8000) == (h & 0x8000), "{h:#06x} -> {back:#06x}");
+            } else {
+                assert_eq!(f32_to_f16(v), h, "{h:#06x} = {v:e}");
+            }
+        }
+        // Neighbouring finite positive values (the sign is symmetric), up to the largest, which has
+        // infinity as its upper neighbour (65536 in the rounding sense: the tie is 65520).
+        for h in 0..0x7BFFu16 {
+            let (a, b) = (f16_to_f32(h), f16_to_f32(h + 1));
+            assert!(a < b, "{h:#06x}");
+            let mid = (a + b) / 2.0;
+            let even = if h % 2 == 0 { h } else { h + 1 };
+            assert_eq!(f32_to_f16(mid), even, "tie above {h:#06x}");
+            assert_eq!(f32_to_f16(f32::from_bits(mid.to_bits() - 1)), h, "just below the tie above {h:#06x}");
+            assert_eq!(f32_to_f16(f32::from_bits(mid.to_bits() + 1)), h + 1, "just above the tie above {h:#06x}");
+            assert_eq!(f32_to_f16(-mid), even | 0x8000, "negative tie above {h:#06x}");
+        }
     }
 
     /// A buffer that comes back from the pool is zero again, and its size matters.

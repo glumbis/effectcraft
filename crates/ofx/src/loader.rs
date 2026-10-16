@@ -796,6 +796,16 @@ fn effect_id(ofx_id: &str) -> String {
     id
 }
 
+/// The pixel depth a plug-in that lists `listed` works in: float when it has it (nothing listed
+/// means float too), then the integer depths a plug-in that worked before this host spoke half
+/// float was given (16-bit, then 8-bit), then half float. `None` when it lists none of them.
+fn pick_depth(listed: &[String]) -> Option<Depth> {
+    if listed.is_empty() {
+        return Some(Depth::Float);
+    }
+    [Depth::Float, Depth::Short, Depth::Half, Depth::Byte].into_iter().find(|d| listed.iter().any(|s| s == d.name()))
+}
+
 fn pick_comps(listed: &[String]) -> Comps {
     let has = |c: Comps| listed.iter().any(|s| s == c.name());
     if listed.is_empty() || has(Comps::Rgba) {
@@ -1003,15 +1013,10 @@ fn describe_core(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Reentr
     }
 
     let depths = desc.props.strs(IE_SUPPORTED_PIXEL_DEPTHS);
-    let depth = if depths.is_empty() {
-        Depth::Float
-    } else {
-        match [Depth::Float, Depth::Short, Depth::Byte].into_iter().find(|d| depths.iter().any(|s| s == d.name())) {
-            Some(d) => d,
-            None => {
-                return Step::Fail(format!("needs an unsupported pixel depth {depths:?} (this host offers {DEPTH_FLOAT}, {DEPTH_SHORT} and {DEPTH_BYTE})"));
-            }
-        }
+    let Some(depth) = pick_depth(&depths) else {
+        return Step::Fail(format!(
+            "needs an unsupported pixel depth {depths:?} (this host offers {DEPTH_FLOAT}, {DEPTH_HALF}, {DEPTH_SHORT} and {DEPTH_BYTE})"
+        ));
     };
     let safety = match desc.props.str(IE_RENDER_THREAD_SAFETY).as_deref() {
         Some(IE_RENDER_UNSAFE) => Safety::Unsafe,
@@ -1167,6 +1172,27 @@ mod tests {
 
     fn offer(id: &str, major: u32, minor: u32) -> Offer {
         Offer { id: id.into(), version: (major, minor) }
+    }
+
+    fn depths(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Half float is a depth a plug-in can have (it used to be refused): float wins when the plug-in
+    /// has both, a half-only plug-in gets half, and the choices that worked before stay.
+    #[test]
+    fn the_pixel_depth_prefers_float_and_accepts_half() {
+        assert_eq!(pick_depth(&depths(&[DEPTH_HALF])), Some(Depth::Half));
+        assert_eq!(pick_depth(&depths(&[DEPTH_HALF, DEPTH_FLOAT])), Some(Depth::Float));
+        assert_eq!(pick_depth(&depths(&[DEPTH_BYTE, DEPTH_HALF, DEPTH_SHORT, DEPTH_FLOAT])), Some(Depth::Float));
+        // As before, 16-bit beats 8-bit; half float comes after 16-bit and before 8-bit.
+        assert_eq!(pick_depth(&depths(&[DEPTH_BYTE, DEPTH_SHORT])), Some(Depth::Short));
+        assert_eq!(pick_depth(&depths(&[DEPTH_BYTE, DEPTH_HALF, DEPTH_SHORT])), Some(Depth::Short));
+        assert_eq!(pick_depth(&depths(&[DEPTH_BYTE, DEPTH_HALF])), Some(Depth::Half));
+        assert_eq!(pick_depth(&depths(&[DEPTH_BYTE])), Some(Depth::Byte));
+        // Nothing listed is float; a depth this host does not know is nothing.
+        assert_eq!(pick_depth(&[]), Some(Depth::Float));
+        assert_eq!(pick_depth(&depths(&[DEPTH_NONE, "OfxBitDepthWeird"])), None);
     }
 
     #[test]

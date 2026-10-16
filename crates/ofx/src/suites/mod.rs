@@ -60,7 +60,7 @@ fn build_host_props() -> PropSet {
     p.put_int(IE_SEQUENTIAL_RENDER, 0);
     p.put_strs(IE_SUPPORTED_COMPONENTS, &[COMP_RGBA, COMP_RGB, COMP_ALPHA]);
     p.put_strs(IE_SUPPORTED_CONTEXTS, &[CTX_FILTER, CTX_GENERAL, CTX_TRANSITION, CTX_GENERATOR]);
-    p.put_strs(IE_SUPPORTED_PIXEL_DEPTHS, &[DEPTH_FLOAT, DEPTH_SHORT, DEPTH_BYTE]);
+    p.put_strs(IE_SUPPORTED_PIXEL_DEPTHS, &[DEPTH_FLOAT, DEPTH_HALF, DEPTH_SHORT, DEPTH_BYTE]);
     p.put_int(IE_MULTIPLE_CLIP_DEPTHS, 0);
     p.put_int(IE_MULTIPLE_CLIP_PARS, 0);
     p.put_int(IE_SETABLE_FRAME_RATE, 0);
@@ -154,6 +154,8 @@ mod tests {
         assert_eq!(p.str(IE_CPU_RENDER_SUPPORTED).as_deref(), Some("true"));
         assert_eq!(p.int(IE_RENDER_QUALITY_DRAFT), Some(0));
         assert_eq!(p.int(IE_SEQUENTIAL_RENDER), Some(0));
+        // Half float is offered (after float, which a plug-in that has both gets).
+        assert_eq!(p.strs(IE_SUPPORTED_PIXEL_DEPTHS), [DEPTH_FLOAT, DEPTH_HALF, DEPTH_SHORT, DEPTH_BYTE]);
         assert_eq!(p.int(PH_SUPPORTS_PARAMETRIC_ANIMATION), Some(0));
         // The window handle is a pointer property, null here.
         assert_eq!(p.ptr(P_HOST_OS_HANDLE), Some(0));
