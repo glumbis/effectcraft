@@ -6,13 +6,14 @@
 //! them), the conversion flips the rows: OFX row 0 is EffectCraft's bottom row and `rowBytes`
 //! is positive.
 //!
-//! Image buffers start on a 64-byte boundary and every row starts on one too: `rowBytes` is the
-//! row's size rounded up to a multiple of 64 (an RGB float row of 5 pixels is 60 bytes of pixels
-//! in a 64-byte row), as plug-ins that load rows with aligned SIMD instructions expect. Every
-//! conversion goes through `rowBytes`, never through width times pixel size. Freed buffers are
-//! kept for the next image of the same size (the frames of one render are all the same size), so
-//! a render does not ask the operating system for tens of megabytes and have it zeroed again for
-//! every effect.
+//! Image buffers start on a 64-byte boundary, but rows are packed tightly: `rowBytes` is exactly
+//! width times the bytes of a pixel. Plug-ins that worked with tightly packed rows (and some assume
+//! them) keep working; a plug-in that loads the first row with aligned SIMD instructions gets an
+//! aligned base. Every conversion still goes through the image's `row_bytes` (the value reported to
+//! the plug-in as `OfxImagePropRowBytes`), never through width times pixel size, so a stride the
+//! host may choose later needs no change in the conversions. Freed buffers are kept for the next
+//! image of the same size (the frames of one render are all the same size), so a render does not
+//! ask the operating system for tens of megabytes and have it zeroed again for every effect.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashSet;
@@ -146,7 +147,7 @@ impl Comps {
     }
 }
 
-/// Buffers and rows are aligned to this many bytes.
+/// Buffers start on a multiple of this many bytes (rows do not: they are tightly packed).
 pub const IMAGE_ALIGN: usize = 64;
 
 /// The most freed buffers kept for reuse, and the most bytes they hold together.
@@ -175,7 +176,7 @@ pub fn release_spare_buffers() {
     }
 }
 
-/// A 64-byte-aligned pixel buffer the plug-in reads (and, for the output image, writes) through
+/// A pixel buffer, 64-byte aligned at its start, that the plug-in reads (and, for the output image, writes) through
 /// a raw pointer while the host keeps it alive.
 pub struct PixBuf {
     ptr: NonNull<u8>,
@@ -251,7 +252,8 @@ pub struct ClipImage {
     pub bounds: OfxRectI,
     /// The region of definition.
     pub rod: OfxRectI,
-    /// The distance between rows in bytes: the row's pixels rounded up to [`IMAGE_ALIGN`].
+    /// The distance between rows in bytes, as reported to the plug-in. [`ClipImage::blank`]
+    /// packs rows tightly (width times the bytes of a pixel).
     pub row_bytes: i32,
     pub depth: Depth,
     pub comps: Comps,
@@ -269,13 +271,21 @@ impl ClipImage {
         self.depth.bytes() * self.comps.channels()
     }
 
-    /// A transparent image covering `bounds`; `None` if it does not fit in memory.
+    /// A transparent image covering `bounds` with tightly packed rows; `None` if it does not fit
+    /// in memory.
     pub fn blank(bounds: OfxRectI, rod: OfxRectI, depth: Depth, comps: Comps) -> Option<ClipImage> {
+        ClipImage::blank_strided(bounds, rod, depth, comps, 1)
+    }
+
+    /// A transparent image whose `rowBytes` is the row's pixels rounded up to a multiple of
+    /// `row_multiple` (1 = tightly packed, which is what the host hands to plug-ins). The
+    /// conversions work for any stride; tests use a padded one to prove it.
+    fn blank_strided(bounds: OfxRectI, rod: OfxRectI, depth: Depth, comps: Comps, row_multiple: usize) -> Option<ClipImage> {
         let w = (bounds.x2 as i64 - bounds.x1 as i64).max(0) as usize;
         let h = (bounds.y2 as i64 - bounds.y1 as i64).max(0) as usize;
         let px = depth.bytes() * comps.channels();
-        // Rows start on aligned addresses; `rowBytes` is an int in the plug-in's world.
-        let row = w.checked_mul(px)?.checked_next_multiple_of(IMAGE_ALIGN)?;
+        // `rowBytes` is an int in the plug-in's world.
+        let row = w.checked_mul(px)?.checked_next_multiple_of(row_multiple.max(1))?;
         let row_bytes = i32::try_from(row).ok()?;
         let buf = PixBuf::zeroed(row.checked_mul(h)?)?;
         Some(ClipImage { buf, bounds, rod, row_bytes, depth, comps, premult: IMAGE_PREMULTIPLIED })
@@ -293,27 +303,35 @@ impl ClipImage {
         depth: Depth,
         comps: Comps,
     ) -> Option<ClipImage> {
+        let img = ClipImage::blank(bounds, rod, depth, comps)?;
+        img.fill_from(src, sw, crop);
+        Some(img)
+    }
+
+    /// Fill a freshly made image from the crop of an EffectCraft buffer (see [`from_rows`]); a
+    /// crop whose size is not the image's leaves it transparent.
+    ///
+    /// [`from_rows`]: ClipImage::from_rows
+    fn fill_from(&self, src: &[[f32; 4]], sw: usize, crop: (usize, usize, usize, usize)) {
         let (x0, y0, x1, y1) = crop;
         let w = x1.saturating_sub(x0);
         let h = y1.saturating_sub(y0);
-        let img = ClipImage::blank(bounds, rod, depth, comps)?;
-        if img.width() != w || img.height() != h {
-            return Some(img);
+        if self.width() != w || self.height() != h {
+            return;
         }
-        let px = img.pixel_bytes();
-        let row_bytes = img.row_bytes as usize;
+        let px = self.pixel_bytes();
+        let row_bytes = self.row_bytes as usize;
         // SAFETY: freshly created, not shared yet.
-        let out = unsafe { img.buf.bytes_mut() };
+        let out = unsafe { self.buf.bytes_mut() };
         for j in 0..h {
             // OFX row j (from the bottom) is EffectCraft row y1 - 1 - j.
             let sy = y1 - 1 - j;
             let Some(row) = src.get(sy * sw + x0..sy * sw + x0 + w) else { continue };
             let Some(dst) = out.get_mut(j * row_bytes..j * row_bytes + w * px) else { continue };
             for (p, d) in row.iter().zip(dst.chunks_exact_mut(px)) {
-                encode_pixel(*p, depth, comps, d);
+                encode_pixel(*p, self.depth, self.comps, d);
             }
         }
-        Some(img)
     }
 
     /// Write the image back into an EffectCraft buffer of exactly the image's size. Non-finite
@@ -453,72 +471,84 @@ mod tests {
         OfxRectI { x1: 0, y1: 0, x2: w, y2: h }
     }
 
-    /// Buffers and rows start on 64-byte boundaries whatever the size, depth and components, and
-    /// `rowBytes` covers the pixels of a row.
+    /// The base of every buffer is 64-byte aligned, but rows are tightly packed: `rowBytes` is
+    /// exactly width times the pixel size, for every size, depth and set of components.
     #[test]
-    fn buffers_and_rows_are_64_byte_aligned() {
+    fn buffers_are_aligned_and_rows_are_tight() {
         for (w, h) in [(1, 1), (3, 2), (5, 3), (16, 4), (17, 1), (1920, 2)] {
             for depth in [Depth::Byte, Depth::Short, Depth::Float] {
                 for comps in [Comps::Rgba, Comps::Rgb, Comps::Alpha] {
                     let img = ClipImage::blank(rect(w, h), rect(w, h), depth, comps).unwrap();
                     assert_eq!(img.buf.ptr() as usize % IMAGE_ALIGN, 0, "{w}x{h} {depth:?} {comps:?}");
-                    let (stride, pixels) = (img.row_bytes as usize, w as usize * img.pixel_bytes());
-                    assert!(
-                        stride >= pixels && stride % IMAGE_ALIGN == 0 && stride - pixels < IMAGE_ALIGN,
-                        "{w}x{h} {depth:?} {comps:?}: {stride} for {pixels}"
-                    );
+                    assert_eq!(img.row_bytes as usize, w as usize * img.pixel_bytes(), "{w}x{h} {depth:?} {comps:?}");
                     // SAFETY: nothing else holds the image.
-                    assert_eq!(unsafe { img.buf.bytes_ref() }.len(), stride * h as usize);
+                    assert_eq!(unsafe { img.buf.bytes_ref() }.len(), img.row_bytes as usize * h as usize);
                 }
             }
         }
     }
 
-    /// Rows that are padded for alignment convert back to what went in, for every pixel format.
+    /// Both the tightly packed rows the host hands out and a wider stride convert back to what
+    /// went in, for every pixel format: the conversions follow `rowBytes`, not width times pixel.
     #[test]
-    fn padded_rows_round_trip() {
-        // 5 pixels wide: an RGB float row is 60 bytes in a 64-byte row, an alpha byte row 5 in 64.
+    fn rows_round_trip_for_tight_and_padded_strides() {
+        // 5 pixels wide: an RGB float row is 60 bytes, padded to 64; an alpha byte row 5, padded to 64.
         let (w, h) = (5usize, 3usize);
         let src: Vec<[f32; 4]> = (0..w * h).map(|i| [i as f32 / 16.0, 0.25 + i as f32 / 32.0, 0.5, 1.0 - i as f32 / 32.0]).collect();
-        for depth in [Depth::Float, Depth::Short, Depth::Byte] {
-            for comps in [Comps::Rgba, Comps::Rgb, Comps::Alpha] {
-                let img = ClipImage::from_rows(&src, w, (0, 0, w, h), rect(w as i32, h as i32), rect(w as i32, h as i32), depth, comps).unwrap();
-                let mut back = vec![[0.0f32; 4]; w * h];
-                img.write_rows(&mut back, false);
-                let tol = match depth {
-                    Depth::Float => 1e-6,
-                    Depth::Short => 1e-4,
-                    Depth::Byte => 3e-3,
-                };
-                for (a, b) in src.iter().zip(&back) {
-                    let want = match comps {
-                        Comps::Rgba => *a,
-                        Comps::Rgb => [a[0], a[1], a[2], 1.0],
-                        Comps::Alpha => [0.0, 0.0, 0.0, a[3]],
+        for multiple in [1usize, IMAGE_ALIGN] {
+            for depth in [Depth::Float, Depth::Short, Depth::Byte] {
+                for comps in [Comps::Rgba, Comps::Rgb, Comps::Alpha] {
+                    let b = rect(w as i32, h as i32);
+                    let img = ClipImage::blank_strided(b, b, depth, comps, multiple).unwrap();
+                    assert_eq!(img.row_bytes as usize % multiple, 0);
+                    img.fill_from(&src, w, (0, 0, w, h));
+                    let mut back = vec![[0.0f32; 4]; w * h];
+                    img.write_rows(&mut back, false);
+                    let tol = match depth {
+                        Depth::Float => 1e-6,
+                        Depth::Short => 1e-4,
+                        Depth::Byte => 3e-3,
                     };
-                    assert!(want.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol), "{depth:?} {comps:?}: {want:?} vs {b:?}");
+                    for (a, b) in src.iter().zip(&back) {
+                        let want = match comps {
+                            Comps::Rgba => *a,
+                            Comps::Rgb => [a[0], a[1], a[2], 1.0],
+                            Comps::Alpha => [0.0, 0.0, 0.0, a[3]],
+                        };
+                        assert!(want.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol), "stride x{multiple} {depth:?} {comps:?}: {want:?} vs {b:?}");
+                    }
                 }
             }
         }
     }
 
-    /// OFX row 0 is the bottom row, and the padding bytes between rows are never read as pixels.
+    /// OFX row 0 is the bottom row; with a padded stride the padding bytes are never read as pixels,
+    /// and with the host's tight stride the second row follows the first directly.
     #[test]
     fn rows_are_flipped_and_padding_is_skipped() {
         let (w, h) = (3usize, 2usize);
         let src = vec![[1.0f32, 0.0, 0.0, 1.0]; 3].into_iter().chain(vec![[0.0f32, 1.0, 0.0, 1.0]; 3]).collect::<Vec<_>>();
+        let px = |bytes: &[u8], stride: usize, row: usize, x: usize| -> [f32; 4] {
+            std::array::from_fn(|c| f32::from_ne_bytes(bytes[row * stride + x * 16 + c * 4..][..4].try_into().unwrap()))
+        };
+        // The host's rows: tight. The top EffectCraft row (red) is OFX row 1, right after row 0.
         let img = ClipImage::from_rows(&src, w, (0, 0, w, h), rect(3, 2), rect(3, 2), Depth::Float, Comps::Rgba).unwrap();
-        let stride = img.row_bytes as usize;
+        assert_eq!(img.row_bytes, 48);
         // SAFETY: nothing else holds the image.
         let bytes = unsafe { img.buf.bytes_ref() };
-        let px =
-            |row: usize, x: usize| -> [f32; 4] { std::array::from_fn(|c| f32::from_ne_bytes(bytes[row * stride + x * 16 + c * 4..][..4].try_into().unwrap())) };
-        // The top EffectCraft row (red) is OFX row 1.
-        assert_eq!((px(0, 0), px(1, 2)), ([0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]));
-        // Padding bytes (48..64 of each row) stay zero, and filling them changes nothing coming back.
-        assert!(bytes[w * 16..stride].iter().all(|b| *b == 0));
+        assert_eq!(bytes.len(), 96);
+        assert_eq!((px(bytes, 48, 0, 0), px(bytes, 48, 1, 2)), ([0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]));
+        // A padded stride: the padding bytes (48..64 of each row) stay zero, and are skipped coming back.
+        let padded = ClipImage::blank_strided(rect(3, 2), rect(3, 2), Depth::Float, Comps::Rgba, IMAGE_ALIGN).unwrap();
+        padded.fill_from(&src, w, (0, 0, w, h));
+        assert_eq!(padded.row_bytes, 64);
+        // SAFETY: nothing else holds the image.
+        let bytes = unsafe { padded.buf.bytes_mut() };
+        assert_eq!((px(bytes, 64, 0, 0), px(bytes, 64, 1, 2)), ([0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]));
+        assert!(bytes[w * 16..64].iter().all(|b| *b == 0));
+        bytes[w * 16..64].fill(0xFF);
         let mut back = vec![[0.0f32; 4]; w * h];
-        img.write_rows(&mut back, false);
+        padded.write_rows(&mut back, false);
         assert_eq!(back, src);
     }
 
