@@ -45,9 +45,10 @@ You do **not** need After Effects, DaVinci Resolve or any other host installed. 
 their vendors and have their own licences (see [Licences](#licences)).
 
 **How well tested is each system?** The Windows build is the one used day to day with RSMB, Twixtor
-and Sapphire. The Linux and macOS builds are new in this release. They are made and checked by
-automated builds. The macOS builds have not yet been tried by a person on a Mac, and the automated
-OpenFX tests there run only on Apple Silicon (a failing test doesn't stop the build). Please
+and Sapphire. The Linux and macOS builds are new in this release. They are built and tested
+automatically (the OpenFX tests run on Windows, Linux and an Apple Silicon Mac; the Intel Mac app is
+built from the same code and given a basic start-up check). Nobody has tried the macOS builds
+hands-on on a Mac yet, and no commercial plug-in has been confirmed on Linux or macOS. Please
 [tell us how it goes](#reporting-a-problem).
 
 ## Download
@@ -107,10 +108,10 @@ appear while they load. Your plug-ins appear in **Effects & Presets**. See
 first. Your settings, projects and plug-ins stay.
 
 **Uninstalling.** Run `Uninstall EffectCraft.bat` in `%LOCALAPPDATA%\Programs\EffectCraft-OFX`. It
-removes the app folder and the shortcuts. Your projects, your settings (`%APPDATA%\EffectCraft`),
-Python and py-aep stay. Plug-ins that vendors installed in `C:\Program Files\Common Files\OFX\Plugins`
-stay too. **Anything you copied into the app's own `OFX` folder is deleted with it**, so keep your
-plug-ins in the Common Files folder.
+removes the app, the shortcuts and the EC Test plug-in. Your projects, your settings
+(`%APPDATA%\EffectCraft`), Python and py-aep stay. Plug-ins that vendors installed in
+`C:\Program Files\Common Files\OFX\Plugins` stay too, and so do plug-ins you added to the app's own
+`OFX` folder (only the bundled EC Test plug-in is removed from it).
 
 ## Install on Linux
 
@@ -198,8 +199,9 @@ This removes the app, the two commands, the menu entry and the icon. Your projec
 **Requirements:** macOS 11 (Big Sur) or newer, on an Apple Silicon or Intel Mac. Use the download
 that matches your Mac. Nothing else needs installing to run EffectCraft.
 
-> **Status:** these builds are made by the project's automated builds and have not yet been tried by
-> a person on a Mac. If something doesn't work, please [report it](#reporting-a-problem).
+> **Status:** these builds are built and tested automatically (on Apple Silicon and, for the start-up
+> check, Intel), but nobody has tried them hands-on on a Mac yet. If something doesn't work, please
+> [report it](#reporting-a-problem).
 
 1. **Unzip** the download and drag **EffectCraft.app** into your Applications folder.
 2. **Open it the first time.** The app isn't notarized by Apple (the project has no Apple developer
@@ -302,7 +304,35 @@ system and can't load.
 platform folder. This only lasts until you quit. To keep a plug-in, put it in one of the folders
 above.
 
-<!-- PENDING(speed): start-up scan cache (ofx_cache.json, setting scan_cache, command effect.plugins.rescanOfx): after the first start EffectCraft remembers what each plug-in contains, so starting is faster; say when to rescan after installing a plug-in. -->
+### Fast starts: the scan cache
+
+Loading a big suite is slow: Sapphire alone has about 290 effects, and each one used to be loaded
+and described at every start. So after a scan, EffectCraft remembers what each plug-in file
+contains, in **`ofx_cache.json`** in the [settings folder](#where-the-settings-folder-is). On the
+next start:
+
+- A plug-in file that hasn't changed is registered from that memory **without being loaded**. It
+  still shows up in Effects & Presets as usual.
+- Its library is loaded the first time you use one of its effects. The first render with a plug-in
+  after starting can therefore take a moment longer.
+
+What this means for you:
+
+- **Installing, updating or removing a plug-in needs nothing.** The cache notices that the file
+  changed (it compares the file's path, size and modification time) and scans it again.
+- **If you fix something the cache can't see**, such as activating a licence or replacing a support
+  file next to the plug-in without touching its `.ofx` file, force a rescan: with EffectCraft closed,
+  delete `ofx_cache.json` (or run `effectcraft-cli exec effect.plugins.rescanOfx --empty`), then
+  start EffectCraft.
+- **The cache is thrown away and rebuilt by itself** when EffectCraft is updated or the [host
+  name](#4-try-a-different-host-name) changes.
+- **If a cached plug-in can't be loaded when you first use it**, you see "the OpenFX plug-in X could
+  not be loaded: …" and EffectCraft scans that file again at the next start.
+- **To turn the cache off**, put `"scan_cache": false` in `ofx_settings.json` (see [Keys in
+  ofx_settings.json](#keys-in-ofx_settingsjson)). Every start then loads everything, as before.
+
+The "Scan cache" part of `ofx_scan.txt` says which files came from the cache and which were
+scanned, and why.
 
 ### Licences
 
@@ -403,6 +433,8 @@ points to it. The report has these parts, in this order:
 |---|---|
 | Host name shown to plug-ins | What EffectCraft calls itself when plug-ins ask. See [step 4](#4-try-a-different-host-name). |
 | Folders searched | Each folder, marked `found` or `missing`. |
+| Plug-ins that crashed EffectCraft in the previous session | Only there if one did: which plug-in and action, when, and on Windows the error code and the file it happened in. See [EffectCraft crashes](#effectcraft-crashes). |
+| Scan cache | Which plug-in files were registered from the [cache](#fast-starts-the-scan-cache) without being loaded, which were loaded now, and why. |
 | Effects registered | Every effect that loaded, with its category. "0" means nothing loaded. |
 | Problems | Plug-ins that failed to load, and why. |
 | Notes | Plug-ins skipped on purpose, and why (see the table below). |
@@ -440,6 +472,7 @@ What the common messages mean:
 | `no Win64 binary in this bundle` (or `MacOS`, `Linux-x86-64`) | The bundle has no build for this system. |
 | `not an OpenFX plug-in` | The file isn't an OFX binary (an AE `.aex` renamed, or a support library). |
 | `skipped: it crashed EffectCraft while loading 2 times in a row` | It crashed EffectCraft twice while starting, so it's skipped. See [EffectCraft crashes](#effectcraft-crashes). |
+| `skipped: it crashed EffectCraft while rendering 2 times in a row` | It crashed EffectCraft twice while rendering, so it's skipped. See [EffectCraft crashes](#effectcraft-crashes). |
 | `declined this host` (Notes) or `exports no OpenFX plug-ins` (Notes) | The plug-in looked at the host name and said it isn't for it. Try [step 4](#4-try-a-different-host-name). |
 | `Load failed: ... declined to load` (Problems) | Often a licence check or a host check. Run the vendor's activation tool, then try [step 4](#4-try-a-different-host-name). |
 | `Describe failed: ...` (Problems) | The plug-in couldn't describe itself. Read what "the plug-in said" and "asked for something this host does not provide" at the end of the line, and [report it](#reporting-a-problem). |
@@ -474,7 +507,9 @@ Look at **Folders searched** in the report. Is the folder your plug-in is in mar
 the `.ofx.bundle` contain the right platform folder (`Win64`, `MacOS` or `Linux-x86-64`)? If your
 plug-in is somewhere else (a portable install, a Resolve-only folder), copy the whole `.ofx.bundle`
 folder into one of the [folders EffectCraft looks in](#where-plug-ins-go), or add its parent folder
-to `OFX_PLUGIN_PATH` and restart EffectCraft.
+to `OFX_PLUGIN_PATH` and restart EffectCraft. If you fixed something that doesn't change the
+plug-in's `.ofx` file (a licence, a support file), the [scan cache](#fast-starts-the-scan-cache) may
+still remember the old state: delete `ofx_cache.json` and restart.
 
 #### 4. Try a different host name
 
@@ -531,9 +566,23 @@ lists third-party effects in its report; apply the OFX version by hand from Effe
 - **To start without any plug-ins:** set the environment variable `EFFECTCRAFT_NO_OFX=1`
   (see [Environment variables](#environment-variables)), start EffectCraft, and remove the variable
   again later. This is also the way to check whether a plug-in is the cause of a problem.
-- **While rendering:** the crash isn't caught, because OFX plug-ins run inside the app. Your work is
-  auto-saved; reopen EffectCraft and it offers to recover it. Please report it with the plug-in name
-  and version and `ofx_scan.txt`.
+- **While rendering:** EffectCraft can't catch the crash, because OFX plug-ins run inside the app.
+  But while it runs it notes which plug-in action is in progress (in `ofx_inflight.<number>.bin` in
+  the settings folder; it's removed when you quit normally), and reads that note at the next start.
+  Your work is auto-saved; reopen EffectCraft and it offers to recover it. Then:
+  - You see a message "*plug-in* crashed EffectCraft last time", and `ofx_scan.txt` has a section
+    about it: the action, the time and, on Windows, the error code and the file it happened in.
+  - A plug-in that crashed EffectCraft **twice in a row** while rendering is **skipped** from then
+    on. The report says `skipped: it crashed EffectCraft while rendering 2 times in a row`. The
+    strikes are kept in `ofx_render_crashes.txt`.
+  - To bring a skipped plug-in back: update or reinstall it, or delete its line from
+    `ofx_render_crashes.txt`, or on Linux or macOS run
+    `effectcraft-cli exec effect.plugins.scanOfx '{"retry": true}' --empty` (this also clears the
+    list of plug-ins that crashed while loading).
+  - A session in which the plug-in renders without a crash resets its count.
+
+  Please report such a crash with the plug-in name and version, `ofx_scan.txt` and
+  `Logs/effectcraft.log`.
 - **EffectCraft doesn't start at all.** Windows: install the Visual C++ Redistributable (see
   [Install on Windows](#install-on-windows)). Linux: run `effectcraft-ofx` in a terminal; a missing
   library is named in the error (see [Install on Linux](#install-on-linux)). macOS: see step 2 of
@@ -542,8 +591,6 @@ lists third-party effects in its report; apply the OFX version by hand from Effe
 - **The log:** `Logs/effectcraft.log` in the settings folder is the log of the current run (the
   two before it are kept as `effectcraft.1.log` and `effectcraft.2.log`, so the log of a run that
   crashed survives the next start). Help ▸ Reveal Logging File opens its folder.
-
-<!-- PENDING(speed): protection against crashes during rendering: a plug-in that crashes twice while rendering is skipped, like one that crashes while loading. Replace the "While rendering" bullet above once confirmed. -->
 
 ### Opening an `.aep` fails
 
@@ -597,16 +644,18 @@ The environment variable `EFFECTCRAFT_CONFIG_DIR` overrides both and names the f
 | `ofx_settings.json` | Optional. You create it. Holds the [host name](#4-try-a-different-host-name) (see the keys below). |
 | `ofx_blocklist.txt` | Plug-in files that crashed EffectCraft while loading. One line each: the number of crashes in a row, a file stamp and the path. A plug-in with a count of 2 or more is skipped. |
 | `ofx_loading.<number>.txt` | A short-lived marker while a plug-in file is loading. If one is left behind, EffectCraft crashed while loading that file, and the next start counts it as a crash. |
+| `ofx_cache.json` | The [scan cache](#fast-starts-the-scan-cache): what each plug-in file contains, so that starting is faster. Safe to delete; it's rebuilt at the next start. |
+| `ofx_inflight.<number>.bin` | Exists while EffectCraft runs: a note of which plug-in action is in progress. Removed at a normal quit. If one is left behind, EffectCraft crashed, and the next start reads it. |
+| `ofx_render_crashes.txt` | Plug-ins that crashed EffectCraft while it was running them. One line each: the number of crashes in a row, a file stamp, the plug-in's id and the action. A plug-in with a count of 2 or more is skipped. |
 | `Logs/effectcraft.log` | The log of the current run. `effectcraft.1.log` and `effectcraft.2.log` are the two runs before. |
 | `Plug-ins/` | EffectCraft's own WebAssembly plug-ins. Not OpenFX. |
-
-<!-- PENDING(speed): ofx_cache.json (the start-up scan cache) belongs in this table, with the setting scan_cache in the keys below and the command effect.plugins.rescanOfx in the commands table. -->
 
 ### Keys in `ofx_settings.json`
 
 | Key | Value | Meaning |
 |---|---|---|
 | `host_name` | text, 1 to 128 characters, no control characters | The name OpenFX plug-ins are told the host has. Default `EffectCraft`. Other keys in the file are kept. |
+| `scan_cache` | `true` or `false` | Whether starting may use the [scan cache](#fast-starts-the-scan-cache). Default `true`. Anything else is ignored (the cache stays on) and the report says so. |
 
 ### Environment variables
 
@@ -636,12 +685,11 @@ only one in a menu is Effect ▸ Load OpenFX Plug-in….
 
 | Command | What it does |
 |---|---|
-| `effect.plugins.scanOfx` | Scans the plug-in folders and returns `{paths, loaded, errors, notes, transcript}`. With `{"retry": true}` it first forgets the crash blocklist. |
-| `effect.plugins.loadOfx {"path": "…"}` | Loads an `.ofx` file, an `.ofx.bundle` folder, or every bundle in a folder. |
+| `effect.plugins.scanOfx` | Scans the plug-in folders and returns `{paths, loaded, errors, notes, transcript, cache, crashes}`. With `{"retry": true}` it first forgets the crash lists (plug-ins skipped for crashing while loading or rendering). With `{"cache": false}` it doesn't use the scan cache. |
+| `effect.plugins.rescanOfx` | Deletes the scan cache, so the next start loads and describes every plug-in again. It takes effect at the next start. |
+| `effect.plugins.loadOfx {"path": "…"}` | Loads an `.ofx` file, an `.ofx.bundle` folder, or every bundle in a folder. It always loads the plug-in fresh (it doesn't use the cache). |
 | `effect.plugins.ofxHostName` | Shows the host name in use, where it comes from, what `ofx_settings.json` holds, and whether a change is waiting for a restart. |
 | `effect.plugins.setOfxHostName {"name": "…"}` | Stores the host name in `ofx_settings.json` (an empty name resets it). It applies from the next start. |
-
-<!-- PENDING(speed): effect.plugins.rescanOfx goes in this table once the scan cache lands. -->
 
 The technical reference is [docs/ofx.md](https://github.com/glumbis/effectcraft/blob/openfx/docs/ofx.md).
 

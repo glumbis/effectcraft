@@ -70,7 +70,8 @@ Nothing needs configuring: at start-up the desktop app scans these folders (the
 effects (Sapphire around 290); loading them takes a few seconds. `EFFECTCRAFT_NO_OFX=1` skips the
 start-up scan of the desktop app (only the exact value `1`; the CLI's `scanOfx` still works).
 
-<!-- PENDING(speed): the start-up scan cache (ofx_cache.json in the config folder, settings key scan_cache, command effect.plugins.rescanOfx): what is cached, when it is invalidated, and how to force a rescan. -->
+Binaries that did not change since the last start are registered from the scan cache without being
+loaded ([The scan cache](#the-scan-cache)).
 
 ## The scan report
 
@@ -78,8 +79,9 @@ The desktop app writes what the scan found to `ofx_scan.txt` in its config folde
 (`%APPDATA%\EffectCraft` on Windows, `~/Library/Application Support/EffectCraft` on macOS,
 `$XDG_CONFIG_HOME/effectcraft` or `~/.config/effectcraft` on Linux; `EFFECTCRAFT_CONFIG_DIR` and
 portable mode move it). The file is rewritten at every start. The release app has no console on
-Windows, so this file is where load errors end up. When a scan found problems (or nothing loaded
-but something was skipped) the app also shows a message at start-up that names the file. The CLI
+Windows, so this file is where load errors end up. When a plug-in crashed the previous session
+("*id* crashed EffectCraft last time"), or a scan found problems (or nothing loaded but something
+was skipped), the app also shows a message at start-up that names the file. The CLI
 doesn't write the file: `effectcraft-cli exec effect.plugins.scanOfx --empty` prints the same data
 as JSON. Troubleshooting steps for users are in [FORK.md](../FORK.md#getting-plug-ins-to-work).
 
@@ -89,12 +91,19 @@ The file has these parts, in order:
    path, how to change the name, a pending change that waits for a restart and any problem with the
    settings file ([Host name](#host-name)).
 2. **Folders searched**: every search path, marked `found` or `missing`.
-3. **Effects registered**: one line per effect (name, category, id, bundle).
-4. **Problems**: plug-ins that could not become effects, one line each, naming the binary.
-5. **Notes (plug-ins skipped on purpose)**: duplicates, plug-ins that declined the host, binaries
+3. **Plug-ins that crashed EffectCraft in the previous session**: only when there is one: the
+   plug-in, the action, the time, the thread and, on Windows, the exception and module ([A plug-in
+   that crashes while it runs](#a-plug-in-that-crashes-while-it-runs)).
+4. **Scan cache**: whether `ofx_cache.json` is in use, one line per binary (`from the cache` or
+   `scanned`, and why), and problems with the cache file ([The scan cache](#the-scan-cache)). When
+   the cache is off it says so and how to turn it on.
+5. **Effects registered**: one line per effect (name, category, id, bundle).
+6. **Problems**: plug-ins that could not become effects, one line each, naming the binary.
+7. **Notes (plug-ins skipped on purpose)**: duplicates, plug-ins that declined the host, binaries
    that export no plug-ins, plug-ins of another OFX API, a context that fell back, a guessed main
    input. These are not failures.
-6. **Load transcript**: one block per plug-in binary (see below).
+8. **Load transcript**: one block per plug-in binary (see below). A binary registered from the
+   cache shows the transcript lines of the scan that described it.
 
 If nothing was found at all, or files were found but none became an effect, the file ends with a
 paragraph that says so.
@@ -154,8 +163,9 @@ shown; `kOfxStatReplyDefault` from `Load` is accepted.
 
 ## How a scan works
 
-Loading a path is two phases, so that copies of one plug-in can be told apart before any of their
-code is started.
+A binary that is in the [scan cache](#the-scan-cache) and has not changed skips all of this. For the
+others, loading a path is two phases, so that copies of one plug-in can be told apart before any of
+their code is started.
 
 1. **Probe**, per binary: open the library, call `OfxSetHost` if it exports it, call
    `OfxGetNumberOfPlugins`, then `OfxGetPlugin` for each. Nothing is described yet (no `Load`). A
@@ -185,6 +195,51 @@ What can stop a plug-in at the describe phase (each is an entry under Problems u
 * None of the pixel depths the plug-in lists is supported ([How OFX maps onto
   EffectCraft](#how-ofx-maps-onto-effectcraft)).
 * It describes no `Output` clip.
+
+## The scan cache
+
+Starting used to load every plug-in library and run `Load`, `Describe` and `DescribeInContext` for
+every plug-in in it (Boris FX Sapphire alone has about 290), and kept them all loaded. The scan now
+remembers what registration needs in **`ofx_cache.json`**, in the config folder next to
+`ofx_scan.txt`. Per binary it stores the plug-in identifiers and versions, the manifest (name,
+category, parameters), the clips, the pixel depth, the render thread safety and the other facts of
+the effect's configuration, the parameter bindings, and the notes and transcript lines of the scan.
+
+* **Key.** An entry is keyed by the binary's canonical path plus its size and modification time. The
+  whole file is ignored (and rebuilt) when its format version, the EffectCraft version or the
+  effective host name differ from the running process's: plug-ins describe themselves differently to
+  different hosts, and a new EffectCraft may read more from a description.
+* **What is cached.** Only binaries with at least one plug-in that registered, and only when no
+  plug-in of the binary was skipped as a duplicate of another copy (the next start works the
+  duplicates out again). A plug-in that failed to describe is cached as the failure, so a binary
+  with a few failing effects (GPU-only ones, say) still starts from the cache. A binary on the
+  crash blocklist is still skipped.
+* **A warm start.** A binary whose entry matches registers its effects from the cache, as lazy
+  effects, **without loading the library**: no probe, no `Load`, no `Describe`. For Sapphire that
+  skips about 290 `Load` / `Describe` calls per start; the test bundle's scan went from 121 ms with
+  one library load to 7.6 ms with none. Binaries that are not in the cache, or changed, take the
+  two phases described above.
+* **First use.** The first render, padding or region-of-definition query of a cached effect loads
+  the library under the load crash marker, runs the load sequence again and compares the result with
+  the cached description. A load that fails, or a description that changed, is a render error
+  ("the OpenFX plug-in X could not be loaded: …"), not a crash; it marks the entry out of date
+  (and writes the file at once), and the next start scans the binary again. A plug-in that cannot
+  be loaded stays unavailable for the rest of the process.
+* **When it is written.** At the end of a scan, through a temporary file and a rename, and when a
+  first use finds an entry out of date. A missing, unreadable, corrupt or half-valid file never
+  fails a load: it is reported in the Scan cache part of `ofx_scan.txt` and the affected binaries
+  are scanned the long way. An entry over 24 MiB is not cached, and a cache file over 256 MiB is
+  not read or written.
+* **Limit.** The cache only watches the `.ofx` file itself. After fixing a licence or replacing a
+  support file without touching the `.ofx`, run `effect.plugins.rescanOfx` (or delete
+  `ofx_cache.json`) and restart.
+
+Control: `"scan_cache": false` in `ofx_settings.json` turns the cache off (default `true`; read at
+the start of every scan; anything but a boolean is reported and ignored, the cache stays on).
+`effect.plugins.scanOfx {"cache": false}` scans one time without it. `effect.plugins.rescanOfx`
+deletes the file; registrations are made once per run, so it takes effect at the next start.
+`effect.plugins.loadOfx` always loads fresh. The `cache` member of a scan's result is
+`{enabled, file, hits, scanned, lines, problems}`.
 
 ## Host name
 
@@ -248,10 +303,44 @@ other OFX hosts, EffectCraft keeps a **crash blocklist** in its config folder (s
 * Lists written by earlier versions of the fork (a bare path per line, written after a single
   crash) count as one strike, so those plug-ins are tried again.
 
-This only covers loading. A crash while an effect is rendering is not caught and is not
-blocklisted; if that keeps happening, start with `EFFECTCRAFT_NO_OFX=1` or uninstall the plug-in.
+This only covers loading. What a plug-in does while the app runs is covered next. A plug-in that
+keeps crashing the app can always be left out with `EFFECTCRAFT_NO_OFX=1`, or uninstalled.
 
-<!-- PENDING(speed): protection against crashes during rendering: a plug-in that crashes twice while rendering is skipped, like one that crashes while loading. Replace the last paragraph above once confirmed. -->
+## A plug-in that crashes while it runs
+
+A plug-in that crashes in `Render` (or any other action) takes the process down, and the next start
+would know nothing about it. `inflight.rs` keeps a small in-flight record so that it does:
+
+* **The record.** One file per process, `ofx_inflight.<pid>.bin` in the config folder, is created
+  the first time a plug-in action runs, kept exclusively locked while the process lives, and removed
+  when the app quits normally. It holds a header and 16 fixed-size slots, one per plug-in action in
+  progress (a thread renders one effect at a time; a nested render of an upstream effect takes one
+  more slot).
+* **Cost.** Before and after each action (`CreateInstance`, `Render`, region of definition,
+  `InstanceChanged`, the sequence actions, …) one small positional write overwrites a slot with the
+  plug-in's identifier, the action, the time and the thread. No file is created per action and
+  nothing is synced: the operating system's page cache outlives a crashed process. If the file
+  can't be written nothing happens: recording never blocks rendering.
+* **Windows.** An unhandled-exception filter (chained to any other) adds the crashing thread's
+  slot, the exception code and the faulting module and address to the header, so a crash with
+  several plug-ins active is pinned on the right one. Elsewhere, or when the filter doesn't run, a
+  record with several plug-ins active can't say which one crashed: they are all listed and nobody is
+  struck, so an innocent plug-in is never skipped.
+* **The next start** reads the record files of dead processes (the lock can be taken), at the first
+  plug-in load (not when the config folder is set, so a tool that only builds a session doesn't
+  consume the report). A slot still marked active means the process died inside that action. The
+  plug-in is named in `ofx_scan.txt` (the section "Plug-ins that crashed EffectCraft in the previous
+  session": identifier, action, start time, thread and, on Windows, the exception and module), in
+  the start-up message ("*id* crashed EffectCraft last time. Details: …"), in the `crashes` member of
+  a scan's result, and it counts as a **strike** in `ofx_render_crashes.txt` (one line per
+  plug-in: `<strikes>\t<binary stamp, hex>\t<plug-in id>\t<action>`; the stamp is a hash of the
+  binary's size and modification time).
+* **Skipping.** After two crashes in a row the plug-in is skipped, like a binary on the load
+  blocklist: "skipped: it crashed EffectCraft while rendering 2 times in a row (last in
+  *action*); update or reinstall it, remove its line from … or run `effect.plugins.scanOfx
+  {"retry": true}` to try again". A session that rendered the plug-in and quit cleanly, a changed
+  binary (another stamp), deleting its line, or `scanOfx {"retry": true}` (which also empties the
+  load blocklist) start it again from zero.
 
 ## How OFX maps onto EffectCraft
 
@@ -286,11 +375,41 @@ blocklisted; if that keeps happening, start with `EFFECTCRAFT_NO_OFX=1` or unins
 * **Threads:** plug-in code runs on threads with 16 MiB stacks (the stack size Linux and other
   plug-ins are built for; Twixtor's optical flow overflowed the 2 MiB of the renderer's worker
   threads): the multithread suite's workers, and the `Render` and `CreateInstance` actions on
-  **every OS**. Those two run on pooled `ofx-plugin` threads: an idle worker (the most recently
-  used first, up to eight kept waiting) takes the job, so a plug-in that keeps per-thread state
-  (GPU contexts, runtimes, licence checks) isn't handed a new thread for every frame. A call
-  from a plug-in-stack thread runs inline, and if no thread can be started the job runs on the
-  caller. A job that panics is a failed action; the worker survives.
+  **every OS**. They all run on one pool of `ofx-plugin` threads: an idle worker (the most recently
+  used first, up to 64 kept waiting) takes the job, so a plug-in that keeps per-thread state
+  (GPU contexts, runtimes, licence checks) isn't handed a new thread for every frame, and a render
+  that calls `multiThread` per tile starts no threads (index 0 runs on the caller, the other
+  indices on pool workers). A call from a plug-in-stack thread runs inline, and if no thread can
+  be started the job runs on the caller. A job that panics is a failed action; the worker survives.
+* **Thread-unsafe libraries.** The plug-ins of a library that declare themselves render-thread-unsafe
+  share one lock, and every render of the library takes it. The lock is held by a logical task and
+  is reentrant: a `clipGetImage` inside a render makes the host render the layer's upstream effects,
+  and one of those may be another effect of the same library, on the same thread or on a thread the
+  render was moved to. The threads that work for the task (the pooled thread a render moves to, the
+  `multiThread` workers) adopt its tokens, so such nested renders no longer wait for themselves.
+  Other threads still wait their turn.
+* **Instances.**
+  * A plug-in that sets `kOfxImageEffectPluginPropSingleInstance` gets **one shared instance** for
+    every application of it, one render at a time; an effect applied inside itself fails with a
+    message.
+  * Instances are created one at a time. A plug-in whose `CreateInstance` takes 250 ms or more (it
+    loads a model, say) is held to **two live instances**: a render at the limit takes the instance
+    idle longest of another applied effect (unless the plug-in declared that it keeps state between
+    frames), else waits for one. A nested render that would wait for itself, or a wait of 20 s,
+    makes one more instance, which is destroyed when it comes back.
+  * **Sequences.** The plug-in's declared `kOfxImageEffectInstancePropSequentialRender` is honoured.
+    `BeginSequenceRender` is sent once and the sequence **stays open** on the pooled instance while
+    frames advance one at a time (the pool gives a frame to the idle instance whose sequence
+    continues at it). A seek, another render scale, an eviction, a failed render, an idle instance or
+    shutdown ends it.
+  * `kOfxStatErrMemory` from `Render`: the host sends `kOfxActionPurgeCaches` once and retries once.
+  * **At quit** every pooled instance gets `DestroyInstance` and every loaded plug-in `Unload`,
+    bounded to 5 s.
+* **Image buffers** start on a 64-byte boundary, and rows are tightly packed (`rowBytes` is the
+  width times the pixel size). Freed buffers are kept for the next image of the same size (bounded;
+  released on an out-of-memory render and at shutdown) so a render doesn't ask the operating system
+  for tens of megabytes, zeroed again, for every effect of every frame. A layer that doesn't fit in
+  memory is a render error, not an abort.
 * **Host properties** the plug-ins read without a fallback are served: no GPU of any kind
   (OpenGL, CUDA, Metal and OpenCL render support `"false"`, CPU render support `"true"`), no
   overlays, tiles or multi-resolution, temporal clip access yes, sequential render off, no
@@ -301,7 +420,8 @@ blocklisted; if that keeps happening, start with `EFFECTCRAFT_NO_OFX=1` or unins
   that query fails).
 * Temporal plug-ins (motion blur, echo, retiming) can ask for the input at other times and for other
   layers; EffectCraft renders those on demand. Each applied effect gets its own pool of OFX
-  instances, so plug-ins that keep state between frames never mix two layers up.
+  instances (except for single-instance plug-ins, above), so plug-ins that keep state between
+  frames never mix two layers up.
 
 ## Retimers (Twixtor)
 
@@ -360,9 +480,10 @@ EffectCraft does not include, license or activate any third-party plug-in.
 
 * **Platforms.** Desktop only: there is no OFX on the web build. **Windows x64** is tested with
   RSMB 7, Twixtor 8 and Sapphire 2026.5. **Linux x86_64** and **macOS** are built and run the host's
-  test suite in CI (macOS only on Apple Silicon, where a failing test is tolerated so the packages
-  are still built), but no commercial plug-in has been confirmed on them. The Intel Mac build is
-  cross-compiled.
+  test suite in CI (Ubuntu 22.04 and an Apple Silicon runner; the OFX tests pass on both), but no
+  commercial plug-in has been confirmed on them, and nobody has tried the macOS builds hands-on on a
+  Mac. The Intel Mac build is cross-compiled on the Apple Silicon runner and gets a basic start-up
+  check there.
 * **Apple Silicon.** The parameter and message suites are C-variadic (`paramGetValue(handle, name,
   ...)`, `message(handle, type, id, format, ...)`). The Apple arm64 ABI passes every variadic
   argument on the stack in an 8-byte slot while named arguments use registers, which differs from
@@ -370,9 +491,9 @@ EffectCraft does not include, license or activate any third-party plug-in.
   `aarch64-apple-darwin` (the unused argument registers as dummy parameters, then one `u64` per
   stack slot). Before this, parameter reads wrote through garbage pointers there. The message suite
   now expands printf arguments on Apple Silicon too. `tests/variadic_params.rs` calls every
-  parameter function through real C-variadic pointers on whatever platform runs the tests, but the
-  Apple declarations were only type-checked locally and have not been confirmed on a Mac by a
-  person.
+  parameter function through real C-variadic pointers on whatever platform runs the tests, and CI
+  runs it, with the rest of the OFX tests, on an Apple Silicon (macOS arm64) runner, where it
+  passes. That is the whole verification: it hasn't been confirmed on a Mac by a person.
 * Plug-in messages (errors, licence notices) are formatted with the common printf conversions (`%s`,
   `%d`, `%u`, `%x`, `%c`, `%p`, `%f`, `%e`, `%g`, with width and precision) and at most 8 arguments;
   anything else is shown as written.
@@ -384,17 +505,17 @@ EffectCraft does not include, license or activate any third-party plug-in.
 
 | Command | Parameters | Result |
 |---|---|---|
-| `effect.plugins.scanOfx` | `{retry?}` | `{paths, loaded, errors, notes, transcript}`: loads every plug-in in the search paths (folders that don't exist are skipped; one bad plug-in doesn't stop the rest). `retry: true` empties the crash blocklist first. |
-| `effect.plugins.loadOfx` | `{path}`: an `.ofx` binary, an `.ofx.bundle` folder or a folder (scanned recursively) | `{loaded: [{id, name, category, ofxId, context, bundle}], errors, notes, transcript}`. It fails, with the reasons from `errors` and `notes`, when nothing loaded and there is something to say. |
+| `effect.plugins.scanOfx` | `{retry?, cache?}` | `{paths, loaded, errors, notes, transcript, cache, crashes}`: registers every plug-in in the search paths (folders that don't exist are skipped; one bad plug-in doesn't stop the rest). Binaries that did not change come from the [scan cache](#the-scan-cache) without being loaded, unless `cache` is `false`. `retry: true` empties both crash lists first (the load blocklist and the render strikes). `cache` is `{enabled, file, hits, scanned, lines, problems}`; `crashes` lists the plug-ins that crashed the app during the previous session. |
+| `effect.plugins.rescanOfx` | none | `{cleared, file, restartRequired, note}`: deletes `ofx_cache.json`, so the next start loads and describes every plug-in again. Registrations are made once per run, so it takes effect at the next start. |
+| `effect.plugins.loadOfx` | `{path}`: an `.ofx` binary, an `.ofx.bundle` folder or a folder (scanned recursively) | `{loaded: [{id, name, category, ofxId, context, bundle}], errors, notes, transcript}`. It always loads fresh (it doesn't use the scan cache). It fails, with the reasons from `errors` and `notes`, when nothing loaded and there is something to say. |
 | `effect.plugins.ofxHostName` | none | `{name, source, configured, environmentOverride, settingsFile, problem, restartRequired, next?, note?}`: the host name in use, where it comes from (`default`, `settings file` or `environment variable`), what `ofx_settings.json` holds, and whether a stored change waits for a restart. |
 | `effect.plugins.setOfxHostName` | `{name}`; an empty name goes back to `EffectCraft` | The same as `ofxHostName`. Stores the name in `ofx_settings.json` (through a temporary file, so a failure leaves the old file); it applies at the next start. Fails when there is no config folder or the name is unusable. |
 
 `loadOfx` is the only one in a menu (Effect ▸ Load OpenFX Plug-in…). Under file-access
 confinement (`--automation-read-root` and `--automation-write-root`, see [mcp.md](mcp.md)) the
-agent can't use `loadOfx`, `scanOfx` or `setOfxHostName`: native, unsandboxed code and what it is
-told about its host are not an agent's call. `ofxHostName` only reads.
-
-<!-- PENDING(speed): effect.plugins.rescanOfx joins this table with the scan cache. -->
+agent can't use `loadOfx`, `scanOfx`, `rescanOfx` or `setOfxHostName`: native, unsandboxed code,
+which plug-ins get loaded and what they are told about their host are not an agent's call.
+`ofxHostName` only reads.
 
 ## How it fits together
 
@@ -409,27 +530,35 @@ told about its host are not an agent's call. `ofxHostName` only reads.
   per-render context, actions and the plug-in thread pool), `effect` (the `EffectPlugin`
   implementation), `suites` (property, parameter, image effect, memory, multithread, message,
   progress, timeline, interact), `loader` (bundle discovery, the probe and describe phases,
-  duplicates, registration), `blocklist`, `settings` (the host name) and `diag` (messages, unmet
-  requests and the load transcript).
-* **Engine / hosts**: `Session::ofx_loader`, `ofx_search_paths`, `ofx_clear_blocklist` and
-  `ofx_host_name` are set by `effectcraft-host` with the `openfx` feature, which also tells the
-  crate where the config folder is (`set_state_dir`: the blocklist and `ofx_settings.json` live
-  there). The commands are in [Commands](#commands); the desktop app runs the scan at start-up and
+  duplicates, registration), `cache` (the scan cache), `blocklist` (the load blocklist),
+  `inflight` (the render-crash record and strikes), `settings` (the host name and `scan_cache`),
+  `diag` (messages, unmet requests and the load transcript), `pool` (the plug-in thread pool) and
+  `lock` (the reentrant lock of thread-unsafe libraries).
+* **Engine / hosts**: `Session::ofx_loader`, `ofx_search_paths`, `ofx_clear_blocklist`,
+  `ofx_host_name` and `ofx_rescan` are set by `effectcraft-host` with the `openfx` feature, which
+  also tells the crate where the config folder is (`set_state_dir`: the blocklist, the cache, the
+  in-flight records and `ofx_settings.json` live there). The commands are in [Commands](#commands); the desktop app runs the scan at start-up and
   writes `ofx_scan.txt`.
 
 ## Testing the host
 
 `examples/ofx/ec-test-ofx` is a small dependency-free OFX plug-in that exercises the host. It
-exports nine effects: Invert, Echo, Border, Mix, an effect with every parameter type (All Params),
-and one each that mimics a situation real plug-ins create: **Support Lib** (describes itself the
-way the OFX C++ Support library does), **Create Time** (reads a parameter in `CreateInstance` and
-answers clip preferences from a slave parameter), **Context Fallback** (its Filter context fails,
-General works) and **No Source** (the main input isn't called `Source`). The environment variable
-`EC_TEST_OFX_MODE` makes it misbehave for the diagnostics tests: `decline-host`, `no-plugins`,
-`load-fails`, `describe-fails`, and `extras` (exports only `GpuOnly` and `NotAnImageEffect`, which
-cannot become effects). The integration tests in `crates/ofx/tests` (`test_plugin`, `diagnostics`,
-`duplicates` and `variadic_params`) load it. Build it into a bundle first; the script picks the
-platform folder and library name from the Rust target:
+exports fifteen effects: Invert, Echo, Border, Mix, an effect with every parameter type (All Params),
+and ones that mimic situations real plug-ins create: **Support Lib** (describes itself the way the
+OFX C++ Support library does), **Create Time** (reads a parameter in `CreateInstance` and answers
+clip preferences from a slave parameter), **Context Fallback** (its Filter context fails, General
+works), **No Source** (the main input isn't called `Source`), **Serial** (render-thread-unsafe),
+**Probe** and **ProbeSingle** (count what the host does to them: instance sharing, sequences),
+**ProbeSlow** (a slow `CreateInstance`, like a model load), **Memory** (answers its first `Render`
+with `kOfxStatErrMemory`) and **Crash** (crashes in `Render` when `EC_TEST_OFX_CRASH` is `segv` or
+`abort`). The environment variable `EC_TEST_OFX_MODE` makes it misbehave for the tests:
+`decline-host`, `no-plugins`, `load-fails`, `describe-fails`, `renamed` (every label gets a suffix,
+so its description differs) and `extras` (exports only `GpuOnly` and `NotAnImageEffect`, which
+cannot become effects); `EC_TEST_OFX_LOG` names a file the probes log sequence, destroy and unload
+events to. The integration tests in `crates/ofx/tests` (`test_plugin`, `diagnostics`, `duplicates`,
+`variadic_params` and the `scenarios` binary: instances, the scan cache, render crashes,
+reentrancy) and the host tests `ofx_host_name` and `ofx_scan_cache` load it. Build it into a bundle
+first; the script picks the platform folder and library name from the Rust target:
 
 ```sh
 bash tools/fork-installer/ci/build-test-bundle.sh            # writes target/ofx-test/ec-test-ofx.ofx.bundle
