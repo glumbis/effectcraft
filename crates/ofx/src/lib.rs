@@ -54,8 +54,8 @@ pub fn set_state_dir(dir: PathBuf) {
     blocklist::set_state_dir(dir.clone());
     cache::reset();
     let _ = settings::identity();
-    // What a previous session left behind (a plug-in that crashed while rendering), and the record
-    // of this one.
+    // Where the record of what plug-ins are doing goes, and where a crashed session's is found (when
+    // the first plug-in is loaded).
     inflight::set_dir(dir);
 }
 

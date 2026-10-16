@@ -25,7 +25,9 @@ fn child_start() {
     let plugins = PathBuf::from(std::env::var_os("EC_FIXTURE_PLUGINS").expect("EC_FIXTURE_PLUGINS"));
     effectcraft_ofx::set_state_dir(PathBuf::from(cfg));
     let use_cache = std::env::var_os("EC_SCAN_CACHE_EXPLICIT").is_none();
+    let started = std::time::Instant::now();
     let report = load_path_with(&plugins, use_cache);
+    let scan_micros = started.elapsed().as_micros() as u64;
     let loads_after_scan = library_loads();
     // Optionally use one effect, which is what makes a cached plug-in load.
     let render = std::env::var("EC_SCAN_CACHE_RENDER").ok().map(|id| {
@@ -49,6 +51,7 @@ fn child_start() {
         "lines": report.cache.lines,
         "problems": report.cache.problems,
         "transcript": report.transcript,
+        "scan_micros": scan_micros,
         "loads_after_scan": loads_after_scan,
         "loads_after_render": library_loads(),
         "render": render,
@@ -92,6 +95,13 @@ fn a_warm_start_registers_from_the_cache_without_loading_any_library() {
     assert!(lines(&warm, "transcript").contains("from the scan cache"), "the report says so too: {warm}");
     // Using an effect loads the library, once, and the effect works.
     assert_eq!(n(&warm, "loads_after_render"), 1, "{warm}");
+    println!(
+        "start-up scan of {EFFECTS} effects in one binary: {} us cold ({} library load), {} us from the scan cache ({} library loads until an effect is used)",
+        n(&cold, "scan_micros"),
+        n(&cold, "loads_after_scan"),
+        n(&warm, "scan_micros"),
+        n(&warm, "loads_after_scan")
+    );
     assert_eq!(warm["render"]["ok"], true, "{warm}");
     let px: Vec<f64> = warm["render"]["pixel"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
     for (got, want) in px.iter().zip([0.8, 0.6, 0.4, 1.0]) {

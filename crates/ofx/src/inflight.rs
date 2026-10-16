@@ -314,6 +314,8 @@ struct Global {
     current: Option<Arc<Inflight>>,
     /// Opening failed (or recording was closed): do not try again.
     off: bool,
+    /// What dead processes left in `dir` has been dealt with ([`recover_once`]).
+    recovered: bool,
 }
 
 fn global() -> &'static Mutex<Global> {
@@ -368,21 +370,35 @@ pub fn begin(plugin: &str, action: &str, stamp: u64) -> ActionGuard {
     }
 }
 
-/// The folder for the record, the strikes and the report of the previous session: recovers what
-/// dead processes left, loads the strikes and installs the crash filter. Called when the host sets
-/// the state folder.
+/// The folder for the record, the strikes and the report of the previous session. Called when the
+/// host sets the state folder; nothing is read or written until a plug-in is loaded
+/// ([`recover_once`]) or run ([`begin`]), so a tool that only builds a session leaves what a crashed
+/// EffectCraft left for the next real start.
 pub fn set_dir(dir: PathBuf) {
-    {
+    let mut g = global().lock().unwrap_or_else(PoisonError::into_inner);
+    if g.dir.as_deref() == Some(dir.as_path()) {
+        return;
+    }
+    // A different folder (tests): the old record goes with the old folder.
+    if let Some(old) = g.current.take() {
+        old.close();
+    }
+    *g = Global { dir: Some(dir), current: None, off: false, recovered: false };
+}
+
+/// Deal with what dead processes left in the state folder, once per process: report the plug-ins
+/// that were running when they died ([`recovered_lines`]), count the strikes, remove the files. The
+/// loader calls it before it registers anything.
+pub fn recover_once() {
+    let dir = {
         let mut g = global().lock().unwrap_or_else(PoisonError::into_inner);
-        if g.dir.as_deref() == Some(dir.as_path()) {
+        if g.recovered {
             return;
         }
-        // A different folder (tests): the old record goes with the old folder.
-        if let Some(old) = g.current.take() {
-            old.close();
-        }
-        *g = Global { dir: Some(dir.clone()), current: None, off: false };
-    }
+        g.recovered = true;
+        g.dir.clone()
+    };
+    let Some(dir) = dir else { return };
     let mut list = read_strikes(&dir);
     let report = recover(&dir, &mut list);
     *recovered().lock().unwrap_or_else(PoisonError::into_inner) = report;

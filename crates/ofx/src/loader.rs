@@ -104,6 +104,9 @@ pub fn load_path(path: &Path) -> LoadReport {
 /// explicit load of a plug-in the user just fixed), still updating the cache.
 pub fn load_path_with(path: &Path, use_cache: bool) -> LoadReport {
     let _guard = load_lock().lock().unwrap_or_else(PoisonError::into_inner);
+    // What a crashed session left behind (a plug-in that died while rendering) is dealt with before
+    // anything is registered, so that a plug-in struck twice is not.
+    crate::inflight::recover_once();
     let mut report = LoadReport::default();
     let mut binaries: Vec<(PathBuf, String)> = Vec::new();
     if !path.exists() {
@@ -670,6 +673,10 @@ fn register_cached(c: Cached, report: &mut LoadReport) {
     report.transcript.push(tr.join("\n"));
 }
 
+/// An opened library: its plug-ins' identifiers and `OfxPlugin` addresses, or why it could not be
+/// opened.
+type Opened = Result<Vec<(String, usize)>, String>;
+
 /// A plug-in binary that registered from the scan cache and has not been loaded yet. It is shared
 /// by the effects of the binary: the first one that needs an instance opens the library, and each
 /// effect then runs its own `Load`, `Describe` and `DescribeInContext`.
@@ -680,9 +687,8 @@ pub(crate) struct LazyBinary {
     key: PathBuf,
     /// Shared by the plug-ins of this library that declare themselves render-thread-unsafe.
     lock: Arc<ReentrantLock>,
-    /// The library once opened: its plug-ins' identifiers and `OfxPlugin` addresses, or why it
-    /// could not be (`None` until the first lazy load).
-    opened: Mutex<Option<Result<Vec<(String, usize)>, String>>>,
+    /// The library once opened (`None` until the first lazy load).
+    opened: Mutex<Option<Opened>>,
 }
 
 impl LazyBinary {
