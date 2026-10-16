@@ -36,6 +36,7 @@ pub mod inflight;
 pub mod instance;
 pub mod loader;
 pub mod lock;
+pub mod open;
 pub mod params;
 pub mod pool;
 pub mod props;
@@ -45,6 +46,7 @@ pub mod suites;
 use std::path::PathBuf;
 
 pub use loader::{default_search_paths, library_loads, load_path, load_path_with};
+pub use open::open_command;
 pub use settings::host_name_command;
 
 /// Set the directory that holds the crash blocklist and `ofx_settings.json` (the host's config

@@ -210,6 +210,24 @@ fn plugins_rescan_ofx(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(r)
 }
 
+fn has_ofx_open(s: &Session) -> std::result::Result<(), String> {
+    if s.ofx_open.is_some() { Ok(()) } else { Err("OpenFX plug-ins are not available in this build".into()) }
+}
+
+/// `effect.plugins.openOfxReport`: open the OpenFX scan report (`ofx_scan.txt`, written at every
+/// start-up) with the operating system's default application.
+fn plugins_open_ofx_report(s: &mut Session, _: &Value) -> Result<Value> {
+    let hook = s.ofx_open.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
+    hook("report").map_err(EngineError::Other)
+}
+
+/// `effect.plugins.openOfxUserFolder`: open the per-user OpenFX plug-in folder (`OFX` in the config
+/// folder, made if it is not there) in the operating system's file manager.
+fn plugins_open_ofx_user_folder(s: &mut Session, _: &Value) -> Result<Value> {
+    let hook = s.ofx_open.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
+    hook("userFolder").map_err(EngineError::Other)
+}
+
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "effect").ok_or_else(|| bad("effect.apply", "missing `effect` (id or name)"))?;
     let spec = effectcraft_effects::lookup(name).ok_or_else(|| bad("effect.apply", format!("unknown effect `{name}`")))?;
@@ -860,6 +878,24 @@ pub fn specs() -> Vec<CommandSpec> {
             has_ofx_rescan,
             plugins_rescan_ofx
         ),
+        cmd!(
+            "effect.plugins.openOfxReport",
+            "Open OpenFX Scan Report",
+            [],
+            None,
+            "{} → {path, opened}: opens the OpenFX scan report (ofx_scan.txt in the config folder: the folders searched, the effects registered, why a plug-in did not work; written at every start-up) with the operating system's default application",
+            has_ofx_open,
+            plugins_open_ofx_report
+        ),
+        cmd!(
+            "effect.plugins.openOfxUserFolder",
+            "Open OpenFX Plug-in Folder",
+            [],
+            None,
+            "{} → {path, opened}: opens the per-user OpenFX plug-in folder (OFX in the config folder, made if it is missing; plug-ins copied there need no administrator rights and stay when EffectCraft is reinstalled) in the file manager",
+            has_ofx_open,
+            plugins_open_ofx_user_folder
+        ),
     ]
 }
 
@@ -893,5 +929,33 @@ mod list_metadata_tests {
         assert_eq!(slider["sliderMax"], 100.0);
         assert_eq!(slider["decimals"], 2);
         assert!(slider["options"].is_null());
+    }
+
+    /// The Effect menu entries that open the OpenFX scan report and the per-user plug-in folder need
+    /// the host's hook (without it they are disabled and refuse), ask it for `report` / `userFolder`,
+    /// and hand its answer or its error on.
+    #[test]
+    fn the_ofx_open_commands_ask_the_host_hook() {
+        fn fake(what: &str) -> std::result::Result<Value, String> {
+            match what {
+                "report" | "userFolder" => Ok(json!({"path": format!("/cfg/{what}"), "opened": true})),
+                other => Err(format!("unexpected {other}")),
+            }
+        }
+        fn failing(_: &str) -> std::result::Result<Value, String> {
+            Err("there is no scan report yet".into())
+        }
+        let mut s = Session::default();
+        for id in ["effect.plugins.openOfxReport", "effect.plugins.openOfxUserFolder"] {
+            assert!(!s.is_enabled(id), "{id} needs the host hook");
+            assert!(s.execute(id, json!({})).is_err());
+        }
+        s.ofx_open = Some(fake);
+        assert!(s.is_enabled("effect.plugins.openOfxReport") && s.is_enabled("effect.plugins.openOfxUserFolder"));
+        assert_eq!(s.execute("effect.plugins.openOfxReport", json!({})).unwrap(), json!({"path": "/cfg/report", "opened": true}));
+        assert_eq!(s.execute("effect.plugins.openOfxUserFolder", json!({})).unwrap()["path"], "/cfg/userFolder");
+        s.ofx_open = Some(failing);
+        let e = s.execute("effect.plugins.openOfxReport", json!({})).unwrap_err().to_string();
+        assert!(e.contains("no scan report yet"), "{e}");
     }
 }

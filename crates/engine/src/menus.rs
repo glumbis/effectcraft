@@ -973,6 +973,8 @@ Effect
   Manage Effects... | effect.manage
   Load Effect Plug-in... | effect.plugins.load
   Load OpenFX Plug-in... | effect.plugins.loadOfx
+  Open OpenFX Plug-in Folder | effect.plugins.openOfxUserFolder
+  Open OpenFX Scan Report | effect.plugins.openOfxReport
   ---
   @effects
 Animation

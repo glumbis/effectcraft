@@ -49,6 +49,10 @@ const REFUSED: &[&str] = &[
     // It only writes a settings file in the config folder, but it changes what native plug-ins are
     // told about the host (some switch to other code paths): not an agent's call under confinement.
     "effect.plugins.setOfxHostName",
+    // They start the operating system's opener on a path in the config folder (the scan report, the
+    // plug-in folder, made if it is missing): other applications, not an agent's call under confinement.
+    "effect.plugins.openOfxReport",
+    "effect.plugins.openOfxUserFolder",
 ];
 
 /// Commands that read files named by these parameters.

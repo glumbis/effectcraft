@@ -486,6 +486,9 @@ pub struct Session {
     /// The OpenFX host name setting (hosts built with the `openfx` feature):
     /// `effect.plugins.ofxHostName`, `effect.plugins.setOfxHostName`.
     pub ofx_host_name: Option<OfxHostName>,
+    /// Opens the OpenFX scan report and the per-user plug-in folder with the operating system:
+    /// `effect.plugins.openOfxReport`, `effect.plugins.openOfxUserFolder`.
+    pub ofx_open: Option<OfxOpen>,
     /// Converts an After Effects project (`.aep` / `.aepx`) into an After Effects-style script that
     /// rebuilds it (hosts built with the `aep` feature): `file.importAep`.
     pub aep_converter: Option<AepConverter>,
@@ -575,6 +578,11 @@ pub type OfxRescan = fn() -> std::result::Result<Value, String>;
 /// and reports it as JSON (`effect.plugins.ofxHostName`, `effect.plugins.setOfxHostName`).
 pub type OfxHostName = fn(Option<&str>) -> std::result::Result<Value, String>;
 
+/// Opens the OpenFX scan report (`"report"`) or the per-user plug-in folder (`"userFolder"`, made if
+/// it is not there) with the operating system's default application and answers `{path, opened}`
+/// (`effect.plugins.openOfxReport`, `effect.plugins.openOfxUserFolder`).
+pub type OfxOpen = fn(&str) -> std::result::Result<Value, String>;
+
 /// Converts an After Effects project file (`.aep` or `.aepx`) into the JavaScript (After Effects
 /// scripting object model) that rebuilds it.
 pub type AepConverter = fn(&str) -> std::result::Result<String, String>;
@@ -632,6 +640,7 @@ impl Default for Session {
             ofx_clear_blocklist: None,
             ofx_rescan: None,
             ofx_host_name: None,
+            ofx_open: None,
             aep_converter: None,
             script_ui: scriptui::ScriptUi::default(),
             sys_memory: None,

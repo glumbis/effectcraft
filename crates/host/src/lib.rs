@@ -113,6 +113,7 @@ pub fn session() -> Session {
         s.ofx_clear_blocklist = Some(effectcraft_ofx::blocklist::clear);
         s.ofx_rescan = Some(effectcraft_ofx::rescan_command);
         s.ofx_host_name = Some(effectcraft_ofx::host_name_command);
+        s.ofx_open = Some(effectcraft_ofx::open_command);
     }
     // After Effects projects are converted by an external Python program: only with the `aep`
     // feature, never on the web build.

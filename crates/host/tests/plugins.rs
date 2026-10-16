@@ -169,11 +169,17 @@ fn openfx_commands_follow_the_build_feature() {
     if cfg!(feature = "openfx") {
         assert_eq!(list["ofx"], true);
         assert!(s.is_enabled("effect.plugins.scanOfx") && s.is_enabled("effect.plugins.loadOfx"));
+        // The menu entries that open the scan report and the per-user plug-in folder (they are not
+        // run here: they would open windows on the developer's machine).
+        assert!(s.is_enabled("effect.plugins.openOfxReport") && s.is_enabled("effect.plugins.openOfxUserFolder"));
         // A path with nothing to load is an error, not a crash.
         assert!(s.execute("effect.plugins.loadOfx", json!({"path": "/no/such/plugin.ofx.bundle"})).is_err());
     } else {
         assert_eq!(list["ofx"], false);
         assert!(!s.is_enabled("effect.plugins.scanOfx") && !s.is_enabled("effect.plugins.loadOfx"));
+        assert!(!s.is_enabled("effect.plugins.openOfxReport") && !s.is_enabled("effect.plugins.openOfxUserFolder"));
+        assert!(s.execute("effect.plugins.openOfxReport", json!({})).is_err());
+        assert!(s.execute("effect.plugins.openOfxUserFolder", json!({})).is_err());
         assert!(s.execute("effect.plugins.scanOfx", json!({})).is_err());
         assert!(s.execute("effect.plugins.loadOfx", json!({"path": "x.ofx"})).is_err());
     }

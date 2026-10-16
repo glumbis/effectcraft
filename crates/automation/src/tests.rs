@@ -1377,7 +1377,14 @@ fn automation_roots_confine_file_access() {
     denied(&mut s, "run_script", json!({"code": "1 + 1"}));
     denied(&mut s, "execute_command", json!({"command": "file.runScript", "params": {"path": p(&read, "x.jsx")}}));
     // Native OpenFX plug-ins are unsandboxed code, like scripts: refused, wherever they are.
-    for command in ["effect.plugins.loadOfx", "effect.plugins.scanOfx", "effect.plugins.rescanOfx", "effect.plugins.setOfxHostName"] {
+    for command in [
+        "effect.plugins.loadOfx",
+        "effect.plugins.scanOfx",
+        "effect.plugins.rescanOfx",
+        "effect.plugins.setOfxHostName",
+        "effect.plugins.openOfxReport",
+        "effect.plugins.openOfxUserFolder",
+    ] {
         let msg = denied(&mut s, "execute_command", json!({"command": command, "params": {"path": p(&read, "x.ofx")}}));
         assert!(msg.contains("not available while file access is confined"), "{msg}");
     }
