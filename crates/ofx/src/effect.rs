@@ -43,7 +43,8 @@
 //!   waking up) has at most [`HEAVY_CAP`] instances alive.
 //!   Creating them is one at a time, and a render at the limit takes an idle instance of another
 //!   applied effect (when the plug-in does not keep state from frame to frame, see
-//!   `kOfxImageEffectInstancePropSequentialRender`), or waits for one to come back, or, when it
+//!   `kOfxImageEffectInstancePropSequentialRender`), or, when none is in use, destroys the one
+//!   idle longest to make its own, or waits for one to come back, or, when it
 //!   would wait for itself (a nested render) or has waited [`WAIT_FOR_INSTANCE`], creates one more.
 //! * `DestroyInstance` goes to every pooled instance and `Unload` to every loaded plug-in when the
 //!   app quits ([`shutdown_all`]).
@@ -356,6 +357,18 @@ impl OfxEffect {
             {
                 pool.out.push(task);
                 break i;
+            }
+            // At the limit with every instance idle, and none can be lent (the plug-in keeps state
+            // from frame to frame): no instance is coming back, so waiting would only run the clock
+            // (the full [`WAIT_FOR_INSTANCE`], on every frame of a third applied effect). The one idle
+            // longest is destroyed to make room, and the loop makes an instance for this render.
+            if pool.out.is_empty()
+                && let Some(victim) = pool.steal(key)
+            {
+                pool.live = pool.live.saturating_sub(1);
+                drop(pool);
+                drop(victim);
+                continue;
             }
             // Everything is in use. A render that holds an instance itself (the plug-in's render
             // asked the host for an image that is made by another application of the same plug-in)
@@ -768,6 +781,70 @@ mod tests {
 
     fn last_of(i: &Instance) -> Option<f64> {
         i.seq.map(|s| s.last)
+    }
+
+    /// An effect (never described by a real plug-in: every action answers "reply default") that
+    /// keeps state from frame to frame and is slow to create instances, so it is limited to
+    /// [`HEAVY_CAP`] of them.
+    fn heavy_stateful_effect() -> OfxEffect {
+        let cfg = Arc::new(EffectCfg {
+            context: CTX_FILTER.into(),
+            clips: vec![],
+            depth: Depth::Float,
+            safety: Safety::InstanceSafe,
+            slave_params: vec![],
+            single_instance: false,
+            sequential_render: 1,
+        });
+        let manifest = PluginManifest {
+            api: effectcraft_effects::plugin::PLUGIN_API_VERSION,
+            id: "test.heavy.stateful".into(),
+            name: "Heavy".into(),
+            category: "Test".into(),
+            version: "1.0".into(),
+            author: String::new(),
+            description: String::new(),
+            params: vec![],
+        };
+        let reg = Registration {
+            ofx_id: "test.heavy.stateful".into(),
+            version: (1, 0),
+            context: "filter".into(),
+            manifest,
+            bindings: Arc::new(Default::default()),
+            cfg,
+            notes: vec![],
+        };
+        let entry = Arc::new(PluginEntry::new(nop, "test.heavy.stateful".into(), Arc::new(ReentrantLock::new()), PluginDiag::new(), 0));
+        let effect = OfxEffect::eager(reg, Live { entry, desc: EffectObj::new_descriptor() }, String::new());
+        effect.heavy.store(true, Ordering::Relaxed);
+        effect
+    }
+
+    /// A heavy plug-in that keeps state between frames has its two instances (for two applied
+    /// effects), both idle, and a third applied effect renders. Nothing is in use, so no instance is
+    /// coming back and none can be lent: the render must make room at once (the idle instance that sat
+    /// longest is destroyed) and not wait for [`WAIT_FOR_INSTANCE`] on every frame.
+    #[test]
+    fn a_render_at_the_limit_with_nothing_in_use_makes_room_instead_of_waiting() {
+        let effect = heavy_stateful_effect();
+        let live = effect.live().unwrap();
+        let values = HashMap::new();
+        for key in [1u64, 2] {
+            let inst = effect.checkout(live, key, &values, None).unwrap();
+            effect.checkin(key, inst);
+        }
+        assert_eq!(effect.pool.lock().unwrap().live, 2);
+        let started = Instant::now();
+        let inst = effect.checkout(live, 3, &values, None).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "waited {:?} for an instance nobody was using", started.elapsed());
+        // One instance went to make room: the limit still holds, and the oldest key lost its own.
+        assert_eq!(effect.pool.lock().unwrap().live, 2);
+        effect.checkin(3, inst);
+        let pool = effect.pool.lock().unwrap();
+        let mut keys: Vec<u64> = pool.idle.keys().copied().collect();
+        keys.sort_unstable();
+        assert_eq!((pool.live, keys), (2, vec![2, 3]));
     }
 
     /// A frame goes to the idle instance whose sequence continues at it; any other frame to the most
