@@ -37,16 +37,25 @@ Install your plug-ins with their own installers, choosing the OFX version. They 
 Effects & Presets) is already inside the app. If you cannot see your plug-ins, look at the report
 EffectCraft writes at start-up: ~/Library/Application Support/EffectCraft/ofx_scan.txt
 
+To add a plug-in by hand without an administrator password, copy its .ofx.bundle folder into
+~/Library/OFX/Plugins (create the folder if it is not there) or into
+~/Library/Application Support/EffectCraft/OFX. EffectCraft searches both, and neither is touched when
+you replace or delete the app.
+
 Only macOS builds of plug-ins work (a "MacOS" folder inside the .ofx.bundle), and they must match
 this app's processor: this download is for @ARCH@ Macs.
 
 4. After Effects project import (.aep / .aepx)
 ----------------------------------------------
 Needs Python 3 and the py-aep library. Double-click "Set up After Effects import.command" (run the
-xattr command from step 2 on this folder first), or in Terminal:
+xattr command from step 2 on this folder first). It keeps py-aep in a private Python environment,
+~/Library/Application Support/EffectCraft/aep-python, which EffectCraft finds by itself (a plain
+"pip install --user" is refused by recent Pythons). Or do the same in Terminal:
 
-    /usr/bin/python3 -m pip install --user py-aep
+    /usr/bin/python3 -m venv "$HOME/Library/Application Support/EffectCraft/aep-python"
+    "$HOME/Library/Application Support/EffectCraft/aep-python/bin/pip" install py-aep
 
+(Homebrew's or python.org's Python 3 work too: /opt/homebrew/bin/python3, /usr/local/bin/python3.)
 Then use File > Import > After Effects Project... in EffectCraft.
 
 5. Command line

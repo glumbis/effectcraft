@@ -6,7 +6,9 @@
 #   * commands:        ~/.local/bin/effectcraft-ofx  and  ~/.local/bin/effectcraft-cli-ofx
 #   * app menu entry:  "EffectCraft (OFX)" (+ its icon) under ${XDG_DATA_HOME:-~/.local/share}
 #   * the test plug-in "EC Test" next to the app, in OFX/ (EffectCraft scans that folder)
-#   * for opening .aep / .aepx: py-aep, installed with `python3 -m pip install --user`
+#   * for opening .aep / .aepx: py-aep, installed with `python3 -m pip install --user`, or, where
+#     the system Python refuses that (Debian 12+, Ubuntu 23.04+, Arch...), into a private virtual
+#     environment at ${XDG_CONFIG_HOME:-~/.config}/effectcraft/aep-python, which the app finds by itself
 #
 # Usage: ./install.sh [--yes] [--no-python]
 #   --yes         answer yes to every question (also what happens when there is no terminal)
@@ -18,6 +20,9 @@ help() { awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else exit }' "$0"; }
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+# EffectCraft's config folder (crates/host/src/app_dirs.rs): settings, the OFX scan report, and the
+# private Python environment for .aep import ("aep-python", found by the app without any setting).
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/effectcraft"
 BIN_DIR="$HOME/.local/bin"
 DEST="$DATA_HOME/effectcraft-ofx"
 ASSUME_YES=0
@@ -97,10 +102,12 @@ if [ -d "$SRC/OFX/ec-test-ofx.ofx.bundle" ]; then
   ok 'Test plug-in installed ("EC Test" effects)'
 fi
 say "     Your own OpenFX plug-ins (RSMB, Twixtor, Sapphire...): install their Linux OFX versions,"
-say "     normally into /usr/OFX/Plugins, or copy the .ofx.bundle folder into $DEST/OFX"
+say "     normally into /usr/OFX/Plugins, or, without root, copy the .ofx.bundle folder into"
+say "     $DATA_HOME/OFX/Plugins (or $CONFIG_DIR/OFX). Both stay when EffectCraft is uninstalled."
 
 # 3. Commands in ~/.local/bin. Named *-ofx so they never replace a distribution's own effectcraft.
-#    (Python's virtual environment, below, turns them into small launcher scripts.)
+#    (An older installer wrote launcher scripts here when py-aep lived in a private environment; the
+#    app finds that environment itself now, so these are plain links again.)
 ln -sfn "$DEST/effectcraft" "$BIN_DIR/effectcraft-ofx"
 ln -sfn "$DEST/effectcraft-cli" "$BIN_DIR/effectcraft-cli-ofx"
 ok "Commands: effectcraft-ofx, effectcraft-cli-ofx (in $BIN_DIR)"
@@ -196,10 +203,17 @@ if [ -n "$LDCONFIG" ]; then
 fi
 
 # 6. Python + py-aep for .aep / .aepx import.
-VENV="$DEST/venv"
+#    The app looks for Python in this order: EFFECTCRAFT_PYTHON, $CONFIG_DIR/aep-python/bin/python3
+#    (the private environment below), then python3 on the PATH (crates/host/src/aep.rs). So an
+#    environment made here is used without a launcher script or an environment variable.
+VENV="$CONFIG_DIR/aep-python"
+# Made by an older installer next to the app (with launcher scripts in ~/.local/bin, replaced above).
+if [ -d "$DEST/venv" ]; then rm -rf "$DEST/venv"; fi
 if [ "$WITH_PYTHON" = 1 ]; then
   say ""
-  if ! command -v python3 >/dev/null 2>&1; then
+  if [ -x "$VENV/bin/python3" ] && "$VENV/bin/python3" -c 'import py_aep' >/dev/null 2>&1; then
+    ok "After Effects project import ready (py-aep is in the private environment $VENV)"
+  elif ! command -v python3 >/dev/null 2>&1; then
     warn "Python 3 is needed only to open After Effects projects (.aep / .aepx). It was not found."
     say "     Install it (Debian/Ubuntu: sudo apt install python3 python3-pip; Fedora: sudo dnf install python3 python3-pip),"
     say "     then run:  python3 -m pip install --user py-aep"
@@ -211,17 +225,19 @@ if [ "$WITH_PYTHON" = 1 ]; then
       ok "After Effects project import ready: File > Import > After Effects Project..."
     elif grep -q 'externally-managed-environment' "$log"; then
       # Debian 12+, Ubuntu 23.04+, Arch and others refuse `pip --user` for the system Python:
-      # keep py-aep in a private virtual environment next to the app instead.
+      # keep py-aep in a private virtual environment in EffectCraft's config folder instead, where
+      # the app looks for one.
       say "     This Python is managed by your distribution, so py-aep goes into a private environment: $VENV"
-      if python3 -m venv "$VENV" >/dev/null 2>&1 && "$VENV/bin/python" -m pip install --upgrade --disable-pip-version-check py-aep >"$log" 2>&1; then
-        for pair in effectcraft-ofx:effectcraft effectcraft-cli-ofx:effectcraft-cli; do
-          rm -f "$BIN_DIR/${pair%%:*}"
-          printf '#!/bin/sh\nEFFECTCRAFT_PYTHON="%s" exec "%s" "$@"\n' "$VENV/bin/python" "$DEST/${pair#*:}" >"$BIN_DIR/${pair%%:*}"
-          chmod 0755 "$BIN_DIR/${pair%%:*}"
-        done
-        ok "After Effects project import ready (private environment; the commands set EFFECTCRAFT_PYTHON for you)"
+      made_venv=0
+      if [ ! -e "$VENV" ]; then made_venv=1; fi
+      mkdir -p "$CONFIG_DIR"
+      if { [ -x "$VENV/bin/python3" ] || python3 -m venv "$VENV" >/dev/null 2>&1; } \
+        && "$VENV/bin/python3" -m pip install --upgrade --disable-pip-version-check py-aep >"$log" 2>&1 \
+        && "$VENV/bin/python3" -c 'import py_aep' >/dev/null 2>&1; then
+        ok "After Effects project import ready (EffectCraft finds the private environment by itself)"
       else
-        rm -rf "$VENV"
+        # Do not leave a half-made environment (the app would try it first); one that was there before stays.
+        if [ "$made_venv" = 1 ]; then rm -rf "$VENV"; fi
         warn "Could not create the environment (Debian/Ubuntu: sudo apt install python3-venv). Or use pipx:  pipx install py-aep"
         tail -n 5 "$log" >&2 || true
       fi
@@ -237,4 +253,4 @@ fi
 
 say ""
 say 'Done. Start EffectCraft from your app menu ("EffectCraft (OFX)") or with:  effectcraft-ofx'
-say "Settings and projects stay in ~/.config/effectcraft. Uninstall with:  $DEST/uninstall.sh"
+say "Settings and projects stay in $CONFIG_DIR. Uninstall with:  $DEST/uninstall.sh"
