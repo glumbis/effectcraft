@@ -1,17 +1,17 @@
 //! `OfxMultiThreadSuiteV1`: SMP helper threads and recursive mutexes.
 //!
-//! `multiThread` runs the plug-in's function on `min(n, CPUs)` scoped threads and returns when
-//! all are done. Threads it spawns are flagged so `multiThreadIsSpawnedThread` / `multiThreadIndex`
-//! answer correctly. Mutexes are recursive (OFX allows relocking) and are created with an
-//! initial lock count owned by the creating thread.
+//! `multiThread` runs the plug-in's function on `min(n, CPUs)` threads (index 0 on the calling
+//! thread, the others on the pooled plug-in-stack workers of [`crate::pool`], which stay alive
+//! between calls) and returns when all are done. The threads are flagged so
+//! `multiThreadIsSpawnedThread` / `multiThreadIndex` answer correctly. Mutexes are recursive (OFX
+//! allows relocking) and are created with an initial lock count owned by the creating thread.
 
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, ThreadId};
 
 use crate::ffi::*;
-use crate::instance::{ON_PLUGIN_STACK, PLUGIN_STACK};
 
 thread_local! {
     static SPAWNED: Cell<Option<u32>> = const { Cell::new(None) };
@@ -22,25 +22,24 @@ fn cpus() -> u32 {
     thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1).clamp(1, 256)
 }
 
-struct RawArg(usize);
-
 extern "C" fn multi_thread(func: ThreadFn, n_threads: u32, arg: *mut c_void) -> OfxStatus {
     guard(|| {
         if IN_MULTI_THREAD.with(Cell::get) {
             return K_STAT_ERR_EXISTS;
         }
         let n = n_threads.clamp(1, cpus());
-        let arg = RawArg(arg as usize);
+        // Raw pointers aren't Send; the argument crosses to the workers as an address, valid until
+        // this call returns (it waits for them all).
+        let arg = arg as usize;
         // The workers belong to the action that called us (messages and unmet requests they
-        // make are attributed to the plug-in).
+        // make are attributed to the plug-in) ...
         let ctx = crate::diag::current();
-        // A crash on a worker is the crash of the action that started it (see `inflight`).
+        // ... a crash on a worker is the crash of the action that started it (see `inflight`) ...
         let slot = crate::inflight::current_slot();
         // ... and the locks of the render it works for (the library's render lock) are its locks:
         // a worker's `clipGetImage` may render another effect of the same library.
         let tokens = crate::lock::snapshot();
-        let run = |index: u32| {
-            let a = &arg;
+        let task: Arc<dyn Fn(u32) -> bool + Send + Sync> = Arc::new(move |index: u32| {
             let _scope = ctx.as_ref().map(crate::diag::CallCtx::enter);
             let _slot = crate::inflight::adopt_slot(slot);
             let _locks = crate::lock::adopt(&tokens);
@@ -48,39 +47,13 @@ extern "C" fn multi_thread(func: ThreadFn, n_threads: u32, arg: *mut c_void) -> 
             // The plug-in's code must not unwind into Rust; a panic here would be a bug in it.
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // SAFETY: the plug-in's thread function, called as the specification describes.
-                unsafe { func(index, n, a.0 as *mut c_void) }
+                unsafe { func(index, n, arg as *mut c_void) }
             }));
             SPAWNED.with(|s| s.set(None));
             r.is_ok()
-        };
+        });
         IN_MULTI_THREAD.with(|f| f.set(true));
-        let ok = if n == 1 {
-            run(0)
-        } else {
-            thread::scope(|s| {
-                // Plug-in-sized stacks (see PLUGIN_STACK); an index whose thread can't be started
-                // runs on this thread afterwards.
-                let spawned: Vec<_> = (1..n)
-                    .map(|i| {
-                        (
-                            i,
-                            thread::Builder::new().name("ofx-worker".into()).stack_size(PLUGIN_STACK).spawn_scoped(s, move || {
-                                ON_PLUGIN_STACK.with(|s| s.set(true));
-                                run(i)
-                            }),
-                        )
-                    })
-                    .collect();
-                let mut ok = run(0);
-                for (i, h) in spawned {
-                    ok &= match h {
-                        Ok(h) => h.join().unwrap_or(false),
-                        Err(_) => run(i),
-                    };
-                }
-                ok
-            })
-        };
+        let ok = crate::pool::run_indexed(n, task);
         IN_MULTI_THREAD.with(|f| f.set(false));
         if ok { K_STAT_OK } else { K_STAT_FAILED }
     })
@@ -255,6 +228,47 @@ mod tests {
         {
             slot.store(asked, Ordering::SeqCst);
         }
+    }
+
+    static THREADS: Mutex<Vec<ThreadId>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn note_thread(_index: u32, _max: u32, _arg: *mut c_void) {
+        THREADS.lock().unwrap().push(thread::current().id());
+    }
+
+    /// The workers are kept between calls: forty calls do not start a hundred threads.
+    #[test]
+    fn the_workers_are_reused_between_calls() {
+        THREADS.lock().unwrap().clear();
+        for _ in 0..40 {
+            assert_eq!(multi_thread(note_thread, 4, std::ptr::null_mut()), K_STAT_OK);
+        }
+        let ids = THREADS.lock().unwrap().clone();
+        let distinct: std::collections::HashSet<_> = ids.iter().collect();
+        let n = cpus().min(4) as usize;
+        assert_eq!(ids.len(), 40 * n, "every index ran in every call");
+        // This thread and the pooled workers (shared with whatever else runs at the moment).
+        assert!(distinct.len() <= n + 16, "{} distinct threads", distinct.len());
+    }
+
+    unsafe extern "C" fn ignore(_index: u32, _max: u32, _arg: *mut c_void) {}
+
+    unsafe extern "C" fn nest(index: u32, _max: u32, arg: *mut c_void) {
+        if index == 0 {
+            // A call from inside a call: the specification says it cannot be done recursively.
+            let status = multi_thread(ignore, 2, std::ptr::null_mut());
+            // SAFETY: the test's own status cell.
+            unsafe { *(arg as *mut OfxStatus) = status };
+        }
+    }
+
+    #[test]
+    fn multi_thread_cannot_be_called_recursively() {
+        let mut status: OfxStatus = K_STAT_OK;
+        assert_eq!(multi_thread(nest, 2, &mut status as *mut OfxStatus as *mut c_void), K_STAT_OK);
+        assert_eq!(status, K_STAT_ERR_EXISTS);
+        // And the flag was cleared: the next call works.
+        assert_eq!(multi_thread(ignore, 2, std::ptr::null_mut()), K_STAT_OK);
     }
 
     #[test]

@@ -38,8 +38,9 @@
 //! * A plug-in that allows one instance (`kOfxImageEffectPluginPropSingleInstance`) has one
 //!   shared instance for all its applications, used by one render at a time; an effect applied
 //!   inside itself cannot have a second one and fails with a message.
-//! * An instance whose `CreateInstance` took [`HEAVY_CREATE`] or longer (a plug-in that loads a
-//!   model or starts a runtime) is rare: such a plug-in has at most [`HEAVY_CAP`] instances alive.
+//! * A plug-in whose `CreateInstance` took [`HEAVY_CREATE`] or longer twice in a row (it loads a
+//!   model or starts a runtime for each instance; one slow first instance is just a library
+//!   waking up) has at most [`HEAVY_CAP`] instances alive.
 //!   Creating them is one at a time, and a render at the limit takes an idle instance of another
 //!   applied effect (when the plug-in does not keep state from frame to frame, see
 //!   `kOfxImageEffectInstancePropSequentialRender`), or waits for one to come back, or, when it
@@ -49,7 +50,7 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,7 @@ use crate::ffi::*;
 use crate::instance::*;
 use crate::loader::LazyBinary;
 use crate::lock::ReentrantLock;
+use crate::pool::PLUGIN_STACK;
 use crate::props::PVal;
 
 /// The most idle instances kept per instance key.
@@ -72,8 +74,8 @@ const MAX_KEYS: usize = 64;
 const MAX_MEASURE_EDGE: f64 = 65536.0;
 /// The most padding a plug-in may request per side; larger regions are treated as unbounded.
 const MAX_PAD: i32 = 4096;
-/// A plug-in whose `CreateInstance` takes this long (it loads a model, starts a runtime) is
-/// limited to [`HEAVY_CAP`] instances.
+/// A plug-in whose `CreateInstance` takes this long twice in a row (it loads a model, starts a
+/// runtime) is limited to [`HEAVY_CAP`] instances.
 const HEAVY_CREATE: Duration = Duration::from_millis(250);
 /// The most live instances (in use and idle) of a heavy plug-in.
 const HEAVY_CAP: usize = 2;
@@ -161,6 +163,7 @@ pub(crate) fn shutdown_all() {
         for e in &all {
             e.unload();
         }
+        crate::clips::release_spare_buffers();
         let _ = tx.send(());
     };
     // Plug-in code wants a big stack here too.
@@ -199,8 +202,10 @@ pub struct OfxEffect {
     /// Instances are made one at a time (a plug-in that loads a model per instance is not asked
     /// for four at once).
     create: Mutex<()>,
-    /// `CreateInstance` took [`HEAVY_CREATE`] or longer once.
+    /// `CreateInstance` took [`HEAVY_CREATE`] or longer twice in a row.
     heavy: AtomicBool,
+    /// How many of the latest creations in a row were that slow.
+    slow_creates: AtomicU32,
     /// Held by the one render that uses the single instance of a plug-in that allows only one.
     single: ReentrantLock,
     /// The app is quitting: no more instances.
@@ -222,6 +227,7 @@ impl OfxEffect {
             returned: Condvar::new(),
             create: Mutex::new(()),
             heavy: AtomicBool::new(false),
+            slow_creates: AtomicU32::new(0),
             single: ReentrantLock::new(),
             closed: AtomicBool::new(false),
             pad_cache: Mutex::new(HashMap::new()),
@@ -326,9 +332,11 @@ impl OfxEffect {
                 let t0 = Instant::now();
                 match self.create_instance(live, values) {
                     Ok(i) => {
-                        if t0.elapsed() >= HEAVY_CREATE && !self.heavy.swap(true, Ordering::Relaxed) {
+                        if t0.elapsed() < HEAVY_CREATE {
+                            self.slow_creates.store(0, Ordering::Relaxed);
+                        } else if self.slow_creates.fetch_add(1, Ordering::Relaxed) >= 1 && !self.heavy.swap(true, Ordering::Relaxed) {
                             log::info!(
-                                "openfx: {} took {} ms to create an instance: at most {HEAVY_CAP} live instances of it",
+                                "openfx: {} is slow to create instances ({} ms): at most {HEAVY_CAP} live instances of it",
                                 self.reg.ofx_id,
                                 t0.elapsed().as_millis()
                             );
@@ -580,9 +588,12 @@ impl OfxEffect {
         let in_comps = self.input_comps(&inst.prefs);
         let depth = inst.prefs.depth;
         let has_input = self.reg.cfg.clips.iter().any(|c| c.role == ClipRole::Input);
-        let src_now = has_input.then(|| {
-            Arc::new(ClipImage::from_rows(frame.pixels, w, (pad, pad, w.saturating_sub(pad), h.saturating_sub(pad)), src_rect, src_rect, depth, in_comps))
-        });
+        let src_now = if has_input {
+            let img = ClipImage::from_rows(frame.pixels, w, (pad, pad, w.saturating_sub(pad), h.saturating_sub(pad)), src_rect, src_rect, depth, in_comps);
+            Some(Arc::new(img.ok_or("there is not enough memory to convert the layer for the plug-in")?))
+        } else {
+            None
+        };
         let ctx = Arc::new(RenderCtx::new(
             self.reg.cfg.clone(),
             geom,
@@ -649,7 +660,7 @@ impl OfxEffect {
             .find(|c| c.role == ClipRole::Output)
             .map(|c| inst.prefs.comps.get(&c.name).copied().unwrap_or(c.comps))
             .unwrap_or(Comps::Rgba);
-        let out = Arc::new(ClipImage::blank(bounds, rod_px, depth, out_comps));
+        let out = Arc::new(ClipImage::blank(bounds, rod_px, depth, out_comps).ok_or("there is not enough memory for the plug-in's output image")?);
         *ctx.output.lock().unwrap_or_else(PoisonError::into_inner) = Some(out.clone());
 
         let entry = inst.entry.clone();
@@ -661,6 +672,7 @@ impl OfxEffect {
             // Out of memory: the plug-in is asked to let go of what it caches, and tries once more.
             log::warn!("openfx: {} ran out of memory rendering; asking it to purge its caches and trying once more", self.reg.ofx_id);
             inst.purge_caches();
+            crate::clips::release_spare_buffers();
             mark = entry.diag.mark();
             status = inst.render(t, window, geom.scale);
         }

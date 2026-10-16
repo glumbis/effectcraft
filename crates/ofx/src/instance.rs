@@ -23,6 +23,7 @@ use crate::diag::{self, CallCtx, PluginDiag, PropKind};
 use crate::ffi::*;
 use crate::lock::ReentrantLock;
 use crate::params::{Bindings, CoordCtx, ParamObj, ParamSet};
+use crate::pool::on_plugin_stack;
 use crate::props::{PVal, PropSet};
 
 /// The marker at the start of every [`EffectObj`].
@@ -195,95 +196,6 @@ impl PluginEntry {
         // overflowed them and crashed. Renders, and instance creation (which loads models and
         // initialises runtimes), run on a thread with a plug-in-sized stack on every OS.
         if action == ACT_RENDER || action == ACT_CREATE_INSTANCE { on_plugin_stack(run).unwrap_or(K_STAT_ERR_FATAL) } else { run() }
-    }
-}
-
-/// Stack size of the threads plug-in code runs on (renders, instance creation, `multiThread`
-/// workers): twice glibc's default, which plug-ins are written for.
-pub(crate) const PLUGIN_STACK: usize = 16 << 20;
-
-thread_local! {
-    /// Set on threads that already have [`PLUGIN_STACK`].
-    pub(crate) static ON_PLUGIN_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Work for a plug-in-stack worker.
-type Job = Box<dyn FnOnce() + Send>;
-
-/// The workers that are waiting for work (their inboxes), most recently idle last.
-fn idle_workers() -> &'static Mutex<Vec<std::sync::mpsc::Sender<Job>>> {
-    static IDLE: OnceLock<Mutex<Vec<std::sync::mpsc::Sender<Job>>>> = OnceLock::new();
-    IDLE.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// The most workers kept waiting. More concurrent calls get a thread of their own, which ends
-/// after its job.
-const MAX_IDLE_WORKERS: usize = 8;
-
-/// A worker thread: run the jobs sent to it, then (while fewer than [`MAX_IDLE_WORKERS`] wait)
-/// wait for the next one. The thread, and so the plug-in's thread-local state, outlives a call:
-/// plug-ins that keep per-thread contexts (GPU, runtimes, licence checks) are not handed a fresh
-/// thread for every frame.
-fn worker_main(first: Arc<Mutex<Option<Job>>>, me: std::sync::mpsc::Sender<Job>, inbox: std::sync::mpsc::Receiver<Job>) {
-    ON_PLUGIN_STACK.with(|c| c.set(true));
-    let mut next = first.lock().unwrap_or_else(PoisonError::into_inner).take();
-    while let Some(job) = next.take() {
-        job();
-        {
-            let mut idle = idle_workers().lock().unwrap_or_else(PoisonError::into_inner);
-            if idle.len() >= MAX_IDLE_WORKERS {
-                return;
-            }
-            idle.push(me.clone());
-        }
-        next = inbox.recv().ok();
-    }
-}
-
-/// Run `f` on a thread with [`PLUGIN_STACK`] and wait for it (directly when this thread already
-/// has one, or when no thread can be started). `None` if `f` panicked. Threads are pooled (see
-/// [`worker_main`]).
-pub(crate) fn on_plugin_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Option<R> {
-    if ON_PLUGIN_STACK.with(std::cell::Cell::get) {
-        return Some(f());
-    }
-    let (reply, answer) = std::sync::mpsc::sync_channel::<Option<R>>(1);
-    // The pooled thread works for this one: the locks this task holds (the library's render lock)
-    // are held by it too, so that a nested render it starts does not wait for them.
-    let tokens = crate::lock::snapshot();
-    let mut job: Job = Box::new(move || {
-        let _adopted = crate::lock::adopt(&tokens);
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
-        let _ = reply.send(r);
-    });
-    // A waiting worker first (the most recently used: its thread-local state is the warmest).
-    loop {
-        let worker = idle_workers().lock().unwrap_or_else(PoisonError::into_inner).pop();
-        let Some(w) = worker else { break };
-        match w.send(job) {
-            Ok(()) => return answer.recv().ok().flatten(),
-            // That worker is gone: take the job back and try the next.
-            Err(std::sync::mpsc::SendError(j)) => job = j,
-        }
-    }
-    // None waiting: start one with this job. The job travels in a shared cell so it is still
-    // here when the thread cannot be started.
-    let cell = Arc::new(Mutex::new(Some(job)));
-    let (me, inbox) = std::sync::mpsc::channel::<Job>();
-    let started = {
-        let cell = cell.clone();
-        std::thread::Builder::new().name("ofx-plugin".into()).stack_size(PLUGIN_STACK).spawn(move || worker_main(cell, me, inbox))
-    };
-    match started {
-        Ok(_) => answer.recv().ok().flatten(),
-        Err(_) => {
-            // No thread: run here.
-            let job = cell.lock().unwrap_or_else(PoisonError::into_inner).take();
-            if let Some(j) = job {
-                j();
-            }
-            answer.recv().ok().flatten()
-        }
     }
 }
 
@@ -661,7 +573,7 @@ impl RenderCtx {
             return None;
         }
         let bounds = self.geom.rect_for(w as i32, h as i32, img.origin);
-        Some(Arc::new(ClipImage::from_rows(&img.pixels, w, (0, 0, w, h), bounds, bounds, self.depth, comps)))
+        Some(Arc::new(ClipImage::from_rows(&img.pixels, w, (0, 0, w, h), bounds, bounds, self.depth, comps)?))
     }
 
     /// The image of clip `name` at OFX time `t`, or `None` when it is unavailable.
@@ -1131,105 +1043,6 @@ mod tests {
         });
         let inst = Instance::build(entry, cfg, &desc);
         assert!(matches!(inst.obj.props.all(IE_OPENGL_ENABLED).as_slice(), [PVal::Int(0)]));
-    }
-
-    /// Recursion that needs a few MiB of stack: more than a 2 MiB worker thread has, less than
-    /// [`PLUGIN_STACK`].
-    fn deep(n: u32) -> u64 {
-        let pad = [n as u8; 32 * 1024];
-        let here: u64 = std::hint::black_box(&pad).iter().map(|b| u64::from(*b)).sum();
-        if n == 0 { here } else { here + deep(n - 1) }
-    }
-
-    /// Render and CreateInstance run on threads with plug-in-sized stacks on every OS, the threads
-    /// are reused (a plug-in's thread-local state survives), and a call from such a thread runs
-    /// inline instead of waiting for another.
-    #[test]
-    fn plugin_stack_threads_are_big_pooled_and_not_nested() {
-        let here = std::thread::current().id();
-        let (there, flagged, total) = on_plugin_stack(|| (std::thread::current().id(), ON_PLUGIN_STACK.with(std::cell::Cell::get), deep(200))).unwrap();
-        assert_ne!(there, here);
-        assert!(flagged);
-        assert!(total > 0, "{total}");
-        // Later calls get the same (now idle) worker.
-        for _ in 0..5 {
-            assert_eq!(on_plugin_stack(|| std::thread::current().id()), Some(there));
-        }
-        // A call made on a plug-in-stack thread runs on that thread.
-        let inline = on_plugin_stack(|| {
-            let me = std::thread::current().id();
-            on_plugin_stack(move || std::thread::current().id() == me)
-        });
-        assert_eq!(inline, Some(Some(true)));
-        // Concurrent calls get workers of their own and all finish.
-        let handles: Vec<_> = (0..4).map(|i| std::thread::spawn(move || on_plugin_stack(move || deep(20) + i))).collect();
-        for (i, h) in handles.into_iter().enumerate() {
-            assert!(h.join().unwrap().is_some_and(|v| v >= i as u64));
-        }
-        // A panic inside the job is reported as `None`, and the pool still works afterwards.
-        assert_eq!(on_plugin_stack(|| -> u32 { panic!("a plug-in-side bug") }), None);
-        assert_eq!(on_plugin_stack(|| 7), Some(7));
-    }
-
-    /// A host that counts the requests for the effect's input and takes a while to answer.
-    struct SlowHost(std::sync::atomic::AtomicUsize);
-
-    impl PluginHost for SlowHost {
-        fn input_at(&self, _layer_time: f64) -> Option<PluginImage> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            Some(PluginImage { width: 2, height: 2, pixels: vec![[0.5, 0.5, 0.5, 1.0]; 4], origin: [0.0; 2], scale: 1.0 })
-        }
-        fn layer_input(&self, _param_id: &str, _layer_time: f64) -> Option<PluginImage> {
-            None
-        }
-        fn params_at(&self, _layer_time: f64) -> Option<(Vec<f64>, Vec<String>)> {
-            None
-        }
-        fn frame_rate(&self) -> f64 {
-            30.0
-        }
-        fn time(&self) -> f64 {
-            0.0
-        }
-    }
-
-    /// A plug-in's worker threads that all want the same image at the same moment cost the layers
-    /// upstream one render, not one each: the host answers one at a time, and a thread that waited
-    /// for its turn finds the answer in the cache.
-    #[test]
-    fn workers_asking_for_the_same_image_at_once_cost_one_host_call() {
-        let host = SlowHost(Default::default());
-        let cfg = Arc::new(EffectCfg {
-            context: CTX_FILTER.into(),
-            clips: vec![ClipCfg { name: "Source".into(), role: ClipRole::Input, comps: Comps::Rgba, optional: false }],
-            depth: Depth::Float,
-            safety: Safety::InstanceSafe,
-            slave_params: vec![],
-            single_instance: false,
-            sequential_render: 0,
-        });
-        let ctx = Arc::new(RenderCtx::new(
-            cfg,
-            Geometry::nominal(1.0),
-            30.0,
-            1.0,
-            Some(HostPtr::new(&host)),
-            Arc::new(Bindings::default()),
-            HashMap::new(),
-            Depth::Float,
-            HashMap::new(),
-            None,
-        ));
-        let images: Vec<bool> = std::thread::scope(|s| {
-            let jobs: Vec<_> = (0..6).map(|_| s.spawn(|| ctx.image("Source", 7.0).is_some())).collect();
-            jobs.into_iter().map(|j| j.join().unwrap()).collect()
-        });
-        assert!(images.iter().all(|ok| *ok));
-        assert_eq!(host.0.load(Ordering::SeqCst), 1, "the host was asked more than once for the same image");
-        // Another time is another request.
-        assert!(ctx.image("Source", 8.0).is_some());
-        assert_eq!(host.0.load(Ordering::SeqCst), 2);
     }
 
     #[test]

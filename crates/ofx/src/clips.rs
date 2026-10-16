@@ -5,10 +5,19 @@
 //! OFX images are y-up. Instead of handing out negative row bytes (some plug-ins mishandle
 //! them), the conversion flips the rows: OFX row 0 is EffectCraft's bottom row and `rowBytes`
 //! is positive.
+//!
+//! Image buffers start on a 64-byte boundary and every row starts on one too: `rowBytes` is the
+//! row's size rounded up to a multiple of 64 (an RGB float row of 5 pixels is 60 bytes of pixels
+//! in a 64-byte row), as plug-ins that load rows with aligned SIMD instructions expect. Every
+//! conversion goes through `rowBytes`, never through width times pixel size. Freed buffers are
+//! kept for the next image of the same size (the frames of one render are all the same size), so
+//! a render does not ask the operating system for tens of megabytes and have it zeroed again for
+//! every effect.
 
-use std::cell::UnsafeCell;
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use serde::{Deserialize, Serialize};
@@ -137,11 +146,43 @@ impl Comps {
     }
 }
 
-/// A 4-byte-aligned pixel buffer the plug-in reads (and, for the output image, writes) through
+/// Buffers and rows are aligned to this many bytes.
+pub const IMAGE_ALIGN: usize = 64;
+
+/// The most freed buffers kept for reuse, and the most bytes they hold together.
+const MAX_SPARE: usize = 12;
+const MAX_SPARE_BYTES: usize = 384 << 20;
+
+/// A freed buffer: its address and size (a multiple of [`IMAGE_ALIGN`]).
+struct Spare(NonNull<u8>, usize);
+
+// The pointer is owned by the pool until it is handed out again.
+unsafe impl Send for Spare {}
+
+fn spare_buffers() -> &'static Mutex<Vec<Spare>> {
+    static S: OnceLock<Mutex<Vec<Spare>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Give back the memory of the buffers kept for reuse (a plug-in ran out of memory, the app quits).
+pub fn release_spare_buffers() {
+    let all: Vec<Spare> = std::mem::take(&mut *spare_buffers().lock().unwrap_or_else(PoisonError::into_inner));
+    for Spare(ptr, cap) in all {
+        if let Ok(layout) = Layout::from_size_align(cap, IMAGE_ALIGN) {
+            // SAFETY: allocated with this layout by `PixBuf::zeroed` and not used since.
+            unsafe { dealloc(ptr.as_ptr(), layout) };
+        }
+    }
+}
+
+/// A 64-byte-aligned pixel buffer the plug-in reads (and, for the output image, writes) through
 /// a raw pointer while the host keeps it alive.
 pub struct PixBuf {
-    cell: UnsafeCell<Vec<f32>>,
+    ptr: NonNull<u8>,
+    /// The bytes of the image.
     bytes: usize,
+    /// The bytes allocated: `bytes` rounded up to a multiple of [`IMAGE_ALIGN`] (at least one unit).
+    cap: usize,
 }
 
 // The buffer is only written by the plug-in's render (one effect instance at a time owns the
@@ -150,15 +191,31 @@ unsafe impl Sync for PixBuf {}
 unsafe impl Send for PixBuf {}
 
 impl PixBuf {
-    pub fn zeroed(bytes: usize) -> PixBuf {
-        PixBuf { cell: UnsafeCell::new(vec![0.0; bytes.div_ceil(4).max(1)]), bytes }
+    /// A zeroed buffer of `bytes` bytes, from the ones kept for reuse if one of that size is
+    /// there. `None` when the memory is not there (or the size is absurd): a huge layer is an
+    /// error, not an abort.
+    pub fn zeroed(bytes: usize) -> Option<PixBuf> {
+        let cap = bytes.max(1).checked_next_multiple_of(IMAGE_ALIGN)?;
+        let spare = {
+            let mut s = spare_buffers().lock().unwrap_or_else(PoisonError::into_inner);
+            s.iter().position(|b| b.1 == cap).map(|i| s.swap_remove(i))
+        };
+        if let Some(Spare(ptr, _)) = spare {
+            // SAFETY: `cap` bytes owned by this buffer now.
+            unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, cap) };
+            return Some(PixBuf { ptr, bytes, cap });
+        }
+        let layout = Layout::from_size_align(cap, IMAGE_ALIGN).ok()?;
+        // SAFETY: a non-zero size with a valid layout.
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
+        Some(PixBuf { ptr, bytes, cap })
     }
     pub fn ptr(&self) -> *mut u8 {
-        unsafe { (*self.cell.get()).as_mut_ptr() as *mut u8 }
+        self.ptr.as_ptr()
     }
     /// # Safety
     /// No plug-in may be running that holds this buffer.
-    // The bytes live in an `UnsafeCell`; exclusivity is the caller's contract above.
+    // The bytes are shared with the plug-in; exclusivity is the caller's contract above.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn bytes_mut(&self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.bytes) }
@@ -170,6 +227,23 @@ impl PixBuf {
     }
 }
 
+impl Drop for PixBuf {
+    fn drop(&mut self) {
+        {
+            let mut spare = spare_buffers().lock().unwrap_or_else(PoisonError::into_inner);
+            let held: usize = spare.iter().map(|b| b.1).sum();
+            if spare.len() < MAX_SPARE && held + self.cap <= MAX_SPARE_BYTES {
+                spare.push(Spare(self.ptr, self.cap));
+                return;
+            }
+        }
+        if let Ok(layout) = Layout::from_size_align(self.cap, IMAGE_ALIGN) {
+            // SAFETY: allocated with this layout by `PixBuf::zeroed`; this buffer is going away.
+            unsafe { dealloc(self.ptr.as_ptr(), layout) };
+        }
+    }
+}
+
 /// One image in the plug-in's pixel format, plus its geometry in OFX pixel coordinates.
 pub struct ClipImage {
     pub buf: PixBuf,
@@ -177,6 +251,7 @@ pub struct ClipImage {
     pub bounds: OfxRectI,
     /// The region of definition.
     pub rod: OfxRectI,
+    /// The distance between rows in bytes: the row's pixels rounded up to [`IMAGE_ALIGN`].
     pub row_bytes: i32,
     pub depth: Depth,
     pub comps: Comps,
@@ -194,16 +269,21 @@ impl ClipImage {
         self.depth.bytes() * self.comps.channels()
     }
 
-    /// A transparent image covering `bounds`.
-    pub fn blank(bounds: OfxRectI, rod: OfxRectI, depth: Depth, comps: Comps) -> ClipImage {
-        let w = (bounds.x2 - bounds.x1).max(0) as usize;
-        let h = (bounds.y2 - bounds.y1).max(0) as usize;
+    /// A transparent image covering `bounds`; `None` if it does not fit in memory.
+    pub fn blank(bounds: OfxRectI, rod: OfxRectI, depth: Depth, comps: Comps) -> Option<ClipImage> {
+        let w = (bounds.x2 as i64 - bounds.x1 as i64).max(0) as usize;
+        let h = (bounds.y2 as i64 - bounds.y1 as i64).max(0) as usize;
         let px = depth.bytes() * comps.channels();
-        ClipImage { buf: PixBuf::zeroed(w * h * px), bounds, rod, row_bytes: (w * px) as i32, depth, comps, premult: IMAGE_PREMULTIPLIED }
+        // Rows start on aligned addresses; `rowBytes` is an int in the plug-in's world.
+        let row = w.checked_mul(px)?.checked_next_multiple_of(IMAGE_ALIGN)?;
+        let row_bytes = i32::try_from(row).ok()?;
+        let buf = PixBuf::zeroed(row.checked_mul(h)?)?;
+        Some(ClipImage { buf, bounds, rod, row_bytes, depth, comps, premult: IMAGE_PREMULTIPLIED })
     }
 
     /// Convert the sub-rectangle `[x0, x1) x [y0, y1)` of an EffectCraft buffer (`sw` pixels per
-    /// row, row 0 = top) into an OFX image with the given geometry.
+    /// row, row 0 = top) into an OFX image with the given geometry. `None` if it does not fit in
+    /// memory.
     pub fn from_rows(
         src: &[[f32; 4]],
         sw: usize,
@@ -212,13 +292,13 @@ impl ClipImage {
         rod: OfxRectI,
         depth: Depth,
         comps: Comps,
-    ) -> ClipImage {
+    ) -> Option<ClipImage> {
         let (x0, y0, x1, y1) = crop;
         let w = x1.saturating_sub(x0);
         let h = y1.saturating_sub(y0);
-        let img = ClipImage::blank(bounds, rod, depth, comps);
+        let img = ClipImage::blank(bounds, rod, depth, comps)?;
         if img.width() != w || img.height() != h {
-            return img;
+            return Some(img);
         }
         let px = img.pixel_bytes();
         let row_bytes = img.row_bytes as usize;
@@ -233,7 +313,7 @@ impl ClipImage {
                 encode_pixel(*p, depth, comps, d);
             }
         }
-        img
+        Some(img)
     }
 
     /// Write the image back into an EffectCraft buffer of exactly the image's size. Non-finite
@@ -363,4 +443,114 @@ pub fn release_image(h: *mut c_void) -> OfxStatus {
     // the live set exactly once.
     drop(unsafe { Box::from_raw(ptr as *mut ImageObj) });
     K_STAT_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(w: i32, h: i32) -> OfxRectI {
+        OfxRectI { x1: 0, y1: 0, x2: w, y2: h }
+    }
+
+    /// Buffers and rows start on 64-byte boundaries whatever the size, depth and components, and
+    /// `rowBytes` covers the pixels of a row.
+    #[test]
+    fn buffers_and_rows_are_64_byte_aligned() {
+        for (w, h) in [(1, 1), (3, 2), (5, 3), (16, 4), (17, 1), (1920, 2)] {
+            for depth in [Depth::Byte, Depth::Short, Depth::Float] {
+                for comps in [Comps::Rgba, Comps::Rgb, Comps::Alpha] {
+                    let img = ClipImage::blank(rect(w, h), rect(w, h), depth, comps).unwrap();
+                    assert_eq!(img.buf.ptr() as usize % IMAGE_ALIGN, 0, "{w}x{h} {depth:?} {comps:?}");
+                    let (stride, pixels) = (img.row_bytes as usize, w as usize * img.pixel_bytes());
+                    assert!(
+                        stride >= pixels && stride % IMAGE_ALIGN == 0 && stride - pixels < IMAGE_ALIGN,
+                        "{w}x{h} {depth:?} {comps:?}: {stride} for {pixels}"
+                    );
+                    // SAFETY: nothing else holds the image.
+                    assert_eq!(unsafe { img.buf.bytes_ref() }.len(), stride * h as usize);
+                }
+            }
+        }
+    }
+
+    /// Rows that are padded for alignment convert back to what went in, for every pixel format.
+    #[test]
+    fn padded_rows_round_trip() {
+        // 5 pixels wide: an RGB float row is 60 bytes in a 64-byte row, an alpha byte row 5 in 64.
+        let (w, h) = (5usize, 3usize);
+        let src: Vec<[f32; 4]> = (0..w * h).map(|i| [i as f32 / 16.0, 0.25 + i as f32 / 32.0, 0.5, 1.0 - i as f32 / 32.0]).collect();
+        for depth in [Depth::Float, Depth::Short, Depth::Byte] {
+            for comps in [Comps::Rgba, Comps::Rgb, Comps::Alpha] {
+                let img = ClipImage::from_rows(&src, w, (0, 0, w, h), rect(w as i32, h as i32), rect(w as i32, h as i32), depth, comps).unwrap();
+                let mut back = vec![[0.0f32; 4]; w * h];
+                img.write_rows(&mut back, false);
+                let tol = match depth {
+                    Depth::Float => 1e-6,
+                    Depth::Short => 1e-4,
+                    Depth::Byte => 3e-3,
+                };
+                for (a, b) in src.iter().zip(&back) {
+                    let want = match comps {
+                        Comps::Rgba => *a,
+                        Comps::Rgb => [a[0], a[1], a[2], 1.0],
+                        Comps::Alpha => [0.0, 0.0, 0.0, a[3]],
+                    };
+                    assert!(want.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol), "{depth:?} {comps:?}: {want:?} vs {b:?}");
+                }
+            }
+        }
+    }
+
+    /// OFX row 0 is the bottom row, and the padding bytes between rows are never read as pixels.
+    #[test]
+    fn rows_are_flipped_and_padding_is_skipped() {
+        let (w, h) = (3usize, 2usize);
+        let src = vec![[1.0f32, 0.0, 0.0, 1.0]; 3].into_iter().chain(vec![[0.0f32, 1.0, 0.0, 1.0]; 3]).collect::<Vec<_>>();
+        let img = ClipImage::from_rows(&src, w, (0, 0, w, h), rect(3, 2), rect(3, 2), Depth::Float, Comps::Rgba).unwrap();
+        let stride = img.row_bytes as usize;
+        // SAFETY: nothing else holds the image.
+        let bytes = unsafe { img.buf.bytes_ref() };
+        let px =
+            |row: usize, x: usize| -> [f32; 4] { std::array::from_fn(|c| f32::from_ne_bytes(bytes[row * stride + x * 16 + c * 4..][..4].try_into().unwrap())) };
+        // The top EffectCraft row (red) is OFX row 1.
+        assert_eq!((px(0, 0), px(1, 2)), ([0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]));
+        // Padding bytes (48..64 of each row) stay zero, and filling them changes nothing coming back.
+        assert!(bytes[w * 16..stride].iter().all(|b| *b == 0));
+        let mut back = vec![[0.0f32; 4]; w * h];
+        img.write_rows(&mut back, false);
+        assert_eq!(back, src);
+    }
+
+    /// A buffer that comes back from the pool is zero again, and its size matters.
+    #[test]
+    fn reused_buffers_are_zeroed() {
+        // A size no other test uses, so the buffer that is freed is the one that is handed out.
+        let bytes = 1_000_000 + 64 * 7;
+        let a = PixBuf::zeroed(bytes).unwrap();
+        // SAFETY: nothing else holds the buffer.
+        unsafe { a.bytes_mut() }.fill(0xAB);
+        drop(a);
+        let b = PixBuf::zeroed(bytes).unwrap();
+        // SAFETY: nothing else holds the buffer.
+        assert!(unsafe { b.bytes_ref() }.iter().all(|v| *v == 0), "a reused buffer must be cleared");
+        assert_eq!(b.ptr() as usize % IMAGE_ALIGN, 0);
+        // A different size is a different buffer, and the pool can be emptied.
+        let c = PixBuf::zeroed(bytes + 4096).unwrap();
+        assert_ne!(c.ptr(), b.ptr());
+        drop((b, c));
+        release_spare_buffers();
+    }
+
+    /// An absurd layer is a failed allocation, not an abort or an overflow.
+    #[test]
+    fn absurd_images_fail_cleanly() {
+        let huge = OfxRectI { x1: i32::MIN / 2, y1: 0, x2: i32::MAX / 2, y2: 4 };
+        assert!(ClipImage::blank(huge, huge, Depth::Float, Comps::Rgba).is_none());
+        assert!(ClipImage::from_rows(&[], 0, (0, 0, 0, 0), huge, huge, Depth::Float, Comps::Rgba).is_none());
+        assert!(PixBuf::zeroed(usize::MAX).is_none());
+        // Empty images are fine.
+        let empty = ClipImage::blank(rect(0, 0), rect(0, 0), Depth::Float, Comps::Rgba).unwrap();
+        assert_eq!((empty.width(), empty.height(), empty.row_bytes), (0, 0, 0));
+    }
 }

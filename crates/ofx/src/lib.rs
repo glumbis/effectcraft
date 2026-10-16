@@ -36,6 +36,7 @@ pub mod instance;
 pub mod loader;
 pub mod lock;
 pub mod params;
+pub mod pool;
 pub mod props;
 pub mod settings;
 pub mod suites;
