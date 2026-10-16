@@ -34,6 +34,7 @@ pub mod ffi;
 pub mod inflight;
 pub mod instance;
 pub mod loader;
+pub mod lock;
 pub mod params;
 pub mod props;
 pub mod settings;

@@ -36,10 +36,14 @@ extern "C" fn multi_thread(func: ThreadFn, n_threads: u32, arg: *mut c_void) -> 
         let ctx = crate::diag::current();
         // A crash on a worker is the crash of the action that started it (see `inflight`).
         let slot = crate::inflight::current_slot();
+        // ... and the locks of the render it works for (the library's render lock) are its locks:
+        // a worker's `clipGetImage` may render another effect of the same library.
+        let tokens = crate::lock::snapshot();
         let run = |index: u32| {
             let a = &arg;
             let _scope = ctx.as_ref().map(crate::diag::CallCtx::enter);
             let _slot = crate::inflight::adopt_slot(slot);
+            let _locks = crate::lock::adopt(&tokens);
             SPAWNED.with(|s| s.set(Some(index)));
             // The plug-in's code must not unwind into Rust; a panic here would be a bug in it.
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

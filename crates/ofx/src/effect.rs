@@ -204,8 +204,11 @@ impl OfxEffect {
     }
 
     /// Serialise plug-ins that declare themselves render-thread-unsafe.
-    fn serialise<'a>(&self, live: &'a Live) -> Option<std::sync::MutexGuard<'a, ()>> {
-        (self.reg.cfg.safety == Safety::Unsafe).then(|| live.entry.lock.lock().unwrap_or_else(PoisonError::into_inner))
+    /// The library's render lock, for a plug-in that declares itself render-thread-unsafe. It is
+    /// reentrant: a render that asks the host for an image can make the host render another
+    /// effect of the same library ([`crate::lock`]).
+    fn serialise<'a>(&self, live: &'a Live) -> Option<crate::lock::Guard<'a>> {
+        (self.reg.cfg.safety == Safety::Unsafe).then(|| live.entry.lock.lock())
     }
 
     fn input_comps(&self, prefs: &Prefs) -> Comps {

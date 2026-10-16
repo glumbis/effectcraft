@@ -25,6 +25,7 @@ use crate::diag::{CallCtx, PluginDiag, is_failure, one_line, status_name};
 use crate::effect::{Live, OfxEffect};
 use crate::ffi::*;
 use crate::instance::{ClipCfg, ClipRole, EffectCfg, EffectObj, PluginEntry, Safety};
+use crate::lock::ReentrantLock;
 use crate::params::map_params;
 use crate::props::PropSet;
 use crate::suites::host_ptr;
@@ -280,7 +281,7 @@ struct Probed {
     /// The binary's load transcript so far (the describe phase adds the plug-ins).
     tr: Vec<String>,
     /// Shared by the plug-ins of this library that declare themselves render-thread-unsafe.
-    lock: Arc<Mutex<()>>,
+    lock: Arc<ReentrantLock>,
     plugins: Vec<Listed>,
 }
 
@@ -374,7 +375,7 @@ fn probe_binary(bin: &Path, bundle: &str, report: &mut LoadReport) -> Option<Pro
     };
     let mut tr = vec![label.clone(), format!("  host shown to the plug-in: {}", crate::suites::host_summary())];
     match probe_open(bin, &label, report, &mut tr) {
-        Some(plugins) => Some(Probed { bin: bin.to_path_buf(), bundle: bundle.to_string(), label, key, tr, lock: Arc::new(Mutex::new(())), plugins }),
+        Some(plugins) => Some(Probed { bin: bin.to_path_buf(), bundle: bundle.to_string(), label, key, tr, lock: Arc::new(ReentrantLock::new()), plugins }),
         None => {
             // Over without a crash: nothing more will be described for this binary.
             marker.forgive();
@@ -678,7 +679,7 @@ pub(crate) struct LazyBinary {
     label: String,
     key: PathBuf,
     /// Shared by the plug-ins of this library that declare themselves render-thread-unsafe.
-    lock: Arc<Mutex<()>>,
+    lock: Arc<ReentrantLock>,
     /// The library once opened: its plug-ins' identifiers and `OfxPlugin` addresses, or why it
     /// could not be (`None` until the first lazy load).
     opened: Mutex<Option<Result<Vec<(String, usize)>, String>>>,
@@ -691,7 +692,7 @@ impl LazyBinary {
             bundle: bundle.to_string(),
             label: label.to_string(),
             key: key.to_path_buf(),
-            lock: Arc::new(Mutex::new(())),
+            lock: Arc::new(ReentrantLock::new()),
             opened: Mutex::new(None),
         }
     }
@@ -877,7 +878,7 @@ enum Step {
 }
 
 /// Load, describe and register one plug-in; its transcript lines go to `tr`.
-fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, crash_stamp: u64, tr: &mut Vec<String>) -> Outcome {
+fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<ReentrantLock>, crash_stamp: u64, tr: &mut Vec<String>) -> Outcome {
     /// The result once the effect is registered (a plug-in loaded here is loaded eagerly: it was just described).
     enum Done {
         Registered(Registration),
@@ -935,7 +936,7 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
 
 /// `Load`, `Describe` and `DescribeInContext` of one plug-in, and everything registering it needs
 /// from the answers. The `OfxEffect` is made (and registered) by the caller.
-fn describe_core(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, diag: &Arc<PluginDiag>, block: &mut Block) -> Step {
+fn describe_core(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<ReentrantLock>, diag: &Arc<PluginDiag>, block: &mut Block) -> Step {
     // SAFETY: a non-null OfxPlugin* from the binary; the struct is static data in the plug-in.
     let p = unsafe { &*ptr };
     let ofx_id = unsafe { str_arg(p.plugin_identifier) }.unwrap_or("").to_string();

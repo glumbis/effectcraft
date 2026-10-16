@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::clips::{ClipImage, ClipObj, Comps, Depth};
 use crate::diag::{self, CallCtx, PluginDiag, PropKind};
 use crate::ffi::*;
+use crate::lock::ReentrantLock;
 use crate::params::{Bindings, CoordCtx, ParamObj, ParamSet};
 use crate::props::{PVal, PropSet};
 
@@ -112,7 +113,7 @@ pub struct PluginEntry {
     pub ofx_id: String,
     /// Serialises plug-ins that declare themselves render-thread-unsafe (shared by all plug-ins
     /// of one library).
-    pub lock: Arc<Mutex<()>>,
+    pub lock: Arc<ReentrantLock>,
     /// What the host learned about the plug-in: its messages and the requests it made that this
     /// host could not meet (see [`crate::diag`]).
     pub diag: Arc<PluginDiag>,
@@ -125,7 +126,7 @@ pub struct PluginEntry {
 }
 
 impl PluginEntry {
-    pub fn new(main: EntryPoint, ofx_id: String, lock: Arc<Mutex<()>>, diag: Arc<PluginDiag>, stamp: u64) -> PluginEntry {
+    pub fn new(main: EntryPoint, ofx_id: String, lock: Arc<ReentrantLock>, diag: Arc<PluginDiag>, stamp: u64) -> PluginEntry {
         PluginEntry { main, ofx_id, lock, diag, stamp, rendered: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
     }
 }
@@ -247,7 +248,11 @@ pub(crate) fn on_plugin_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 
         return Some(f());
     }
     let (reply, answer) = std::sync::mpsc::sync_channel::<Option<R>>(1);
+    // The pooled thread works for this one: the locks this task holds (the library's render lock)
+    // are held by it too, so that a nested render it starts does not wait for them.
+    let tokens = crate::lock::snapshot();
     let mut job: Job = Box::new(move || {
+        let _adopted = crate::lock::adopt(&tokens);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
         let _ = reply.send(r);
     });
@@ -588,6 +593,10 @@ impl RenderCtx {
         ofx_time / self.fps
     }
 
+    /// Call the host. One thread at a time: `PluginHost` has no `Sync` bound (the engine's host
+    /// borrows the renderer's caches), so a plug-in's worker threads take turns asking for images,
+    /// and the turn is as short as possible: the image cache is looked at before it and again in it
+    /// ([`RenderCtx::image`]), and nothing but the host call and the conversion happens inside.
     fn with_host<R>(&self, f: impl FnOnce(&dyn PluginHost) -> R) -> Option<R> {
         let m = self.host.as_ref()?;
         let g = m.lock().unwrap_or_else(PoisonError::into_inner);
@@ -678,24 +687,32 @@ impl RenderCtx {
         if let Some(v) = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
             return v.clone();
         }
-        let got = match &clip.role {
-            ClipRole::Input => self.with_host(|h| h.input_at(sec)).flatten(),
-            ClipRole::Layer(pid) => {
-                if self.layer_ids.get(name).copied().flatten().is_none() {
-                    None
-                } else {
-                    self.with_host(|h| h.layer_input(pid, sec)).flatten()
-                }
-            }
-            ClipRole::Output => None,
-        };
-        let img = got.and_then(|g| self.convert(g, comps));
-        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache.len() > 64 {
-            cache.clear();
+        let unset_layer = matches!(&clip.role, ClipRole::Layer(_)) && self.layer_ids.get(name).copied().flatten().is_none();
+        if unset_layer || clip.role == ClipRole::Output {
+            return None;
         }
-        cache.insert(key, img.clone());
-        img
+        // The host answers one request at a time (`PluginHost` is not `Sync`, see `with_host`), and an
+        // image another worker asked for while this one waited for its turn is in the cache by now:
+        // look again inside the turn, and keep the answer there, so that the layers upstream are
+        // rendered once however many workers want the same image.
+        self.with_host(|h| {
+            if let Some(v) = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+                return v.clone();
+            }
+            let got = match &clip.role {
+                ClipRole::Input => h.input_at(sec),
+                ClipRole::Layer(pid) => h.layer_input(pid, sec),
+                ClipRole::Output => None,
+            };
+            let img = got.and_then(|g| self.convert(g, comps));
+            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            if cache.len() > 64 {
+                cache.clear();
+            }
+            cache.insert(key.clone(), img.clone());
+            img
+        })
+        .flatten()
     }
 
     pub fn next_image_id() -> u64 {
@@ -1043,7 +1060,7 @@ mod tests {
     #[test]
     fn instances_say_opengl_is_not_enabled_as_an_int() {
         let desc = EffectObj::new_descriptor();
-        let entry = Arc::new(PluginEntry::new(nop_entry, "test".into(), Arc::new(Mutex::new(())), PluginDiag::new(), 0));
+        let entry = Arc::new(PluginEntry::new(nop_entry, "test".into(), Arc::new(ReentrantLock::new()), PluginDiag::new(), 0));
         let cfg = Arc::new(EffectCfg {
             context: CTX_FILTER.into(),
             clips: vec![],
@@ -1093,6 +1110,67 @@ mod tests {
         // A panic inside the job is reported as `None`, and the pool still works afterwards.
         assert_eq!(on_plugin_stack(|| -> u32 { panic!("a plug-in-side bug") }), None);
         assert_eq!(on_plugin_stack(|| 7), Some(7));
+    }
+
+    /// A host that counts the requests for the effect's input and takes a while to answer.
+    struct SlowHost(std::sync::atomic::AtomicUsize);
+
+    impl PluginHost for SlowHost {
+        fn input_at(&self, _layer_time: f64) -> Option<PluginImage> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            Some(PluginImage { width: 2, height: 2, pixels: vec![[0.5, 0.5, 0.5, 1.0]; 4], origin: [0.0; 2], scale: 1.0 })
+        }
+        fn layer_input(&self, _param_id: &str, _layer_time: f64) -> Option<PluginImage> {
+            None
+        }
+        fn params_at(&self, _layer_time: f64) -> Option<(Vec<f64>, Vec<String>)> {
+            None
+        }
+        fn frame_rate(&self) -> f64 {
+            30.0
+        }
+        fn time(&self) -> f64 {
+            0.0
+        }
+    }
+
+    /// A plug-in's worker threads that all want the same image at the same moment cost the layers
+    /// upstream one render, not one each: the host answers one at a time, and a thread that waited
+    /// for its turn finds the answer in the cache.
+    #[test]
+    fn workers_asking_for_the_same_image_at_once_cost_one_host_call() {
+        let host = SlowHost(Default::default());
+        let cfg = Arc::new(EffectCfg {
+            context: CTX_FILTER.into(),
+            clips: vec![ClipCfg { name: "Source".into(), role: ClipRole::Input, comps: Comps::Rgba, optional: false }],
+            depth: Depth::Float,
+            safety: Safety::InstanceSafe,
+            slave_params: vec![],
+            single_instance: false,
+            sequential_render: 0,
+        });
+        let ctx = Arc::new(RenderCtx::new(
+            cfg,
+            Geometry::nominal(1.0),
+            30.0,
+            1.0,
+            Some(HostPtr::new(&host)),
+            Arc::new(Bindings::default()),
+            HashMap::new(),
+            Depth::Float,
+            HashMap::new(),
+            None,
+        ));
+        let images: Vec<bool> = std::thread::scope(|s| {
+            let jobs: Vec<_> = (0..6).map(|_| s.spawn(|| ctx.image("Source", 7.0).is_some())).collect();
+            jobs.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        assert!(images.iter().all(|ok| *ok));
+        assert_eq!(host.0.load(Ordering::SeqCst), 1, "the host was asked more than once for the same image");
+        // Another time is another request.
+        assert!(ctx.image("Source", 8.0).is_some());
+        assert_eq!(host.0.load(Ordering::SeqCst), 2);
     }
 
     #[test]
