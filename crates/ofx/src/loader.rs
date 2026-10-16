@@ -1099,13 +1099,17 @@ fn describe_core(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Reentr
 
     // The first context that describes wins; the reasons the others did not are kept for the notes.
     // An attempt may have defined clips and parameters and extended lists before it failed, so each
-    // one starts from what Describe left.
+    // later one starts from what Describe left. The first attempt starts from the descriptor as it
+    // is: a plug-in that defined clips or parameters in Describe itself (the specification keeps
+    // that for DescribeInContext, but it has always worked here) keeps them.
     let described = desc.props.clone();
     let mut notes: Vec<String> = Vec::new();
     let mut failed_contexts: Vec<String> = Vec::new();
     let mut chosen: Option<&str> = None;
-    for ctx in candidates {
-        desc.reset_to(&described);
+    for (attempt, ctx) in candidates.into_iter().enumerate() {
+        if attempt > 0 {
+            desc.reset_to(&described);
+        }
         let inp = PropSet::new();
         inp.put_str(IE_CONTEXT, ctx);
         let short = short_context(ctx);
