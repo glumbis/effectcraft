@@ -30,22 +30,22 @@ fn replacing_a_missing_file_relinks_the_others_that_moved_with_it() {
     let _ = std::fs::remove_dir_all(&root);
     let old = root.join("Job");
     std::fs::create_dir_all(old.join("stills")).unwrap();
-    std::fs::write(old.join("stills/a.png"), icon()).unwrap();
-    std::fs::write(old.join("stills/b.png"), icon()).unwrap();
+    std::fs::write(old.join("stills").join("a.png"), icon()).unwrap();
+    std::fs::write(old.join("stills").join("b.png"), icon()).unwrap();
     let mut s = effectcraft_host::session();
-    let paths: Vec<String> = ["stills/a.png", "stills/b.png"].iter().map(|p| old.join(p).to_string_lossy().to_string()).collect();
+    let paths: Vec<String> = ["a.png", "b.png"].iter().map(|p| old.join("stills").join(p).to_string_lossy().to_string()).collect();
     s.execute("file.import", json!({"paths": paths, "sequence": false})).unwrap();
     let before = footage_paths(&s);
     assert_eq!(before.len(), 2, "{before:?}");
     // The job folder moves; both files go missing.
-    let new = root.join("Archive/Job");
+    let new = root.join("Archive").join("Job");
     std::fs::create_dir_all(root.join("Archive")).unwrap();
     std::fs::rename(&old, &new).unwrap();
     let r = s.execute("footage.check", json!({"wait": true})).unwrap();
     assert_eq!(r["missing"], 2, "{r}");
     // Locating one finds the other.
     let a = before.iter().find(|(_, p, _)| p.ends_with("a.png")).unwrap().0;
-    let r = s.execute("file.replaceFootage", json!({"item": a, "path": new.join("stills/a.png").to_string_lossy()})).unwrap();
+    let r = s.execute("file.replaceFootage", json!({"item": a, "path": new.join("stills").join("a.png").to_string_lossy()})).unwrap();
     assert_eq!(r["relinked"].as_array().map(Vec::len), Some(1), "{r}");
     let after = footage_paths(&s);
     assert!(after.iter().all(|(_, p, missing)| p.starts_with(&*new.to_string_lossy()) && !missing), "{after:?}");
