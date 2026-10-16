@@ -81,11 +81,30 @@ fn ofx_scan_report(search_paths: &[std::path::PathBuf], result: &Result<serde_js
     for e in errors {
         let _ = writeln!(t, "  {}", e.as_str().unwrap_or("error"));
     }
-    if loaded.is_empty() {
+    let notes = r["notes"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let _ = writeln!(t, "\nNotes (plug-ins skipped on purpose): {}", notes.len());
+    for n in notes {
+        let _ = writeln!(t, "  {}", n.as_str().unwrap_or("note"));
+    }
+    let transcript = r["transcript"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if !transcript.is_empty() {
+        t.push_str(
+            "\nLoad transcript (what each plug-in binary answered to each action, what it said, and what it asked for that this host does not provide):\n",
+        );
+        for block in transcript {
+            let _ = writeln!(t, "\n{}", block.as_str().unwrap_or(""));
+        }
+    }
+    if loaded.is_empty() && transcript.is_empty() {
         t.push_str(
             "\nNo OpenFX effects were found. Install the OFX version of your plug-ins (not the After Effects\n\
              one) into one of the folders above, or list extra folders in the OFX_PLUGIN_PATH environment\n\
              variable, then restart EffectCraft. See FORK.md, \"Getting plug-ins to work\".\n",
+        );
+    } else if loaded.is_empty() {
+        t.push_str(
+            "\nPlug-in files were found but none became an effect: the problems, notes and transcript above say why\n\
+             for each one. See FORK.md, \"Getting plug-ins to work\".\n",
         );
     }
     t
@@ -99,7 +118,10 @@ fn ofx_scan_toast(result: &Result<serde_json::Value, String>, report: &std::path
     };
     let loaded = r["loaded"].as_array().map_or(0, Vec::len);
     let errors = r["errors"].as_array().map_or(0, Vec::len);
+    let notes = r["notes"].as_array().map_or(0, Vec::len);
     match (loaded, errors) {
+        // Plug-ins that declined this host or were skipped on purpose: a toast only when nothing loaded.
+        (0, 0) if notes > 0 => Some(format!("No OpenFX plug-in loaded ({notes} skipped or declined). Details: {}", report.display())),
         (_, 0) => None,
         (0, n) => Some(format!("No OpenFX plug-in loaded ({n} problem(s)). Details: {}", report.display())),
         (l, n) => Some(format!("{l} OpenFX effect(s) loaded, {n} problem(s). Details: {}", report.display())),
@@ -578,6 +600,18 @@ mod tests {
         let t = super::ofx_scan_report(&[], &bad);
         assert!(t.contains("a.ofx: cannot load the library") && t.contains("No OpenFX effects were found"));
         assert!(super::ofx_scan_toast(&bad, Path::new("r.txt")).is_some_and(|m| m.contains("r.txt")));
+        // Notes and the transcript are part of the report; a scan that only skipped plug-ins still says so.
+        let skipped = Ok(json!({
+            "loaded": [],
+            "errors": [],
+            "notes": ["b.ofx: declined this host: OfxSetHost returned kOfxStatFailed (1)"],
+            "transcript": ["b.ofx\n  OfxSetHost -> kOfxStatFailed (1)"]
+        }));
+        let t = super::ofx_scan_report(&[], &skipped);
+        assert!(t.contains("Notes (plug-ins skipped on purpose): 1") && t.contains("declined this host"), "{t}");
+        assert!(t.contains("Load transcript") && t.contains("OfxSetHost -> kOfxStatFailed (1)"), "{t}");
+        assert!(t.contains("none became an effect") && !t.contains("No OpenFX effects were found"), "{t}");
+        assert!(super::ofx_scan_toast(&skipped, Path::new("r.txt")).is_some_and(|m| m.contains("declined") && m.contains("r.txt")));
         assert!(super::ofx_scan_toast(&Err("boom".into()), Path::new("r.txt")).is_some_and(|m| m.contains("boom")));
     }
 

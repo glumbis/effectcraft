@@ -7,13 +7,14 @@
 //! [`OfxEffect`]. Libraries stay loaded for the life of the process.
 
 use std::collections::HashMap;
-use std::ffi::c_int;
+use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use effectcraft_effects::plugin::{PLUGIN_API_VERSION, PluginManifest, register_plugin};
 
 use crate::clips::{Comps, Depth};
+use crate::diag::{CallCtx, PluginDiag, is_failure, one_line, status_name};
 use crate::effect::OfxEffect;
 use crate::ffi::*;
 use crate::instance::{ClipCfg, ClipRole, EffectCfg, EffectObj, PluginEntry, Safety};
@@ -165,7 +166,9 @@ fn find_binaries(path: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>, er
 
 type CountFn = unsafe extern "C" fn() -> c_int;
 type GetPluginFn = unsafe extern "C" fn(c_int) -> *mut OfxPlugin;
-type SetHostFn = unsafe extern "C" fn(*mut OfxHost);
+/// `OfxStatus OfxSetHost(const OfxHost *host)` (OFX 1.5). A binary that exports it and answers
+/// `kOfxStatFailed` is "not for this host" and is skipped.
+type SetHostFn = unsafe extern "C" fn(*mut OfxHost) -> OfxStatus;
 
 fn open_library(path: &Path) -> Result<libloading::Library, String> {
     // SAFETY: loading a native library runs its initialisers; that is what loading a plug-in is.
@@ -192,6 +195,13 @@ fn lib_error(e: &libloading::Error) -> String {
     }
 }
 
+/// Run `f` as `action` of `plugin`, so the suites attribute what the plug-in asks for to it.
+fn in_scope<R>(diag: &Arc<PluginDiag>, plugin: &str, action: &str, f: impl FnOnce() -> R) -> R {
+    let ctx = CallCtx { diag: diag.clone(), plugin: plugin.into(), action: action.into() };
+    let _scope = ctx.enter();
+    f()
+}
+
 fn load_binary(bin: &Path, bundle: &str, report: &mut LoadReport) {
     let key = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
     if let Some(done) = loaded_cache().lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
@@ -208,9 +218,17 @@ fn load_binary(bin: &Path, bundle: &str, report: &mut LoadReport) {
             return;
         }
     };
+    let mut tr = vec![label.clone(), format!("  host shown to the plug-in: {}", crate::suites::host_summary())];
+    load_open(bin, bundle, &label, &key, report, &mut tr);
+    report.transcript.push(tr.join("\n"));
+}
+
+/// The part of [`load_binary`] that runs plug-in code; what happens goes to `tr`.
+fn load_open(bin: &Path, bundle: &str, label: &str, key: &Path, report: &mut LoadReport, tr: &mut Vec<String>) {
     let lib = match open_library(bin) {
         Ok(l) => l,
         Err(e) => {
+            tr.push(format!("  cannot load the library: {e}"));
             report.errors.push(format!("{label}: cannot load the library: {e}"));
             return;
         }
@@ -222,38 +240,77 @@ fn load_binary(bin: &Path, bundle: &str, report: &mut LoadReport) {
         match (lib.get::<CountFn>(b"OfxGetNumberOfPlugins\0"), lib.get::<GetPluginFn>(b"OfxGetPlugin\0")) {
             (Ok(c), Ok(g)) => (*c, *g),
             _ => {
+                tr.push("  OfxGetNumberOfPlugins / OfxGetPlugin are not exported".to_string());
                 report.errors.push(format!("{label}: not an OpenFX plug-in (OfxGetNumberOfPlugins / OfxGetPlugin not exported)"));
                 return;
             }
         }
     };
-    // Some plug-ins export `OfxSetHost` as well.
+    let host = crate::suites::host_name();
+    let bin_name = bin.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| label.to_string());
+    let bin_diag = PluginDiag::new();
+    // `OfxSetHost` is optional (OFX 1.5) and comes first: the header's order is OfxSetHost,
+    // OfxGetNumberOfPlugins, OfxGetPlugin. A plug-in that is not for this host answers
+    // kOfxStatFailed and the host skips it silently (here: with a note, so the user can tell).
     // SAFETY: optional entry point with the documented shape.
     if let Ok(sh) = unsafe { lib.get::<SetHostFn>(b"OfxSetHost\0") } {
         let sh: SetHostFn = *sh;
-        let _ = std::panic::catch_unwind(|| unsafe { sh(host_ptr()) });
+        let answer = in_scope(&bin_diag, &bin_name, "OfxSetHost", || std::panic::catch_unwind(|| unsafe { sh(host_ptr()) }));
+        match answer {
+            Err(_) => tr.push("  OfxSetHost -> the plug-in panicked (ignored)".to_string()),
+            // Only a status that says "failed" counts: an older plug-in that declares no return
+            // value leaves whatever was in the register.
+            Ok(st) if is_failure(st) => {
+                tr.push(format!("  OfxSetHost -> {}", status_name(st)));
+                report.notes.push(format!(
+                    "{label}: declined this host: OfxSetHost returned {} (the plug-in says it is not for this host; the host name it was shown is \"{host}\")",
+                    status_name(st)
+                ));
+                return;
+            }
+            Ok(K_STAT_OK) => tr.push("  OfxSetHost -> kOfxStatOK (0)".to_string()),
+            Ok(st) => tr.push(format!("  OfxSetHost -> {} (not a failure: ignored)", status_name(st))),
+        }
     }
     // SAFETY: as above.
-    let n = std::panic::catch_unwind(|| unsafe { count() }).unwrap_or(0).clamp(0, 4096);
+    let n_raw = in_scope(&bin_diag, &bin_name, "OfxGetNumberOfPlugins", || std::panic::catch_unwind(|| unsafe { count() })).unwrap_or(0);
+    tr.push(format!("  OfxGetNumberOfPlugins -> {n_raw}"));
+    if n_raw <= 0 {
+        report.notes.push(format!(
+            "{label}: exports no OpenFX plug-ins (OfxGetNumberOfPlugins returned {n_raw}); it is not a plug-in for this host, or it declined the host name \"{host}\""
+        ));
+        return;
+    }
+    let n = n_raw.clamp(0, 4096);
     let lock = Arc::new(Mutex::new(()));
     let mut here: Vec<LoadedEffect> = Vec::new();
     for i in 0..n {
         // SAFETY: as above.
-        let p = std::panic::catch_unwind(|| unsafe { get(i) }).unwrap_or(std::ptr::null_mut());
+        let p = in_scope(&bin_diag, &bin_name, "OfxGetPlugin", || std::panic::catch_unwind(|| unsafe { get(i) })).unwrap_or(std::ptr::null_mut());
         if p.is_null() {
+            tr.push(format!("  OfxGetPlugin({i}) -> null"));
             report.errors.push(format!("{label}: OfxGetPlugin({i}) returned null"));
             continue;
         }
-        match describe_plugin(p, bin, bundle, lock.clone()) {
-            Ok(Some(e)) => here.push(e),
-            Ok(None) => {}
-            Err(e) => report.errors.push(format!("{label}: {e}")),
+        match describe_plugin(p, bin, bundle, lock.clone(), tr) {
+            Outcome::Registered(e) => here.push(e),
+            Outcome::Skipped(note) => report.notes.push(format!("{label}: {note}")),
+            Outcome::Failed(e) => report.errors.push(format!("{label}: {e}")),
         }
     }
     report.loaded.extend(here.iter().cloned());
     if !here.is_empty() {
-        loaded_cache().lock().unwrap_or_else(PoisonError::into_inner).insert(key, here);
+        loaded_cache().lock().unwrap_or_else(PoisonError::into_inner).insert(key.to_path_buf(), here);
     }
+}
+
+/// What became of one plug-in.
+enum Outcome {
+    Registered(LoadedEffect),
+    /// Left out on purpose: the note says why.
+    Skipped(String),
+    /// Could not be made into an effect: the error says why.
+    Failed(String),
 }
 
 fn short_context(ctx: &str) -> &'static str {
@@ -291,28 +348,133 @@ fn pick_comps(listed: &[String]) -> Comps {
     }
 }
 
-/// Load, describe and register one plug-in. `Ok(None)` = skipped (not an image effect).
-fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>) -> Result<Option<LoadedEffect>, String> {
+/// One plug-in's lines in the load transcript. A plug-in that registered cleanly (every action
+/// answered OK, nothing posted, nothing missing) collapses to one line, so a suite of hundreds of
+/// effects stays readable; anything else keeps the full detail.
+#[derive(Default)]
+struct Block {
+    /// The plug-in identifier (empty until it is known).
+    id: String,
+    /// `id vMAJOR.MINOR`.
+    head: String,
+    lines: Vec<String>,
+    /// Something happened that the reader may need to see.
+    noteworthy: bool,
+    /// The last action answered with a failure status (its line already says why).
+    action_failed: bool,
+}
+
+impl Block {
+    /// Add the block to the transcript, closing it with `outcome`. `clean` = the plug-in registered.
+    fn finish(self, tr: &mut Vec<String>, diag: &PluginDiag, outcome: &str, clean: bool) {
+        if self.head.is_empty() {
+            tr.push(format!("  {outcome}"));
+        } else if clean && !self.noteworthy {
+            tr.push(format!("  {}: {outcome} (Load, Describe and DescribeInContext: OK)", self.head));
+        } else {
+            tr.push(format!("  {}", self.head));
+            tr.extend(self.lines);
+            let reads = diag.host_reads();
+            if !reads.is_empty() {
+                tr.push(format!("    host properties read: {}", reads.join(", ")));
+            }
+            tr.push(format!("    {outcome}"));
+        }
+    }
+}
+
+/// Run one action of the load sequence for `entry`, adding its status, the plug-in's messages and
+/// what it asked for that this host lacks to the block. Returns the status and the
+/// [`PluginDiag::mark`] from before the action (for [`PluginEntry::failure`]).
+fn run_action(entry: &PluginEntry, block: &mut Block, name: &str, action: &str, handle: *const c_void, inp: Option<&PropSet>) -> (OfxStatus, u64) {
+    let mark = entry.diag.mark();
+    let t0 = std::time::Instant::now();
+    let st = entry.call(action, handle, inp, None);
+    block.lines.push(format!("    {name} -> {} ({} ms)", status_name(st), t0.elapsed().as_millis()));
+    block.action_failed = !matches!(st, K_STAT_OK | K_STAT_REPLY_DEFAULT);
+    block.noteworthy |= block.action_failed;
+    for m in entry.diag.messages_since(mark) {
+        block.lines.push(format!("      plug-in said ({}): \"{}\"", m.kind, one_line(&m.text, 400)));
+        block.noteworthy = true;
+    }
+    for u in entry.diag.unmet_since(mark) {
+        block.lines.push(format!("      asked for {}, which this host does not provide", u.request));
+        block.noteworthy = true;
+    }
+    (st, mark)
+}
+
+/// What [`describe_steps`] made of a plug-in.
+enum Step {
+    Registered(LoadedEffect),
+    /// Left out on purpose (a note, without the plug-in's id).
+    Skip(String),
+    /// Could not be made into an effect (the reason, without the plug-in's id).
+    Fail(String),
+}
+
+/// Load, describe and register one plug-in; its transcript lines go to `tr`.
+fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, tr: &mut Vec<String>) -> Outcome {
+    let diag = PluginDiag::new();
+    let mut block = Block::default();
+    let step = describe_steps(ptr, bin, bundle, lock, &diag, &mut block);
+    let id = block.id.clone();
+    let prefixed = |s: String| if id.is_empty() { s } else { format!("{id}: {s}") };
+    match step {
+        Step::Registered(e) => {
+            let outcome = format!("registered as effect {} ({} context)", e.id, e.context);
+            block.finish(tr, &diag, &outcome, true);
+            Outcome::Registered(e)
+        }
+        Step::Skip(note) => {
+            block.finish(tr, &diag, &format!("skipped: {note}"), false);
+            Outcome::Skipped(prefixed(format!("skipped, {note}")))
+        }
+        Step::Fail(why) => {
+            // An action that failed already says so in its own line.
+            let outcome = if block.action_failed { "not registered".to_string() } else { format!("not registered: {why}") };
+            block.finish(tr, &diag, &outcome, false);
+            Outcome::Failed(prefixed(why))
+        }
+    }
+}
+
+fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, diag: &Arc<PluginDiag>, block: &mut Block) -> Step {
     // SAFETY: a non-null OfxPlugin* from the binary; the struct is static data in the plug-in.
     let p = unsafe { &*ptr };
     let ofx_id = unsafe { str_arg(p.plugin_identifier) }.unwrap_or("").to_string();
     if ofx_id.is_empty() {
-        return Err("a plug-in has no identifier".into());
+        return Step::Fail("a plug-in has no identifier".into());
     }
-    if unsafe { str_arg(p.plugin_api) } != Some(IMAGE_EFFECT_API) {
-        return Ok(None);
+    block.id = ofx_id.clone();
+    block.head = format!("{ofx_id} v{}.{}", p.plugin_version_major, p.plugin_version_minor);
+    let api = unsafe { str_arg(p.plugin_api) };
+    if api != Some(IMAGE_EFFECT_API) {
+        return Step::Skip(format!("it is not an OpenFX image effect (plug-in API \"{}\")", api.unwrap_or("?")));
     }
     if p.api_version != 1 {
-        return Err(format!("{ofx_id}: unsupported image-effect API version {}", p.api_version));
+        return Step::Fail(format!("unsupported image-effect API version {}", p.api_version));
     }
-    let (Some(set_host), Some(main)) = (p.set_host, p.main_entry) else { return Err(format!("{ofx_id}: missing setHost or mainEntry")) };
+    let (Some(set_host), Some(main)) = (p.set_host, p.main_entry) else {
+        return Step::Fail("missing setHost or mainEntry".into());
+    };
     // SAFETY: the plug-in's setHost with our process-lifetime host block.
-    std::panic::catch_unwind(|| unsafe { set_host(host_ptr()) }).map_err(|_| format!("{ofx_id}: setHost panicked"))?;
-    let entry = Arc::new(PluginEntry { main, ofx_id: ofx_id.clone(), lock });
+    let set = in_scope(diag, &ofx_id, "setHost", || std::panic::catch_unwind(|| unsafe { set_host(host_ptr()) }));
+    if set.is_err() {
+        return Step::Fail("setHost panicked".into());
+    }
+    let entry = Arc::new(PluginEntry { main, ofx_id: ofx_id.clone(), lock, diag: diag.clone() });
+    let host = crate::suites::host_name();
 
-    let status =
-        |what: &str, s: OfxStatus| -> Result<(), String> { if s == K_STAT_OK { Ok(()) } else { Err(format!("{ofx_id}: {what} failed (OFX status {s})")) } };
-    status("Load", entry.call(ACT_LOAD, std::ptr::null(), None, None))?;
+    let (st, mark) = run_action(&entry, block, "Load", ACT_LOAD, std::ptr::null(), None);
+    match st {
+        K_STAT_OK | K_STAT_REPLY_DEFAULT => {}
+        K_STAT_FAILED => {
+            let hint = format!("the plug-in declined to load (a licence or host check? it was shown the host name \"{host}\")");
+            return Step::Fail(entry.failure_hint("Load", st, mark, Some(&hint)));
+        }
+        s => return Step::Fail(entry.failure("Load", s, mark)),
+    }
 
     let desc = EffectObj::new_descriptor();
     desc.props.put_ptr(IE_PLUGIN_HANDLE, ptr as usize);
@@ -320,22 +482,26 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     if !bundle.is_empty() && bundle != bin.to_string_lossy() {
         desc.props.put_str(P_PLUGIN_FILE_PATH, bundle);
     }
-    status("Describe", entry.call(ACT_DESCRIBE, desc.handle(), None, None))?;
+    let (st, mark) = run_action(&entry, block, "Describe", ACT_DESCRIBE, desc.handle(), None);
+    if st != K_STAT_OK {
+        return Step::Fail(entry.failure("Describe", st, mark));
+    }
 
     let contexts = desc.props.strs(IE_SUPPORTED_CONTEXTS);
-    let context = [CTX_FILTER, CTX_GENERAL, CTX_TRANSITION, CTX_GENERATOR]
-        .into_iter()
-        .find(|c| contexts.iter().any(|s| s == c))
-        .ok_or_else(|| format!("{ofx_id}: no supported context (needs filter, general, transition or generator; has {contexts:?})"))?;
+    let Some(context) = [CTX_FILTER, CTX_GENERAL, CTX_TRANSITION, CTX_GENERATOR].into_iter().find(|c| contexts.iter().any(|s| s == c)) else {
+        return Step::Fail(format!("no supported context (needs filter, general, transition or generator; it lists {contexts:?})"));
+    };
 
     let depths = desc.props.strs(IE_SUPPORTED_PIXEL_DEPTHS);
     let depth = if depths.is_empty() {
         Depth::Float
     } else {
-        [Depth::Float, Depth::Short, Depth::Byte]
-            .into_iter()
-            .find(|d| depths.iter().any(|s| s == d.name()))
-            .ok_or_else(|| format!("{ofx_id}: needs an unsupported pixel depth {depths:?}"))?
+        match [Depth::Float, Depth::Short, Depth::Byte].into_iter().find(|d| depths.iter().any(|s| s == d.name())) {
+            Some(d) => d,
+            None => {
+                return Step::Fail(format!("needs an unsupported pixel depth {depths:?} (this host offers {DEPTH_FLOAT}, {DEPTH_SHORT} and {DEPTH_BYTE})"));
+            }
+        }
     };
     let safety = match desc.props.str(IE_RENDER_THREAD_SAFETY).as_deref() {
         Some(IE_RENDER_UNSAFE) => Safety::Unsafe,
@@ -345,14 +511,17 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
 
     let inp = PropSet::new();
     inp.put_str(IE_CONTEXT, context);
-    status("DescribeInContext", entry.call(ACT_DESCRIBE_IN_CONTEXT, desc.handle(), Some(&inp), None))?;
+    let (st, mark) = run_action(&entry, block, "DescribeInContext", ACT_DESCRIBE_IN_CONTEXT, desc.handle(), Some(&inp));
+    if st != K_STAT_OK {
+        return Step::Fail(entry.failure(&format!("DescribeInContext ({})", short_context(context)), st, mark));
+    }
 
     // Clips: Output; the effect's own layer; everything else becomes a Layer parameter.
     let input_name = if context == CTX_TRANSITION { CLIP_SOURCE_FROM } else { CLIP_SOURCE };
     let mut clip_infos: Vec<(String, Comps, bool)> = Vec::new();
     desc.each_clip(|c| clip_infos.push((c.name.clone(), pick_comps(&c.props.strs(IE_SUPPORTED_COMPONENTS)), c.props.flag(CLIP_OPTIONAL, false))));
     if !clip_infos.iter().any(|(n, ..)| n == CLIP_OUTPUT) {
-        return Err(format!("{ofx_id}: describes no Output clip"));
+        return Step::Fail("describes no Output clip".into());
     }
     let layer_clips: Vec<String> = clip_infos.iter().filter(|(n, ..)| n != CLIP_OUTPUT && n != input_name).map(|(n, ..)| n.clone()).collect();
     let page_order = desc.props.strs(IE_PARAM_PAGE_ORDER);
@@ -393,8 +562,10 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     };
     let source = bin.to_string_lossy().into_owned();
     let effect = OfxEffect::new(manifest, entry, cfg, desc, mapped.bindings, source);
-    register_plugin(Arc::new(effect)).map_err(|e| format!("{ofx_id}: {e}"))?;
-    Ok(Some(LoadedEffect { id, name, category, ofx_id, context: short_context(context).to_string(), bundle: bundle.to_string() }))
+    if let Err(e) = register_plugin(Arc::new(effect)) {
+        return Step::Fail(e);
+    }
+    Step::Registered(LoadedEffect { id, name, category, ofx_id, context: short_context(context).to_string(), bundle: bundle.to_string() })
 }
 
 #[cfg(test)]

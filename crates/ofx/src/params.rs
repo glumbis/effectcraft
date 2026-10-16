@@ -23,6 +23,7 @@ use std::sync::{Mutex, PoisonError};
 
 use effectcraft_effects::plugin::{PluginParam, PluginParamKind};
 
+use crate::diag::PropKind;
 use crate::ffi::*;
 use crate::instance::EffectObj;
 use crate::props::{PVal, PropSet, as_double, as_int, as_string};
@@ -176,7 +177,7 @@ impl ParamSet {
         if items.len() >= 4096 {
             return Err(K_STAT_ERR_MEMORY);
         }
-        let props = PropSet::new();
+        let props = PropSet::with_kind(PropKind::Param);
         init_props(kind, name, &props, instance);
         let value = Mutex::new(initial_value(kind, &props));
         let p = Box::new(ParamObj { magic: PARAM_MAGIC, kind, name: name.to_string(), props, value, owner });

@@ -7,6 +7,7 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
+use crate::diag::PropKind;
 use crate::ffi::*;
 use crate::props::PropSet;
 
@@ -30,12 +31,17 @@ unsafe impl Sync for HostBlock {}
 
 /// The name plug-ins see in `kOfxPropName`: "EffectCraft", or `EFFECTCRAFT_OFX_HOST_NAME`
 /// (some plug-ins only enable themselves for hosts they know).
-fn host_name() -> String {
+pub fn host_name() -> String {
     std::env::var("EFFECTCRAFT_OFX_HOST_NAME").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "EffectCraft".to_string())
 }
 
+/// The host as plug-ins are told about it, for the load transcript: name, version, API version.
+pub fn host_summary() -> String {
+    format!("\"{}\" {} (OFX API 1.4)", host_name(), env!("CARGO_PKG_VERSION"))
+}
+
 fn build_host_props() -> PropSet {
-    let p = PropSet::new();
+    let p = PropSet::with_kind(PropKind::Host);
     let name = host_name();
     p.put_str(P_TYPE, TYPE_IMAGE_EFFECT_HOST);
     p.put_str(P_NAME, &name);
@@ -101,7 +107,7 @@ extern "C" fn fetch_suite(_host: Handle, name: *const c_char, version: c_int) ->
             (SUITE_PROGRESS, 1 | 2) => &misc::PROGRESS as *const OfxProgressSuite as *const c_void,
             (SUITE_TIMELINE, 1) => &misc::TIMELINE as *const OfxTimeLineSuiteV1 as *const c_void,
             _ => {
-                crate::props::note_unknown(&format!("suite {name} v{version}"));
+                crate::diag::unknown_suite(name, version);
                 std::ptr::null()
             }
         }

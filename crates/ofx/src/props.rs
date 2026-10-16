@@ -4,12 +4,15 @@
 //! (plug-ins may touch an effect's properties from several render threads) and lenient: setting
 //! an unknown property creates it, `int` and `double` properties convert into each other on read,
 //! and reading a property that was never set reports `kOfxStatErrUnknown` and logs the name once
-//! so missing host features show up in the log without flooding it.
+//! (at `warn`, with the kind of set it was asked of; see [`crate::diag`]) so missing host features
+//! show up in the log without flooding it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{CString, c_void};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, PoisonError};
 
+use crate::diag::{self, PropKind};
 use crate::ffi::{
     IE_CLIP_PREFS_SLAVE_PARAM, IE_PARAM_PAGE_ORDER, IE_SUPPORTED_COMPONENTS, IE_SUPPORTED_CONTEXTS, IE_SUPPORTED_PIXEL_DEPTHS, K_STAT_ERR_BAD_HANDLE,
     K_STAT_ERR_BAD_INDEX, K_STAT_ERR_UNKNOWN, K_STAT_OK, OfxStatus, P_VERSION, PP_CHOICE_ENUM, PP_CHOICE_OPTION, PP_DIMENSION_LABEL, PP_PAGE_CHILD, cstring,
@@ -37,6 +40,8 @@ impl PVal {
 #[repr(C)]
 pub struct PropSet {
     magic: u32,
+    /// What the set belongs to ([`PropKind`] as a number), for the messages about unmet requests.
+    kind: AtomicU8,
     map: Mutex<HashMap<String, Vec<PVal>>>,
 }
 
@@ -48,7 +53,7 @@ impl Default for PropSet {
 
 impl Clone for PropSet {
     fn clone(&self) -> Self {
-        PropSet { magic: PROPSET_MAGIC, map: Mutex::new(self.lock().clone()) }
+        PropSet { magic: PROPSET_MAGIC, kind: AtomicU8::new(self.kind.load(Ordering::Relaxed)), map: Mutex::new(self.lock().clone()) }
     }
 }
 
@@ -56,11 +61,6 @@ impl std::fmt::Debug for PropSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PropSet").field("props", &self.lock().len()).finish()
     }
-}
-
-fn warned() -> &'static Mutex<HashSet<String>> {
-    static W: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    W.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 /// Properties that are lists a plug-in extends (`propSetX(name, v, propGetDimension(name))`). A
@@ -85,17 +85,29 @@ fn is_known_list(name: &str) -> bool {
     KNOWN_LISTS.contains(&name)
 }
 
-/// Log a property the plug-in asked for that this host does not provide (once per name).
-pub fn note_unknown(name: &str) {
-    let first = warned().lock().unwrap_or_else(PoisonError::into_inner).insert(name.to_string());
-    if first {
-        log::debug!("openfx: plug-in read property `{name}`, which this host does not provide");
-    }
-}
-
 impl PropSet {
+    /// A set for the arguments of one action (see [`PropKind::Args`]).
     pub fn new() -> PropSet {
-        PropSet { magic: PROPSET_MAGIC, map: Mutex::new(HashMap::new()) }
+        PropSet::with_kind(PropKind::Args)
+    }
+
+    pub fn with_kind(kind: PropKind) -> PropSet {
+        PropSet { magic: PROPSET_MAGIC, kind: AtomicU8::new(kind as u8), map: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn kind(&self) -> PropKind {
+        PropKind::from_u8(self.kind.load(Ordering::Relaxed))
+    }
+
+    pub fn set_kind(&self, kind: PropKind) {
+        self.kind.store(kind as u8, Ordering::Relaxed);
+    }
+
+    /// A plug-in read `name`: remember it when this is the host's set.
+    fn note_read(&self, name: &str) {
+        if self.kind() == PropKind::Host {
+            diag::host_read(name);
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PVal>>> {
@@ -221,20 +233,22 @@ impl PropSet {
 
     /// Fetch value `index` of `name`, logging unknown names.
     pub fn get_at(&self, name: &str, index: i32) -> Result<PVal, OfxStatus> {
+        self.note_read(name);
         let map = self.lock();
         let Some(slot) = map.get(name) else {
             drop(map);
-            return Err(unset_status(name));
+            return Err(self.unset_status(name));
         };
         usize::try_from(index).ok().and_then(|i| slot.get(i)).cloned().ok_or(K_STAT_ERR_BAD_INDEX)
     }
 
     /// The raw pointer of a string value, stable while the property is not changed.
     pub fn get_str_ptr(&self, name: &str, index: i32) -> Result<*const std::ffi::c_char, OfxStatus> {
+        self.note_read(name);
         let map = self.lock();
         let Some(slot) = map.get(name) else {
             drop(map);
-            return Err(unset_status(name));
+            return Err(self.unset_status(name));
         };
         match usize::try_from(index).ok().and_then(|i| slot.get(i)) {
             Some(PVal::Str(s)) => Ok(s.as_ptr()),
@@ -244,30 +258,31 @@ impl PropSet {
     }
 
     pub fn dimension(&self, name: &str) -> Result<i32, OfxStatus> {
+        self.note_read(name);
         match self.lock().get(name) {
             Some(v) => Ok(v.len() as i32),
             // A known list nobody has set yet is empty.
             None if is_known_list(name) => Ok(0),
             None => {
-                note_unknown(name);
+                diag::unknown_property(self.kind(), name);
                 Err(K_STAT_ERR_UNKNOWN)
             }
         }
     }
 
+    /// The status for reading a property that is not set: a known list is empty (its first
+    /// element is out of range), anything else is unknown (and recorded, see [`crate::diag`]).
+    fn unset_status(&self, name: &str) -> OfxStatus {
+        if is_known_list(name) {
+            K_STAT_ERR_BAD_INDEX
+        } else {
+            diag::unknown_property(self.kind(), name);
+            K_STAT_ERR_UNKNOWN
+        }
+    }
+
     pub fn reset(&self, name: &str) -> OfxStatus {
         if self.lock().remove(name).is_some() { K_STAT_OK } else { K_STAT_ERR_UNKNOWN }
-    }
-}
-
-/// The status for reading a property that is not set: a known list is empty (its first element
-/// is out of range), anything else is unknown (and logged).
-fn unset_status(name: &str) -> OfxStatus {
-    if is_known_list(name) {
-        K_STAT_ERR_BAD_INDEX
-    } else {
-        note_unknown(name);
-        K_STAT_ERR_UNKNOWN
     }
 }
 

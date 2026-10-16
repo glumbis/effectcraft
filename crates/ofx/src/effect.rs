@@ -224,7 +224,9 @@ impl OfxEffect {
         inst.end();
         let msg = inst.obj.message();
         self.checkin(key, inst);
-        result.map_err(|e| if msg.is_empty() { e } else { format!("{e}: {msg}") })
+        // (The plug-in's messages are already part of a failure's text; the effect's last error
+        // message is only added when it is something else.)
+        result.map_err(|e| if msg.is_empty() || e.contains(&msg) { e } else { format!("{e}; last message: \"{msg}\"") })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -322,14 +324,15 @@ impl OfxEffect {
         let out = Arc::new(ClipImage::blank(bounds, rod_px, depth, out_comps));
         *ctx.output.lock().unwrap_or_else(PoisonError::into_inner) = Some(out.clone());
 
+        let mark = self.entry.diag.mark();
         inst.begin_sequence(t, geom.scale);
         let status = inst.render(t, window, geom.scale);
         inst.end_sequence(t, geom.scale);
         inst.rendered = true;
         match status {
             K_STAT_OK | K_STAT_REPLY_DEFAULT => {}
-            K_STAT_UNLICENSED => return Err("the plug-in reports it is unlicensed".into()),
-            s => return Err(format!("the plug-in's render failed (OFX status {s})")),
+            K_STAT_UNLICENSED => return Err(format!("the plug-in reports it is unlicensed ({})", self.entry.failure("render", status, mark))),
+            s => return Err(format!("the plug-in's {}", self.entry.failure("render", s, mark))),
         }
         out.write_rows(frame.pixels, inst.prefs.out_unpremult);
         Ok(())

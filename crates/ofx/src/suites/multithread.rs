@@ -31,8 +31,12 @@ extern "C" fn multi_thread(func: ThreadFn, n_threads: u32, arg: *mut c_void) -> 
         }
         let n = n_threads.clamp(1, cpus());
         let arg = RawArg(arg as usize);
+        // The workers belong to the action that called us (messages and unmet requests they
+        // make are attributed to the plug-in).
+        let ctx = crate::diag::current();
         let run = |index: u32| {
             let a = &arg;
+            let _scope = ctx.as_ref().map(crate::diag::CallCtx::enter);
             SPAWNED.with(|s| s.set(Some(index)));
             // The plug-in's code must not unwind into Rust; a panic here would be a bug in it.
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

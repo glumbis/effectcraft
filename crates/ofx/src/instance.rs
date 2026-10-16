@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use effectcraft_effects::plugin::{PluginHost, PluginImage};
 
 use crate::clips::{ClipImage, ClipObj, Comps, Depth};
+use crate::diag::{self, CallCtx, PluginDiag, PropKind};
 use crate::ffi::*;
 use crate::params::{Bindings, CoordCtx, ParamObj, ParamSet};
 use crate::props::{PVal, PropSet};
@@ -104,9 +105,31 @@ pub struct PluginEntry {
     /// Serialises plug-ins that declare themselves render-thread-unsafe (shared by all plug-ins
     /// of one library).
     pub lock: Arc<Mutex<()>>,
+    /// What the host learned about the plug-in: its messages and the requests it made that this
+    /// host could not meet (see [`crate::diag`]).
+    pub diag: Arc<PluginDiag>,
 }
 
 impl PluginEntry {
+    /// The error text for the action `what` that failed with `status`: the status by name, what
+    /// the plug-in said since `mark` ([`PluginDiag::mark`]) and what it asked for that this host
+    /// does not provide (the requests made during the action, else every one so far: a plug-in
+    /// that cannot continue usually asked for the missing thing while describing itself).
+    pub fn failure(&self, what: &str, status: OfxStatus, mark: u64) -> String {
+        self.failure_hint(what, status, mark, None)
+    }
+
+    /// [`PluginEntry::failure`] with a hint about the likely cause after the status.
+    pub fn failure_hint(&self, what: &str, status: OfxStatus, mark: u64, hint: Option<&str>) -> String {
+        let msgs = self.diag.messages_since(mark);
+        let mut unmet = self.diag.unmet_since(mark);
+        if unmet.is_empty() {
+            unmet = self.diag.unmet_all();
+        }
+        let hint = hint.map(|h| format!(": {h}")).unwrap_or_default();
+        format!("{what} failed: {}{hint}{}", diag::status_name(status), diag::explain(&msgs, &unmet))
+    }
+
     /// Dispatch an action to the plug-in.
     // `handle` is never dereferenced here, only handed to the plug-in.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -117,7 +140,11 @@ impl PluginEntry {
         let main = self.main;
         // Raw pointers aren't Send; they cross to the render thread as addresses.
         let (h, i, o) = (handle as usize, i as usize, o as usize);
+        let ctx = CallCtx { diag: self.diag.clone(), plugin: self.ofx_id.as_str().into(), action: action.into() };
         let run = || {
+            // The suites attribute messages and unmet requests to this plug-in and action (set on
+            // the thread the plug-in code runs on, which may not be this one).
+            let _scope = ctx.enter();
             // SAFETY: `main` is the plug-in's entry point, called with the argument shapes the
             // specification fixes; the handles are alive for the duration of the call (the
             // caller waits for it, also when it runs on another thread).
@@ -183,7 +210,7 @@ impl EffectObj {
     pub fn new_descriptor() -> Box<EffectObj> {
         let o = Box::new(EffectObj {
             magic: EFFECT_MAGIC,
-            props: PropSet::new(),
+            props: PropSet::with_kind(PropKind::EffectDescriptor),
             params: ParamSet::default(),
             clips: Mutex::new(Vec::new()),
             is_instance: false,
@@ -620,6 +647,7 @@ impl Instance {
         let owner: *const EffectObj = &*obj;
         desc.params.instantiate_into(&obj.params, owner);
         desc.each_clip(|c| obj.clips.lock().unwrap_or_else(PoisonError::into_inner).push(Box::new(c.instantiate(owner))));
+        obj.props.set_kind(PropKind::EffectInstance);
         obj.props.put_str(P_TYPE, TYPE_IMAGE_EFFECT_INSTANCE);
         obj.props.put_str(IE_CONTEXT, &cfg.context);
         obj.props.put_int(P_IS_INTERACTIVE, 0);
@@ -659,9 +687,10 @@ impl Instance {
 
     /// `kOfxActionCreateInstance`, then `GetClipPreferences`.
     pub fn create(&mut self) -> Result<(), String> {
+        let mark = self.entry.diag.mark();
         let st = self.entry.call(ACT_CREATE_INSTANCE, self.handle(), None, None);
         if st != K_STAT_OK && st != K_STAT_REPLY_DEFAULT {
-            return Err(format!("create instance failed (status {st})"));
+            return Err(self.entry.failure("create instance", st, mark));
         }
         self.created = true;
         self.refresh_prefs();

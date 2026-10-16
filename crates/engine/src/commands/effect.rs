@@ -84,6 +84,13 @@ fn plugins_load_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     let r = loader(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let n = r["loaded"].as_array().map_or(0, Vec::len);
     let errors: Vec<&str> = r["errors"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let notes: Vec<&str> = r["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    // Nothing loaded and something to say about it: a failure with the reasons (the scan reports
+    // the same reasons without failing).
+    if n == 0 && !(errors.is_empty() && notes.is_empty()) {
+        let why: Vec<&str> = errors.iter().chain(notes.iter()).copied().collect();
+        return Err(EngineError::Other(format!("{path}: {}", why.join("; "))));
+    }
     match (n, errors.first()) {
         (0, None) => s.toast(format!("{path}: no OpenFX effects in it")),
         (_, None) => s.toast(format!("Loaded {n} OpenFX effect(s)")),
@@ -95,7 +102,8 @@ fn plugins_load_ofx(s: &mut Session, p: &Value) -> Result<Value> {
 /// `effect.plugins.scanOfx`: load every plug-in in the host's OpenFX search paths
 /// ([`Session::ofx_search_paths`]). Missing folders are skipped; one bad plug-in doesn't stop
 /// the rest. Plug-ins that crashed the app while loading last time are skipped (the host keeps a
-/// blocklist); `retry: true` forgets that list first. Returns `{paths, loaded, errors}`.
+/// blocklist); `retry: true` forgets that list first. Returns `{paths, loaded, errors, notes,
+/// transcript}` (`notes`: plug-ins skipped on purpose; `transcript`: one block of text per binary).
 fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     let loader = s.ofx_loader.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
     if b_p(p, "retry").unwrap_or(false)
@@ -103,7 +111,7 @@ fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     {
         clear();
     }
-    let (mut paths, mut loaded, mut errors) = (vec![], vec![], vec![]);
+    let (mut paths, mut loaded, mut errors, mut notes, mut transcript) = (vec![], vec![], vec![], vec![], vec![]);
     for dir in s.ofx_search_paths.clone() {
         if !dir.exists() {
             continue;
@@ -113,12 +121,14 @@ fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
             Ok(r) => {
                 loaded.extend(r["loaded"].as_array().cloned().unwrap_or_default());
                 errors.extend(r["errors"].as_array().cloned().unwrap_or_default());
+                notes.extend(r["notes"].as_array().cloned().unwrap_or_default());
+                transcript.extend(r["transcript"].as_array().cloned().unwrap_or_default());
             }
             Err(e) => errors.push(json!(format!("{path}: {e}"))),
         }
         paths.push(path);
     }
-    Ok(json!({"paths": paths, "loaded": loaded, "errors": errors}))
+    Ok(json!({"paths": paths, "loaded": loaded, "errors": errors, "notes": notes, "transcript": transcript}))
 }
 
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
@@ -734,7 +744,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load OpenFX Plug-in...",
             [],
             None,
-            "{path (.ofx binary | .ofx.bundle folder | a folder, scanned recursively)} → {loaded: [{id, name, category, ofxId, context, bundle}], errors}",
+            "{path (.ofx binary | .ofx.bundle folder | a folder, scanned recursively)} → {loaded: [{id, name, category, ofxId, context, bundle}], errors, notes, transcript}: errors say what stopped a plug-in, notes what was skipped on purpose (declined this host, duplicate, not an image effect), transcript what each plug-in answered while loading",
             has_ofx,
             plugins_load_ofx
         ),
@@ -743,7 +753,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Scan for OpenFX Plug-ins",
             [],
             None,
-            "{retry?} → {paths, loaded, errors}: loads every OpenFX plug-in in the standard folders and OFX_PLUGIN_PATH; plug-ins that crashed the app while loading last time are skipped unless retry is true",
+            "{retry?} → {paths, loaded, errors, notes, transcript}: loads every OpenFX plug-in in the standard folders and OFX_PLUGIN_PATH; plug-ins that crashed the app while loading last time are skipped unless retry is true",
             has_ofx,
             plugins_scan_ofx
         ),

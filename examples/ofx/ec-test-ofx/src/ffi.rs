@@ -86,11 +86,19 @@ pub struct ImageEffectSuite {
     _abort_and_memory: [*const c_void; 5],
 }
 
+#[repr(C)]
+pub struct MessageSuite {
+    /// `message(handle, type, id, format, ...)`: a real C variadic, as plug-ins call it.
+    pub message: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, *const c_char, ...) -> Status,
+}
+
 /// The suites fetched from the host in the Load action.
 pub struct Suites {
     pub prop: &'static PropertySuite,
     pub param: &'static ParameterSuite,
     pub fx: &'static ImageEffectSuite,
+    /// Optional, as in the Support library.
+    pub msg: Option<&'static MessageSuite>,
 }
 
 impl Suites {
@@ -104,6 +112,7 @@ impl Suites {
                 prop: (get(c"OfxPropertySuite") as *const PropertySuite).as_ref()?,
                 param: (get(c"OfxParameterSuite") as *const ParameterSuite).as_ref()?,
                 fx: (get(c"OfxImageEffectSuite") as *const ImageEffectSuite).as_ref()?,
+                msg: (get(c"OfxMessageSuite") as *const MessageSuite).as_ref(),
             })
         }
     }
@@ -130,6 +139,12 @@ impl Suites {
     pub unsafe fn get_ptr(&self, p: Props, key: &CStr) -> Option<*mut c_void> {
         let mut v = std::ptr::null_mut();
         (unsafe { (self.prop.get_pointer)(p, key.as_ptr(), 0, &mut v) } == OK).then_some(v)
+    }
+    /// Post an error message the way plug-ins do (`message(handle, "OfxMessageError", "", "%s", text)`).
+    pub unsafe fn post_error(&self, handle: *mut c_void, text: &CStr) {
+        if let Some(m) = self.msg {
+            unsafe { (m.message)(handle, c"OfxMessageError".as_ptr(), c"".as_ptr(), c"%s".as_ptr(), text.as_ptr()) };
+        }
     }
     pub unsafe fn get_string(&self, p: Props, key: &CStr) -> Option<String> {
         let mut v: *mut c_char = std::ptr::null_mut();

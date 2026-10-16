@@ -17,7 +17,9 @@
 //! mapping to EffectCraft parameters), [`clips`] (clips, images and pixel conversion),
 //! [`instance`] (effect handles, geometry, per-render context, actions), [`effect`] (the
 //! `EffectPlugin` implementation), [`suites`] (the host suites), [`loader`] (bundle discovery
-//! and registration) and [`blocklist`] (skips plug-ins that crashed the app while loading).
+//! and registration), [`blocklist`] (skips plug-ins that crashed the app while loading) and
+//! [`diag`] (what the host learns about a plug-in while it runs: its messages, the properties and
+//! suites it asked for that this host lacks; the load transcript is built from it).
 
 // Native code: nothing to host on the web build.
 #![cfg(not(target_arch = "wasm32"))]
@@ -25,6 +27,7 @@
 
 pub mod blocklist;
 pub mod clips;
+pub mod diag;
 pub mod effect;
 pub mod ffi;
 pub mod instance;
@@ -60,22 +63,28 @@ pub struct LoadedEffect {
 #[derive(Clone, Debug, Default)]
 pub struct LoadReport {
     pub loaded: Vec<LoadedEffect>,
+    /// What stopped a plug-in from becoming an effect (one line each, naming the binary).
     pub errors: Vec<String>,
+    /// Plug-ins that were skipped on purpose, and why: not an image effect, declined this host,
+    /// exports no plug-ins, a duplicate of another copy (not failures).
+    pub notes: Vec<String>,
+    /// One block of text per binary: what each action answered, what the plug-in said, which
+    /// properties and suites it asked for that this host lacks (see [`diag`]).
+    pub transcript: Vec<String>,
 }
 
-/// Engine hook: [`load_path`] as `{"loaded": [{id, name, category, ofxId, context, bundle}], "errors": [...]}`.
-/// `Err` only when nothing could be loaded and there were errors.
+/// Engine hook: [`load_path`] as `{"loaded": [{id, name, category, ofxId, context, bundle}],
+/// "errors": [...], "notes": [...], "transcript": [...]}`. Always `Ok`: a path with nothing to load
+/// is an empty `loaded` and `errors` that say why (the engine turns that into an error for a single
+/// `loadOfx`, and a scan wants the notes and the transcript either way).
 pub fn loader(path: &str) -> Result<serde_json::Value, String> {
     let report = load_path(&PathBuf::from(path));
-    if report.loaded.is_empty() && !report.errors.is_empty() {
-        return Err(report.errors.join("; "));
-    }
     let loaded: Vec<serde_json::Value> = report
         .loaded
         .iter()
         .map(|e| serde_json::json!({"id": e.id, "name": e.name, "category": e.category, "ofxId": e.ofx_id, "context": e.context, "bundle": e.bundle}))
         .collect();
-    Ok(serde_json::json!({"loaded": loaded, "errors": report.errors}))
+    Ok(serde_json::json!({"loaded": loaded, "errors": report.errors, "notes": report.notes, "transcript": report.transcript}))
 }
 
 /// Helper programs plug-ins start and leave running after the host quits (Boris FX Sapphire

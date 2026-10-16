@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use crate::diag::PropKind;
 use crate::ffi::*;
 use crate::instance::EffectObj;
 use crate::props::PropSet;
@@ -32,7 +33,7 @@ unsafe impl Sync for ClipObj {}
 
 impl ClipObj {
     pub fn new(name: &str, owner: *const EffectObj) -> ClipObj {
-        let props = PropSet::new();
+        let props = PropSet::with_kind(PropKind::Clip);
         props.put_str(P_TYPE, TYPE_CLIP);
         props.put_str(P_NAME, name);
         props.put_str(P_LABEL, name);
@@ -331,7 +332,7 @@ fn live_images() -> &'static Mutex<HashSet<usize>> {
 
 /// Hand an image to the plug-in; the handle stays valid until [`release_image`].
 pub fn new_image_handle(img: &Arc<ClipImage>, render_scale: f64, unique: u64) -> *mut c_void {
-    let props = PropSet::new();
+    let props = PropSet::with_kind(PropKind::Image);
     props.put_str(P_TYPE, TYPE_IMAGE);
     props.put_ptr(IMG_DATA, img.buf.ptr() as usize);
     props.put_ints(IMG_BOUNDS, &[img.bounds.x1, img.bounds.y1, img.bounds.x2, img.bounds.y2]);

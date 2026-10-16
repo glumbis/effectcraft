@@ -427,6 +427,16 @@ fn post(handle: Handle, kind: *const c_char, format: *const c_char, persistent: 
         let format = if format.is_null() { String::new() } else { unsafe { read_c_str(format.cast::<u8>()) } };
         let text = expand(&format, args, &|p: u64| unsafe { read_c_str(p as usize as *const u8) });
         let text = text.as_str();
+        // Remembered for the plug-in (attached to a failure, shown in the scan transcript).
+        let short_kind = match kind {
+            MSG_FATAL => "fatal",
+            MSG_ERROR => "error",
+            MSG_WARNING => "warning",
+            MSG_LOG => "log",
+            MSG_QUESTION => "question",
+            _ => "message",
+        };
+        crate::diag::message(short_kind, text);
         match kind {
             MSG_FATAL | MSG_ERROR => log::error!("openfx plug-in: {text}"),
             MSG_WARNING => log::warn!("openfx plug-in: {text}"),

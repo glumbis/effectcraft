@@ -19,7 +19,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use ffi::*;
 
@@ -33,6 +33,8 @@ const SUPPORT_LIB: usize = 5;
 const LABELS: [&CStr; 6] = [c"EC Test Invert", c"EC Test Echo", c"EC Test Border", c"EC Test Mix", c"EC Test All Params", c"EC Test Support Lib"];
 
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(null_mut());
+/// Set when the host has called `OfxSetHost` (the header orders it before `OfxGetNumberOfPlugins`).
+static SET_HOST_CALLED: AtomicBool = AtomicBool::new(false);
 static SUITES: OnceLock<Suites> = OnceLock::new();
 
 fn suites() -> &'static Suites {
@@ -41,6 +43,22 @@ fn suites() -> &'static Suites {
 
 unsafe extern "C" fn set_host(host: *mut OfxHost) {
     HOST.store(host, Ordering::SeqCst);
+}
+
+/// How the host's tests make this plug-in misbehave: the environment variable `EC_TEST_OFX_MODE`
+/// (read when each entry point runs) is one of `decline-host`, `no-plugins`, `load-fails`,
+/// `describe-fails` (see the host's `tests/diagnostics.rs`). Unset: a well-behaved plug-in.
+fn mode() -> String {
+    std::env::var("EC_TEST_OFX_MODE").unwrap_or_default()
+}
+
+/// `OfxSetHost`, the optional OFX 1.5 entry point that runs before `OfxGetNumberOfPlugins`; a
+/// plug-in that is not for this host answers `kOfxStatFailed` and the host skips it.
+#[unsafe(no_mangle)]
+pub extern "C" fn OfxSetHost(host: *mut OfxHost) -> c_int {
+    HOST.store(host, Ordering::SeqCst);
+    SET_HOST_CALLED.store(true, Ordering::SeqCst);
+    if mode() == "decline-host" { FAILED } else { OK }
 }
 
 // ---- exports ---------------------------------------------------------------------------------
@@ -74,7 +92,8 @@ static PLUGINS: [Plug; 6] = [
 
 #[unsafe(no_mangle)]
 pub extern "C" fn OfxGetNumberOfPlugins() -> c_int {
-    PLUGINS.len() as c_int
+    // A plug-in library may decide what it exports once it has seen the host.
+    if mode() == "no-plugins" || !SET_HOST_CALLED.load(Ordering::SeqCst) { 0 } else { PLUGINS.len() as c_int }
 }
 
 #[unsafe(no_mangle)]
@@ -95,6 +114,11 @@ unsafe fn dispatch(k: usize, action: &[u8], effect: Effect, in_args: Props, out_
             b"OfxActionLoad" => match Suites::fetch(HOST.load(Ordering::SeqCst)) {
                 Some(s) => {
                     let _ = SUITES.set(s);
+                    if mode() == "load-fails" {
+                        // As a licence check does: say why, then decline.
+                        suites().post_error(null_mut(), c"The licence file was not found");
+                        return FAILED;
+                    }
                     OK
                 }
                 None => ERR_UNSUPPORTED,
@@ -111,11 +135,23 @@ unsafe fn dispatch(k: usize, action: &[u8], effect: Effect, in_args: Props, out_
 unsafe fn describe(k: usize, effect: Effect) -> Status {
     let s = suites();
     unsafe {
+        if mode() == "describe-fails" {
+            // Needs something of the host that it does not have, and says so.
+            let host = HOST.load(Ordering::SeqCst).as_ref().map_or(null_mut(), |h| h.host);
+            if s.get_string(host, c"OfxTestOnlyHostFeature").is_none() {
+                s.post_error(effect, c"This host lacks a feature this plug-in needs");
+                return ERR_MISSING_HOST_FEATURE;
+            }
+        }
         let mut p = null_mut();
         (s.fx.get_property_set)(effect, &mut p);
         s.set_str(p, c"OfxPropLabel", 0, LABELS[k]);
         s.set_str(p, c"OfxImageEffectPluginPropGrouping", 0, c"EC Test");
         if k == SUPPORT_LIB {
+            // Like the Support library's `fetchHostDescription`, look at the host first (its name
+            // above all): the host's load transcript lists the properties a plug-in read.
+            let host = HOST.load(Ordering::SeqCst).as_ref().map_or(null_mut(), |h| h.host);
+            let _ = s.get_string(host, c"OfxPropName");
             // The Support library's way: append at the current dimension. These lists start empty
             // on a conforming host, so the dimension query must succeed (with 0).
             let appended = append_str(p, c"OfxImageEffectPropSupportedContexts", c"OfxImageEffectContextFilter")
