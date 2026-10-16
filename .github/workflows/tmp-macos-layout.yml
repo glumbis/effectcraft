@@ -1,0 +1,84 @@
+# TEMPORARY (removed before the branch is finished): which EffectCraft.app layouts survive ad-hoc
+# codesign when OFX/ and aep-import/ must be found next to the executable? Fake binaries, one minute.
+name: tmp macOS layout
+on:
+  push:
+    branches: ["ci/fork-packaging"]
+    paths: [".github/workflows/tmp-macos-layout.yml"]
+permissions:
+  contents: read
+jobs:
+  layout:
+    runs-on: macos-15
+    steps:
+      - name: Try the layouts
+        run: |
+          set +e
+          cd "$RUNNER_TEMP" && rm -rf exp && mkdir exp && cd exp
+          printf '#include <stdio.h>\nint main(int c, char **v){ puts("effectcraft fake"); return 0; }\n' >f.c
+          cc f.c -o fake-exe
+          printf 'int x;\n' >l.c
+          cc -dynamiclib l.c -o fake.ofx
+          mkdir -p assets/OFX/ec-test-ofx.ofx.bundle/Contents/MacOS assets/aep-import
+          cp fake.ofx assets/OFX/ec-test-ofx.ofx.bundle/Contents/MacOS/ec-test-ofx.ofx
+          echo hi >assets/aep-import/requirements.txt
+          echo 'print(1)' >assets/aep-import/a.py
+          sign() { codesign --force --sign - --timestamp=none "$@"; }
+          skeleton() { # $1 = variant dir
+            mkdir -p "$1/EffectCraft.app/Contents/MacOS" "$1/EffectCraft.app/Contents/Resources"
+            cp fake-exe "$1/EffectCraft.app/Contents/MacOS/EffectCraft"
+            cp fake-exe "$1/EffectCraft.app/Contents/MacOS/effectcraft-cli"
+            echo icon >"$1/EffectCraft.app/Contents/Resources/EffectCraft.icns"
+            cat >"$1/EffectCraft.app/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleExecutable</key><string>EffectCraft</string>
+          <key>CFBundleIdentifier</key><string>ai.example.layout</string>
+          <key>CFBundleName</key><string>EffectCraft</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleIconFile</key><string>EffectCraft</string>
+          </dict></plist>
+          PLIST
+          }
+          report() { # $1 = variant name
+            app="$1/EffectCraft.app"
+            echo "=== $1: verify"; codesign --verify --deep --strict --verbose=2 "$app"; echo "verify exit $?"
+            "$app/Contents/MacOS/EffectCraft"; echo "run exit $?"
+            ls -L "$app/Contents/MacOS/OFX/ec-test-ofx.ofx.bundle/Contents/MacOS/" "$app/Contents/MacOS/aep-import/" 2>&1
+            ditto -c -k --keepParent "$app" "$1.zip" && rm -rf "x-$1" && mkdir "x-$1" && ditto -x -k "$1.zip" "x-$1"
+            codesign --verify --deep --strict --verbose=2 "x-$1/EffectCraft.app"; echo "verify after zip exit $?"
+            "x-$1/EffectCraft.app/Contents/MacOS/EffectCraft"; echo "run after zip exit $?"
+            ls -L "x-$1/EffectCraft.app/Contents/MacOS/OFX/ec-test-ofx.ofx.bundle/Contents/MacOS/" 2>&1
+          }
+
+          echo "##### S: assets in Resources, symlinks in Contents/MacOS, sealed"
+          skeleton S; cp -R assets/OFX assets/aep-import S/EffectCraft.app/Contents/Resources/
+          ln -s ../Resources/OFX S/EffectCraft.app/Contents/MacOS/OFX
+          ln -s ../Resources/aep-import S/EffectCraft.app/Contents/MacOS/aep-import
+          sign S/EffectCraft.app/Contents/Resources/OFX/ec-test-ofx.ofx.bundle/Contents/MacOS/ec-test-ofx.ofx; echo "sign ofx exit $?"
+          sign S/EffectCraft.app/Contents/MacOS/effectcraft-cli; echo "sign cli exit $?"
+          sign S/EffectCraft.app; echo "sign app exit $?"
+          report S
+
+          echo "##### R: assets in Resources only (the layout once the app also looks there), sealed"
+          skeleton R; cp -R assets/OFX assets/aep-import R/EffectCraft.app/Contents/Resources/
+          sign R/EffectCraft.app/Contents/Resources/OFX/ec-test-ofx.ofx.bundle/Contents/MacOS/ec-test-ofx.ofx; echo "sign ofx exit $?"
+          sign R/EffectCraft.app/Contents/MacOS/effectcraft-cli; echo "sign cli exit $?"
+          sign R/EffectCraft.app; echo "sign app exit $?"
+          report R
+
+          echo "##### U: assets in Contents/MacOS, Mach-O signed on their own, bundle not sealed"
+          mkdir -p U/EffectCraft.app/Contents/MacOS U/EffectCraft.app/Contents/Resources
+          cp fake-exe u-main && cp fake-exe u-cli && cp fake.ofx u.ofx
+          sign u-main; echo "sign main exit $?"; sign u-cli; sign u.ofx
+          skeleton U; cp u-main U/EffectCraft.app/Contents/MacOS/EffectCraft; cp u-cli U/EffectCraft.app/Contents/MacOS/effectcraft-cli
+          cp -R assets/OFX assets/aep-import U/EffectCraft.app/Contents/MacOS/
+          cp u.ofx U/EffectCraft.app/Contents/MacOS/OFX/ec-test-ofx.ofx.bundle/Contents/MacOS/ec-test-ofx.ofx
+          report U
+
+          echo "##### D: assets in Contents/MacOS, sign with --deep"
+          skeleton D; cp -R assets/OFX assets/aep-import D/EffectCraft.app/Contents/MacOS/
+          codesign --force --deep --sign - --timestamp=none D/EffectCraft.app; echo "sign deep exit $?"
+          report D
+          exit 0

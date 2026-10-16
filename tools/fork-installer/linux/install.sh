@@ -142,8 +142,8 @@ if [ -f "$SRC/effectcraft-ofx.desktop.in" ]; then
   ok 'App menu entry: "EffectCraft (OFX)"'
 fi
 
-# 5. Libraries the app needs from the system (the dynamic linker's list; graphics, windowing and
-#    sound libraries that the app opens at run time are not on it).
+# 5. Libraries the app needs from the system. ldd lists what the dynamic linker needs at start-up
+#    (libasound; libc and friends); the libraries opened later are checked further down.
 lib_hint() {
   case "$1" in
     libasound.so.2) echo "libasound2 (Debian/Ubuntu 24.04+: libasound2t64) | alsa-lib (Fedora)" ;;
@@ -157,6 +157,7 @@ lib_hint() {
     libGL.so.1) echo "libgl1 (Debian/Ubuntu) | mesa-libGL (Fedora)" ;;
     libEGL.so.1) echo "libegl1 (Debian/Ubuntu) | mesa-libEGL (Fedora)" ;;
     libvulkan.so.1) echo "libvulkan1 (Debian/Ubuntu) | vulkan-loader (Fedora)" ;;
+    libdbus-1.so.3) echo "libdbus-1-3 (Debian/Ubuntu) | dbus-libs (Fedora)" ;;
     *) echo "" ;;
   esac
 }
@@ -170,6 +171,27 @@ if command -v ldd >/dev/null 2>&1; then
     done
   else
     ok "All required system libraries found"
+  fi
+fi
+# The libraries the app opens when it needs them (found with `strings` in the CI build): graphics
+# (EGL), keyboard (xkbcommon), the Wayland ones in a Wayland session, D-Bus for desktop portals.
+# Which are really needed depends on the session, so this only warns.
+LDCONFIG="$(command -v ldconfig 2>/dev/null || true)"
+if [ -z "$LDCONFIG" ] && [ -x /sbin/ldconfig ]; then LDCONFIG=/sbin/ldconfig; fi
+if [ -n "$LDCONFIG" ]; then
+  cache="$("$LDCONFIG" -p 2>/dev/null || true)"
+  if [ -n "$cache" ]; then
+    absent=""
+    for lib in libEGL.so.1 libxkbcommon.so.0 libxkbcommon-x11.so.0 libwayland-client.so.0 libwayland-egl.so.1 libdbus-1.so.3; do
+      case "$cache" in *"$lib "*) ;; *) absent="$absent $lib" ;; esac
+    done
+    if [ -n "$absent" ]; then
+      warn "Not found (EffectCraft loads these when it runs; you may only need some, depending on Wayland or X11):"
+      for lib in $absent; do
+        hint="$(lib_hint "$lib")"
+        if [ -n "$hint" ]; then warn "  $lib  ->  $hint"; else warn "  $lib"; fi
+      done
+    fi
   fi
 fi
 
