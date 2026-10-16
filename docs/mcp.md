@@ -13,7 +13,12 @@ parameters must be absolute paths inside the roots (symbolic links resolved, no 
 any other absolute path in its parameters. Save, Increment and Save and rendering the Render
 Queue are checked against the files they write (the open project's, the queued outputs). Scripts
 (`run_script`, `file.runScript`…), Execute File, Reveal in Finder, loading OpenFX plug-ins
-(`effect.plugins.loadOfx`, `effect.plugins.scanOfx`: native, unsandboxed code), `$N` references to file paths
+(`effect.plugins.loadOfx`, `effect.plugins.scanOfx`: native, unsandboxed code), deleting the OpenFX
+scan cache (`effect.plugins.rescanOfx`: it changes which native plug-ins load at the next start),
+changing the host name those plug-ins are told (`effect.plugins.setOfxHostName`; some plug-ins
+switch code paths for a host they recognise; `effect.plugins.ofxHostName` only reads and stays
+allowed), opening the OpenFX scan report or plug-in folder in another application
+(`effect.plugins.openOfxReport`, `effect.plugins.openOfxUserFolder`), `$N` references to file paths
 in a batch, and the bridge's UI-driving tools (`ui_click`, `ui_key`, `ui_type`, `ui_drag`,
 `ui_set`, `script_ui`, `control`) are refused while confined. Without the flags nothing changes.
 

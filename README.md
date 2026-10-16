@@ -17,17 +17,18 @@
 > Report problems with this fork in [its own Issues](https://github.com/glumbis/effectcraft/issues).
 
 > [!IMPORTANT]
-> ### 🔌 This fork adds OpenFX plug-ins and After Effects project import
+> ### This fork adds OpenFX plug-ins and After Effects project import
 > Run **OpenFX (OFX) plug-ins** inside EffectCraft as ordinary effects: tested with
-> **RE:Vision ReelSmart Motion Blur**, **RE:Vision Twixtor** and **Boris FX Sapphire** (all 298 of
-> their effects load and render). It also **opens After Effects projects (`.aep` / `.aepx`)**
-> through File ▸ Import. One-click Windows installer in the download. Upstream, OpenFX is being
-> reworked as an [external helper](FORK.md#how-this-fork-is-organised): EffectCraft gets a safe
-> helper interface and the OpenFX host becomes the separate
+> **RE:Vision ReelSmart Motion Blur**, **RE:Vision Twixtor** and **Boris FX Sapphire** (Sapphire's
+> roughly 290 effects load and render). It also **opens After Effects projects (`.aep` / `.aepx`)**
+> through File ▸ Import. Downloads for **Windows, Linux and macOS**, with an installer for Windows
+> and Linux; the macOS builds are new and not yet tried by a person on a Mac. Upstream, OpenFX is
+> being reworked as an [external helper](FORK.md#how-this-fork-is-organised): EffectCraft gets a
+> safe helper interface and the OpenFX host becomes the separate
 > [ec-extension-ofx](https://github.com/glumbis/ec-extension-ofx).
 >
-> **[⬇ Download for Windows](https://github.com/glumbis/effectcraft/releases/latest)** ·
-> **[Getting started](FORK.md)** · **[How the fork is organised](FORK.md#how-this-fork-is-organised)** · **[OpenFX](docs/ofx.md)** · **[Opening .aep files](tools/aep-import/README.md)**
+> **[Download the latest release](https://github.com/glumbis/effectcraft/releases/latest)** ·
+> **[Install and use it (FORK.md)](FORK.md)** · **[Troubleshooting plug-ins](FORK.md#getting-plug-ins-to-work)** · **[How the fork is organised](FORK.md#how-this-fork-is-organised)** · **[OpenFX reference](docs/ofx.md)** · **[Opening .aep files](tools/aep-import/README.md)**
 
 <p align="center">
   <b>Motion graphics and visual effects; an open-source, clean-room reimplementation of Adobe After Effects, rebuilt in pure Rust.</b>
