@@ -10,7 +10,11 @@
 //!   commands `effect.plugins.ofxHostName` and `effect.plugins.setOfxHostName` read and write it.
 //! * the environment variable `EFFECTCRAFT_OFX_HOST_NAME`, which wins over the file.
 //!
-//! Both are read **once**, when the host block is built for the first plug-in load (the config
+//! `ofx_settings.json` also holds `"scan_cache": true|false` (default true): whether the start-up
+//! scan may use `ofx_cache.json` instead of loading every plug-in library ([`crate::cache`]). It is
+//! read at the start of every scan.
+//!
+//! The host name is read **once**, when the host block is built for the first plug-in load (the config
 //! folder is known by then, see [`crate::set_state_dir`]), so a change applies from the next start.
 //! A missing file is normal. A file that cannot be read or understood never stops a load: the
 //! default name is used and the problem is reported ([`HostIdentity::problem`], shown in
@@ -127,6 +131,30 @@ pub fn read_stored(dir: Option<&Path>) -> Stored {
         Some(_) => Stored {
             host_name: None,
             problem: Some(format!("host_name in {} must be a string; the default host name \"{DEFAULT_HOST_NAME}\" is used", dir.join(FILE).display())),
+        },
+    }
+}
+
+/// What `ofx_settings.json` says about the scan cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanCacheSetting {
+    pub enabled: bool,
+    /// Why the setting was not understood (the cache then stays on).
+    pub problem: Option<String>,
+}
+
+/// The `scan_cache` setting in `dir`'s settings file: on unless the file says `false`. Never fails.
+pub fn scan_cache(dir: Option<&Path>) -> ScanCacheSetting {
+    let on = ScanCacheSetting { enabled: true, problem: None };
+    let Some(dir) = dir else { return on };
+    // (A file that cannot be used is already reported through the host name.)
+    let Ok(obj) = read_object(dir) else { return on };
+    match obj.get("scan_cache") {
+        None | Some(Value::Null) => on,
+        Some(Value::Bool(b)) => ScanCacheSetting { enabled: *b, problem: None },
+        Some(_) => ScanCacheSetting {
+            enabled: true,
+            problem: Some(format!("scan_cache in {} must be true or false; the scan cache stays on", dir.join(FILE).display())),
         },
     }
 }
@@ -307,6 +335,29 @@ mod tests {
             t.write(text);
             assert_eq!(read_stored(Some(&t.0)), Stored::default(), "{text}");
         }
+    }
+
+    #[test]
+    fn the_scan_cache_is_on_unless_the_file_says_false() {
+        let t = TempDir::new("scan-cache");
+        assert_eq!(scan_cache(None), ScanCacheSetting { enabled: true, problem: None });
+        // No file, an empty file, a missing key, null and a broken file all leave it on.
+        for text in ["", "{}", r#"{"scan_cache": null}"#, r#"{"host_name": "x"}"#, "{broken"] {
+            t.write(text);
+            assert!(scan_cache(Some(&t.0)).enabled, "{text}");
+        }
+        t.write(r#"{"scan_cache": false, "host_name": "X"}"#);
+        assert_eq!(scan_cache(Some(&t.0)), ScanCacheSetting { enabled: false, problem: None });
+        t.write(r#"{"scan_cache": true}"#);
+        assert!(scan_cache(Some(&t.0)).enabled);
+        // Something else than a boolean is reported and ignored.
+        t.write(r#"{"scan_cache": "no"}"#);
+        let s = scan_cache(Some(&t.0));
+        assert!(s.enabled && s.problem.as_deref().is_some_and(|p| p.contains("must be true or false")), "{s:?}");
+        // Changing the host name keeps the key.
+        t.write(r#"{"scan_cache": false}"#);
+        store_host_name(&t.0, "B").unwrap();
+        assert!(!scan_cache(Some(&t.0)).enabled);
     }
 
     #[test]

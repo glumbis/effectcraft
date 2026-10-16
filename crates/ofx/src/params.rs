@@ -22,6 +22,7 @@ use std::ffi::c_void;
 use std::sync::{Mutex, PoisonError};
 
 use effectcraft_effects::plugin::{PluginParam, PluginParamKind};
+use serde::{Deserialize, Serialize};
 
 use crate::diag::PropKind;
 use crate::ffi::*;
@@ -36,7 +37,7 @@ pub const PARAM_MAGIC: u32 = 0x4F46_5841; // "OFXA"
 const NOMINAL_PROJECT: [f64; 2] = [1920.0, 1080.0];
 
 /// An OFX parameter type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PKind {
     Int,
     Double,
@@ -325,7 +326,7 @@ pub fn initial_value(kind: PKind, props: &PropSet) -> Vec<PVal> {
 // ---------------------------------------------------------------------------------------------
 
 /// How an exposed OFX parameter is fed from the flattened EffectCraft values.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Src {
     /// One flattened value.
     Flat { at: usize, n: usize },
@@ -338,7 +339,7 @@ pub enum Src {
 }
 
 /// One OFX parameter and where its value comes from.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     pub name: String,
     pub kind: PKind,
@@ -348,7 +349,7 @@ pub struct Binding {
 }
 
 /// A clip exposed as a Layer parameter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerBinding {
     pub clip: String,
     pub param_id: String,
@@ -356,7 +357,7 @@ pub struct LayerBinding {
 }
 
 /// Everything needed to turn flattened EffectCraft values into OFX values.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bindings {
     pub items: Vec<Binding>,
     pub layers: Vec<LayerBinding>,

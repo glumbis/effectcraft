@@ -5,17 +5,24 @@
 //! loader runs `Load`, `Describe` and `DescribeInContext` for the preferred context
 //! (Filter, General, Transition, Generator), maps the parameters to a manifest and registers an
 //! [`OfxEffect`]. Libraries stay loaded for the life of the process.
+//!
+//! With the scan cache ([`crate::cache`]) a binary whose file did not change is not loaded at all:
+//! its plug-ins register from the stored description as *lazy* effects, and [`LazyBinary`] loads
+//! the library, runs the load sequence again and compares the result to the stored description the
+//! first time one of them needs an instance.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use effectcraft_effects::plugin::{PLUGIN_API_VERSION, PluginManifest, register_plugin};
+use effectcraft_effects::plugin::{PLUGIN_API_VERSION, PluginManifest};
 
+use crate::cache::{self, BinaryEntry, PluginRecord, Registration};
 use crate::clips::{Comps, Depth};
 use crate::diag::{CallCtx, PluginDiag, is_failure, one_line, status_name};
-use crate::effect::OfxEffect;
+use crate::effect::{Live, OfxEffect};
 use crate::ffi::*;
 use crate::instance::{ClipCfg, ClipRole, EffectCfg, EffectObj, PluginEntry, Safety};
 use crate::params::map_params;
@@ -76,8 +83,25 @@ pub fn default_search_paths() -> Vec<PathBuf> {
     v
 }
 
-/// Load an `.ofx` binary, an `.ofx.bundle` folder, or every bundle below a folder.
+/// How many plug-in libraries this process has opened (each binary at most once): a start from the
+/// scan cache opens none until an effect is used.
+static LIBRARY_LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of plug-in libraries this process has loaded so far.
+pub fn library_loads() -> usize {
+    LIBRARY_LOADS.load(Ordering::Relaxed)
+}
+
+/// Load an `.ofx` binary, an `.ofx.bundle` folder, or every bundle below a folder. Binaries that
+/// did not change since the last scan register from the scan cache (see [`crate::cache`]) when
+/// there is one; use [`load_path_with`] to load everything.
 pub fn load_path(path: &Path) -> LoadReport {
+    load_path_with(path, true)
+}
+
+/// [`load_path`]; `use_cache = false` loads every binary even when the scan cache knows it (an
+/// explicit load of a plug-in the user just fixed), still updating the cache.
+pub fn load_path_with(path: &Path, use_cache: bool) -> LoadReport {
     let _guard = load_lock().lock().unwrap_or_else(PoisonError::into_inner);
     let mut report = LoadReport::default();
     let mut binaries: Vec<(PathBuf, String)> = Vec::new();
@@ -92,13 +116,43 @@ pub fn load_path(path: &Path) -> LoadReport {
     // The same binary can be reached twice (through a link, or a folder listed twice).
     let mut seen = std::collections::HashSet::new();
     binaries.retain(|(bin, _)| seen.insert(std::fs::canonicalize(bin).unwrap_or_else(|_| bin.clone())));
-    // Phase one lists every binary's plug-ins, so that copies of one plug-in can be told apart
-    // before any of them is described; phase two describes what is kept.
-    let mut probed: Vec<Probed> = binaries.iter().filter_map(|(bin, bundle)| probe_binary(bin, bundle, &mut report)).collect();
-    mark_duplicates(&mut probed, &mut report.notes);
-    for p in probed {
-        describe_binary(p, &mut report);
+    let mut cache = cache::Run::begin(use_cache, &crate::suites::host_name());
+    // Phase one lists every binary's plug-ins (a binary in the scan cache is not loaded: its
+    // listing is the cached one), so that copies of one plug-in can be told apart before any of
+    // them is described; phase two describes what is kept.
+    let mut units: Vec<Unit> = Vec::new();
+    for (bin, bundle) in &binaries {
+        let key = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.clone());
+        let label = bin.display().to_string();
+        let known = loaded_cache().lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned();
+        if let Some(done) = known {
+            report.loaded.extend(done);
+            continue;
+        }
+        if cache.enabled()
+            && let Some(entry) = cache.lookup(&key, &label)
+        {
+            // A cached binary is skipped for the same reason a loaded one would be.
+            if let Err(e) = crate::blocklist::check(&key, &label) {
+                report.errors.push(e);
+                continue;
+            }
+            let skips = vec![None; entry.plugins.len()];
+            units.push(Unit::Cached(Cached { bin: bin.clone(), bundle: bundle.clone(), label, key, entry, skips }));
+            continue;
+        }
+        if let Some(p) = probe_binary(bin, bundle, &mut report) {
+            units.push(Unit::Probed(p));
+        }
     }
+    mark_duplicates(&mut units, &mut report.notes);
+    for u in units {
+        match u {
+            Unit::Probed(p) => describe_binary(p, &mut report, &mut cache),
+            Unit::Cached(c) => register_cached(c, &mut report),
+        }
+    }
+    report.cache = cache.finish();
     report
 }
 
@@ -185,6 +239,7 @@ type GetPluginFn = unsafe extern "C" fn(c_int) -> *mut OfxPlugin;
 type SetHostFn = unsafe extern "C" fn(*mut OfxHost) -> OfxStatus;
 
 fn open_library(path: &Path) -> Result<libloading::Library, String> {
+    LIBRARY_LOADS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: loading a native library runs its initialisers; that is what loading a plug-in is.
     #[cfg(windows)]
     {
@@ -229,6 +284,57 @@ struct Probed {
     plugins: Vec<Listed>,
 }
 
+/// A binary the scan cache knows: its plug-ins register from the stored description without the
+/// library being loaded.
+struct Cached {
+    bin: PathBuf,
+    bundle: String,
+    label: String,
+    key: PathBuf,
+    entry: Arc<BinaryEntry>,
+    /// Per plug-in of the entry: why it is not registered (another copy of it is kept).
+    skips: Vec<Option<String>>,
+}
+
+/// A binary of one scan: freshly probed, or known to the scan cache.
+enum Unit {
+    Probed(Probed),
+    Cached(Cached),
+}
+
+impl Unit {
+    fn label(&self) -> &str {
+        match self {
+            Unit::Probed(p) => &p.label,
+            Unit::Cached(c) => &c.label,
+        }
+    }
+
+    /// The plug-ins the binary offers, in the order it lists them.
+    fn offers(&self) -> Vec<Offer> {
+        match self {
+            Unit::Probed(p) => p.plugins.iter().map(|l| Offer { id: l.id.clone(), version: l.version }).collect(),
+            Unit::Cached(c) => c.entry.plugins.iter().map(|r| Offer { id: r.id().to_string(), version: r.version() }).collect(),
+        }
+    }
+
+    /// Mark plug-in `j` as not to be registered, because of `why`.
+    fn skip(&mut self, j: usize, why: String) {
+        match self {
+            Unit::Probed(p) => {
+                if let Some(l) = p.plugins.get_mut(j) {
+                    l.skip = Some(why);
+                }
+            }
+            Unit::Cached(c) => {
+                if let Some(s) = c.skips.get_mut(j) {
+                    *s = Some(why);
+                }
+            }
+        }
+    }
+}
+
 /// One plug-in a binary lists through `OfxGetPlugin`.
 struct Listed {
     ptr: *mut OfxPlugin,
@@ -268,7 +374,7 @@ fn probe_binary(bin: &Path, bundle: &str, report: &mut LoadReport) -> Option<Pro
     };
     let mut tr = vec![label.clone(), format!("  host shown to the plug-in: {}", crate::suites::host_summary())];
     match probe_open(bin, &label, report, &mut tr) {
-        Some((lock, plugins)) => Some(Probed { bin: bin.to_path_buf(), bundle: bundle.to_string(), label, key, tr, lock, plugins }),
+        Some(plugins) => Some(Probed { bin: bin.to_path_buf(), bundle: bundle.to_string(), label, key, tr, lock: Arc::new(Mutex::new(())), plugins }),
         None => {
             // Over without a crash: nothing more will be described for this binary.
             marker.forgive();
@@ -279,7 +385,7 @@ fn probe_binary(bin: &Path, bundle: &str, report: &mut LoadReport) -> Option<Pro
 }
 
 /// The part of [`probe_binary`] that runs plug-in code; what happens goes to `tr`.
-fn probe_open(bin: &Path, label: &str, report: &mut LoadReport, tr: &mut Vec<String>) -> Option<(Arc<Mutex<()>>, Vec<Listed>)> {
+fn probe_open(bin: &Path, label: &str, report: &mut LoadReport, tr: &mut Vec<String>) -> Option<Vec<Listed>> {
     let lib = match open_library(bin) {
         Ok(l) => l,
         Err(e) => {
@@ -350,7 +456,7 @@ fn probe_open(bin: &Path, label: &str, report: &mut LoadReport, tr: &mut Vec<Str
         let id = unsafe { str_arg(pl.plugin_identifier) }.unwrap_or("").to_string();
         plugins.push(Listed { ptr: p, id, version: (pl.plugin_version_major, pl.plugin_version_minor), skip: None });
     }
-    Some((Arc::new(Mutex::new(())), plugins))
+    Some(plugins)
 }
 
 /// A plug-in offered by a binary, for [`pick_duplicates`].
@@ -407,8 +513,8 @@ fn pick_duplicates(offers: &[Vec<Offer>], claimed: &HashMap<String, (u32, u32)>)
 /// Mark the plug-ins that lose to another copy of themselves, and say so in a note per binary.
 /// Users end up with alpha, beta and release bundles of one product side by side in the OFX
 /// folder (Topaz documents crashes from the older ones in Nuke); the newest is the one that runs.
-fn mark_duplicates(probed: &mut [Probed], notes: &mut Vec<String>) {
-    let offers: Vec<Vec<Offer>> = probed.iter().map(|p| p.plugins.iter().map(|l| Offer { id: l.id.clone(), version: l.version }).collect()).collect();
+fn mark_duplicates(probed: &mut [Unit], notes: &mut Vec<String>) {
+    let offers: Vec<Vec<Offer>> = probed.iter().map(Unit::offers).collect();
     let claimed = registered_ids().lock().unwrap_or_else(PoisonError::into_inner).clone();
     let losers = pick_duplicates(&offers, &claimed);
     let version = |v: (u32, u32)| format!("{}.{}", v.0, v.1);
@@ -416,7 +522,7 @@ fn mark_duplicates(probed: &mut [Probed], notes: &mut Vec<String>) {
     for (&(i, j), winner) in &losers {
         let why = match winner {
             Winner::Binary(b, v) => {
-                let winner_label = probed.get(*b).map(|p| p.label.as_str()).unwrap_or("another copy");
+                let winner_label = probed.get(*b).map(Unit::label).unwrap_or("another copy");
                 (
                     format!("duplicate: {winner_label} offers version {} of it", version(*v)),
                     format!("{} (this copy {}, kept {} in {winner_label})", offers[i][j].id, version(offers[i][j].version), version(*v)),
@@ -427,8 +533,8 @@ fn mark_duplicates(probed: &mut [Probed], notes: &mut Vec<String>) {
                 format!("{} (this copy {}, already registered {})", offers[i][j].id, version(offers[i][j].version), version(*v)),
             ),
         };
-        if let Some(l) = probed.get_mut(i).and_then(|p| p.plugins.get_mut(j)) {
-            l.skip = Some(why.0);
+        if let Some(u) = probed.get_mut(i) {
+            u.skip(j, why.0);
         }
         per_binary.entry(i).or_default().push(why.1);
     }
@@ -436,13 +542,25 @@ fn mark_duplicates(probed: &mut [Probed], notes: &mut Vec<String>) {
         let Some(p) = probed.get(i) else { continue };
         let shown: Vec<&str> = list.iter().take(3).map(String::as_str).collect();
         let more = if list.len() > 3 { format!(" and {} more", list.len() - 3) } else { String::new() };
-        notes.push(format!("{}: {} duplicate plug-in(s) skipped, the newest copy is kept: {}{more}", p.label, list.len(), shown.join("; ")));
+        notes.push(format!("{}: {} duplicate plug-in(s) skipped, the newest copy is kept: {}{more}", p.label(), list.len(), shown.join("; ")));
+    }
+}
+
+/// The effect the report lists for a registered plug-in.
+fn loaded_effect(reg: &Registration, bundle: &str) -> LoadedEffect {
+    LoadedEffect {
+        id: reg.manifest.id.clone(),
+        name: reg.manifest.name.clone(),
+        category: reg.manifest.category.clone(),
+        ofx_id: reg.ofx_id.clone(),
+        context: reg.context.clone(),
+        bundle: bundle.to_string(),
     }
 }
 
 /// Phase two: describe and register the plug-ins of a probed binary that were not marked as
-/// duplicates.
-fn describe_binary(p: Probed, report: &mut LoadReport) {
+/// duplicates, and remember the result in the scan cache.
+fn describe_binary(p: Probed, report: &mut LoadReport, cache: &mut cache::Run) {
     let Probed { bin, bundle, label, key, mut tr, lock, plugins } = p;
     let _marker = match crate::blocklist::begin_phase(&key, &label, true) {
         Ok(g) => g,
@@ -453,19 +571,83 @@ fn describe_binary(p: Probed, report: &mut LoadReport) {
         }
     };
     let mut here: Vec<LoadedEffect> = Vec::new();
+    let mut records: Vec<PluginRecord> = Vec::new();
+    // A binary with a plug-in skipped as a duplicate is not cached: that plug-in was never described.
+    let mut cacheable = true;
     for l in &plugins {
         if let Some(why) = &l.skip {
             tr.push(format!("  {} v{}.{}: skipped, {why}", l.id, l.version.0, l.version.1));
+            cacheable = false;
             continue;
         }
         match describe_plugin(l.ptr, &bin, &bundle, lock.clone(), &mut tr) {
-            Outcome::Registered(e, notes) => {
+            Outcome::Registered(reg) => {
                 registered_ids().lock().unwrap_or_else(PoisonError::into_inner).insert(l.id.clone(), l.version);
-                report.notes.extend(notes.into_iter().map(|n| format!("{label}: {n}")));
-                here.push(e);
+                report.notes.extend(reg.notes.iter().map(|n| format!("{label}: {n}")));
+                here.push(loaded_effect(&reg, &bundle));
+                records.push(PluginRecord::Registered { reg });
             }
-            Outcome::Skipped(note) => report.notes.push(format!("{label}: {note}")),
-            Outcome::Failed(e) => report.errors.push(format!("{label}: {e}")),
+            Outcome::Skipped(note) => {
+                report.notes.push(format!("{label}: {note}"));
+                records.push(PluginRecord::Skipped { id: l.id.clone(), version: l.version, note });
+            }
+            Outcome::Failed(error) => {
+                report.errors.push(format!("{label}: {error}"));
+                records.push(PluginRecord::Failed { id: l.id.clone(), version: l.version, error });
+            }
+        }
+    }
+    report.loaded.extend(here.iter().cloned());
+    if cacheable && !here.is_empty() {
+        match cache::file_stamp(&bin) {
+            Some((size, mtime)) => cache.store(BinaryEntry {
+                path: key.to_string_lossy().into_owned(),
+                bundle: bundle.clone(),
+                size,
+                mtime,
+                stale: None,
+                transcript: tr.iter().skip(1).cloned().collect(),
+                plugins: records,
+            }),
+            None => cache.forget(&key),
+        }
+    } else {
+        cache.forget(&key);
+    }
+    if !here.is_empty() {
+        loaded_cache().lock().unwrap_or_else(PoisonError::into_inner).insert(key, here);
+    }
+    report.transcript.push(tr.join("\n"));
+}
+
+/// Register the plug-ins of a binary the scan cache knows, as lazy effects: the library is not
+/// loaded until one of them needs an instance ([`LazyBinary`]).
+fn register_cached(c: Cached, report: &mut LoadReport) {
+    let Cached { bin, bundle, label, key, entry, skips } = c;
+    let lazy = Arc::new(LazyBinary::new(&bin, &bundle, &label, &key));
+    let source = bin.to_string_lossy().into_owned();
+    let mut tr = vec![label.clone(), "  from the scan cache: the library is not loaded until one of its effects is first used".to_string()];
+    tr.extend(entry.transcript.iter().cloned());
+    let mut here: Vec<LoadedEffect> = Vec::new();
+    for (rec, skip) in entry.plugins.iter().zip(&skips) {
+        if let Some(why) = skip {
+            tr.push(format!("  {} v{}.{}: skipped, {why}", rec.id(), rec.version().0, rec.version().1));
+            continue;
+        }
+        match rec {
+            PluginRecord::Registered { reg } => match OfxEffect::register(OfxEffect::lazy((**reg).clone(), lazy.clone(), source.clone())) {
+                Ok(()) => {
+                    registered_ids().lock().unwrap_or_else(PoisonError::into_inner).insert(reg.ofx_id.clone(), reg.version);
+                    report.notes.extend(reg.notes.iter().map(|n| format!("{label}: {n}")));
+                    here.push(loaded_effect(reg, &bundle));
+                }
+                Err(e) => {
+                    tr.push(format!("  {}: not registered: {e}", reg.ofx_id));
+                    report.errors.push(format!("{label}: {}: {e}", reg.ofx_id));
+                }
+            },
+            PluginRecord::Failed { error, .. } => report.errors.push(format!("{label}: {error}")),
+            PluginRecord::Skipped { note, .. } => report.notes.push(format!("{label}: {note}")),
         }
     }
     report.loaded.extend(here.iter().cloned());
@@ -475,10 +657,94 @@ fn describe_binary(p: Probed, report: &mut LoadReport) {
     report.transcript.push(tr.join("\n"));
 }
 
+/// A plug-in binary that registered from the scan cache and has not been loaded yet. It is shared
+/// by the effects of the binary: the first one that needs an instance opens the library, and each
+/// effect then runs its own `Load`, `Describe` and `DescribeInContext`.
+pub(crate) struct LazyBinary {
+    bin: PathBuf,
+    bundle: String,
+    label: String,
+    key: PathBuf,
+    /// Shared by the plug-ins of this library that declare themselves render-thread-unsafe.
+    lock: Arc<Mutex<()>>,
+    /// The library once opened: its plug-ins' identifiers and `OfxPlugin` addresses, or why it
+    /// could not be (`None` until the first lazy load).
+    opened: Mutex<Option<Result<Vec<(String, usize)>, String>>>,
+}
+
+impl LazyBinary {
+    fn new(bin: &Path, bundle: &str, label: &str, key: &Path) -> LazyBinary {
+        LazyBinary {
+            bin: bin.to_path_buf(),
+            bundle: bundle.to_string(),
+            label: label.to_string(),
+            key: key.to_path_buf(),
+            lock: Arc::new(Mutex::new(())),
+            opened: Mutex::new(None),
+        }
+    }
+
+    /// Load the plug-in `reg` describes: open the library (the first time), run the load sequence
+    /// and check the plug-in still describes itself as the cache said. Crashes while doing it count
+    /// against the binary like any load crash (the marker is written before and removed after).
+    /// A failure marks the cache entry out of date, so the next start scans the binary again.
+    pub(crate) fn load(&self, reg: &Registration) -> Result<Live, String> {
+        // One load at a time in the process (the crash marker is one file per process).
+        let _guard = load_lock().lock().unwrap_or_else(PoisonError::into_inner);
+        let _marker = crate::blocklist::begin_phase(&self.key, &self.label, true)?;
+        let t0 = std::time::Instant::now();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.load_inner(reg))).unwrap_or_else(|_| Err("loading it panicked".to_string()));
+        match &r {
+            Ok(_) => log::info!("openfx: loaded {} on first use ({} ms)", reg.ofx_id, t0.elapsed().as_millis()),
+            Err(why) => {
+                log::warn!("openfx: {}: {why}; its scan cache entry is marked out of date and the binary is scanned again at the next start", reg.ofx_id);
+                cache::mark_stale(&self.key, &format!("{}: {why}", reg.ofx_id));
+            }
+        }
+        r
+    }
+
+    fn load_inner(&self, reg: &Registration) -> Result<Live, String> {
+        let ptr = self.plugin_ptr(&reg.ofx_id)?;
+        let diag = PluginDiag::new();
+        let mut block = Block::default();
+        // The address of an `OfxPlugin` the library listed: static data in the library, which stays
+        // loaded for the life of the process.
+        match describe_core(ptr as *mut OfxPlugin, &self.bin, &self.bundle, self.lock.clone(), &diag, &mut block) {
+            Step::Registered(d) => match reg.difference(&d.reg) {
+                None => Ok(Live { entry: d.entry, desc: d.desc }),
+                Some(diff) => Err(format!("it no longer matches its description in the scan cache ({diff})")),
+            },
+            Step::Skip(note) => Err(format!("it no longer describes an effect ({note})")),
+            Step::Fail(why) => Err(why),
+        }
+    }
+
+    /// The address of the `OfxPlugin` of `id`, opening the library if that has not happened yet.
+    fn plugin_ptr(&self, id: &str) -> Result<usize, String> {
+        let mut opened = self.opened.lock().unwrap_or_else(PoisonError::into_inner);
+        if opened.is_none() {
+            let (mut scratch, mut tr) = (LoadReport::default(), Vec::new());
+            *opened = Some(match probe_open(&self.bin, &self.label, &mut scratch, &mut tr) {
+                Some(list) => Ok(list.into_iter().map(|l| (l.id, l.ptr as usize)).collect()),
+                None => {
+                    Err(scratch.errors.into_iter().chain(scratch.notes).next().unwrap_or_else(|| format!("{}: the library could not be opened", self.label)))
+                }
+            });
+        }
+        match opened.as_ref() {
+            Some(Ok(list)) => list.iter().find(|(i, _)| i == id).map(|(_, p)| *p).ok_or_else(|| format!("the library no longer lists the plug-in {id}")),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("the library is not open".to_string()),
+        }
+    }
+}
+
 /// What became of one plug-in.
 enum Outcome {
-    /// Registered, with notes about how it was described (a fallback context, a guessed input).
-    Registered(LoadedEffect, Vec<String>),
+    /// Registered; the registration notes say how it was described (a fallback context, a
+    /// guessed input), prefixed with the plug-in's identifier.
+    Registered(Box<Registration>),
     /// Left out on purpose: the note says why.
     Skipped(String),
     /// Could not be made into an effect: the error says why.
@@ -576,10 +842,18 @@ fn run_action(entry: &PluginEntry, block: &mut Block, name: &str, action: &str, 
     (st, mark)
 }
 
-/// What [`describe_steps`] made of a plug-in.
+/// A plug-in after `Load`, `Describe` and `DescribeInContext`: what registers (and the cache
+/// keeps) and the live parts a render needs.
+struct Described {
+    reg: Registration,
+    entry: Arc<PluginEntry>,
+    desc: Box<EffectObj>,
+}
+
+/// What [`describe_core`] made of a plug-in.
 enum Step {
-    /// Registered, with notes about how it was described.
-    Registered(LoadedEffect, Vec<String>),
+    /// Described.
+    Registered(Box<Described>),
     /// Left out on purpose (a note, without the plug-in's id).
     Skip(String),
     /// Could not be made into an effect (the reason, without the plug-in's id).
@@ -588,24 +862,42 @@ enum Step {
 
 /// Load, describe and register one plug-in; its transcript lines go to `tr`.
 fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, tr: &mut Vec<String>) -> Outcome {
+    /// The result once the effect is registered (a plug-in loaded here is loaded eagerly: it was just described).
+    enum Done {
+        Registered(Registration),
+        Skip(String),
+        Fail(String),
+    }
     let diag = PluginDiag::new();
     let mut block = Block::default();
-    let step = describe_steps(ptr, bin, bundle, lock, &diag, &mut block);
+    let done = match describe_core(ptr, bin, bundle, lock, &diag, &mut block) {
+        Step::Registered(d) => {
+            let Described { reg, entry, desc } = *d;
+            let effect = OfxEffect::eager(reg.clone(), Live { entry, desc }, bin.to_string_lossy().into_owned());
+            match OfxEffect::register(effect) {
+                Ok(()) => Done::Registered(reg),
+                Err(e) => Done::Fail(e),
+            }
+        }
+        Step::Skip(note) => Done::Skip(note),
+        Step::Fail(why) => Done::Fail(why),
+    };
     let id = block.id.clone();
     let prefixed = |s: String| if id.is_empty() { s } else { format!("{id}: {s}") };
-    match step {
-        Step::Registered(e, notes) => {
-            let outcome = format!("registered as effect {} ({} context)", e.id, e.context);
+    match done {
+        Done::Registered(mut reg) => {
+            let outcome = format!("registered as effect {} ({} context)", reg.manifest.id, reg.context);
             // A fallback or a guess is worth the full lines (a failed attempt's status and message).
-            block.noteworthy |= !notes.is_empty();
+            block.noteworthy |= !reg.notes.is_empty();
             block.finish(tr, &diag, &outcome, true);
-            Outcome::Registered(e, notes.into_iter().map(prefixed).collect())
+            reg.notes = std::mem::take(&mut reg.notes).into_iter().map(prefixed).collect();
+            Outcome::Registered(Box::new(reg))
         }
-        Step::Skip(note) => {
+        Done::Skip(note) => {
             block.finish(tr, &diag, &format!("skipped: {note}"), false);
             Outcome::Skipped(prefixed(format!("skipped, {note}")))
         }
-        Step::Fail(why) => {
+        Done::Fail(why) => {
             // An action that failed already says so in its own line.
             let outcome = if block.action_failed { "not registered".to_string() } else { format!("not registered: {why}") };
             block.finish(tr, &diag, &outcome, false);
@@ -614,7 +906,9 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     }
 }
 
-fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, diag: &Arc<PluginDiag>, block: &mut Block) -> Step {
+/// `Load`, `Describe` and `DescribeInContext` of one plug-in, and everything registering it needs
+/// from the answers. The `OfxEffect` is made (and registered) by the caller.
+fn describe_core(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, diag: &Arc<PluginDiag>, block: &mut Block) -> Step {
     // SAFETY: a non-null OfxPlugin* from the binary; the struct is static data in the plug-in.
     let p = unsafe { &*ptr };
     let ofx_id = unsafe { str_arg(p.plugin_identifier) }.unwrap_or("").to_string();
@@ -756,7 +1050,15 @@ fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex
             ClipCfg { name, role, comps, optional }
         })
         .collect();
-    let cfg = Arc::new(EffectCfg { context: context.to_string(), clips, depth, safety, slave_params: desc.props.strs(IE_CLIP_PREFS_SLAVE_PARAM) });
+    let cfg = Arc::new(EffectCfg {
+        context: context.to_string(),
+        clips,
+        depth,
+        safety,
+        slave_params: desc.props.strs(IE_CLIP_PREFS_SLAVE_PARAM),
+        single_instance: desc.props.flag(IE_SINGLE_INSTANCE, false),
+        sequential_render: desc.props.int(IE_SEQUENTIAL_RENDER).unwrap_or(0),
+    });
 
     let name = desc.props.str(P_LABEL).filter(|s| !s.trim().is_empty()).unwrap_or_else(|| ofx_id.clone());
     let category = desc
@@ -764,23 +1066,26 @@ fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex
         .str(IE_GROUPING)
         .and_then(|g| g.split('/').map(str::trim).find(|s| !s.is_empty()).map(str::to_string))
         .unwrap_or_else(|| "OpenFX".to_string());
-    let id = effect_id(&ofx_id);
     let manifest = PluginManifest {
         api: PLUGIN_API_VERSION,
-        id: id.clone(),
-        name: name.clone(),
-        category: category.clone(),
+        id: effect_id(&ofx_id),
+        name,
+        category,
         version: format!("{}.{}", p.plugin_version_major, p.plugin_version_minor),
         author: String::new(),
         description: desc.props.str(P_PLUGIN_DESCRIPTION).unwrap_or_default(),
         params: mapped.params,
     };
-    let source = bin.to_string_lossy().into_owned();
-    let effect = OfxEffect::new(manifest, entry, cfg, desc, mapped.bindings, source);
-    if let Err(e) = register_plugin(Arc::new(effect)) {
-        return Step::Fail(e);
-    }
-    Step::Registered(LoadedEffect { id, name, category, ofx_id, context: short_context(context).to_string(), bundle: bundle.to_string() }, notes)
+    let reg = Registration {
+        ofx_id,
+        version: (p.plugin_version_major, p.plugin_version_minor),
+        context: short_context(context).to_string(),
+        manifest,
+        bindings: Arc::new(mapped.bindings),
+        cfg,
+        notes,
+    };
+    Step::Registered(Box::new(Described { reg, entry, desc }))
 }
 
 /// What the loader needs to know about a described clip.

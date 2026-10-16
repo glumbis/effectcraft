@@ -92,6 +92,7 @@ fn ofx_scan_report(search_paths: &[std::path::PathBuf], result: &Result<serde_js
             return t;
         }
     };
+    ofx_scan_cache_section(&mut t, &r["cache"]);
     let loaded = r["loaded"].as_array().map(Vec::as_slice).unwrap_or_default();
     let _ = writeln!(t, "\nEffects registered: {}", loaded.len());
     for e in loaded {
@@ -130,6 +131,40 @@ fn ofx_scan_report(search_paths: &[std::path::PathBuf], result: &Result<serde_js
         );
     }
     t
+}
+
+/// The "Scan cache" part of `ofx_scan.txt`: whether `ofx_cache.json` is in use, which plug-in
+/// binaries registered from it without being loaded, which were loaded and described (and why),
+/// and problems with the cache file. `cache` is `effect.plugins.scanOfx`'s `cache` member.
+fn ofx_scan_cache_section(t: &mut String, cache: &serde_json::Value) {
+    use std::fmt::Write as _;
+    if cache.is_null() {
+        return;
+    }
+    let file = cache["file"].as_str().unwrap_or("ofx_cache.json in the config folder");
+    if cache["enabled"] == true {
+        let (hits, scanned) = (cache["hits"].as_u64().unwrap_or(0), cache["scanned"].as_u64().unwrap_or(0));
+        let _ = writeln!(
+            t,
+            "\nScan cache ({file}): {hits} plug-in binar{} registered from the cache (their libraries are loaded when one of their effects is first used), {scanned} loaded and described now.",
+            if hits == 1 { "y" } else { "ies" }
+        );
+        for l in cache["lines"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            let _ = writeln!(t, "  {}", l.as_str().unwrap_or(""));
+        }
+        let _ = writeln!(
+            t,
+            "  effect.plugins.rescanOfx deletes the cache (every plug-in is loaded again at the next start); \"scan_cache\": false in ofx_settings.json turns it off."
+        );
+    } else {
+        let _ = writeln!(
+            t,
+            "\nScan cache: off. Every plug-in library is loaded and described at every start. (\"scan_cache\": true in ofx_settings.json, in the config folder, turns it on; the cache file is {file}.)"
+        );
+    }
+    for p in cache["problems"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        let _ = writeln!(t, "  Problem: {}", p.as_str().unwrap_or(""));
+    }
 }
 
 /// The toast after the start-up OpenFX scan: only when something needs attention.
@@ -648,6 +683,38 @@ mod tests {
         assert!(t.contains("none became an effect") && !t.contains("No OpenFX effects were found"), "{t}");
         assert!(super::ofx_scan_toast(&skipped, Path::new("r.txt")).is_some_and(|m| m.contains("declined") && m.contains("r.txt")));
         assert!(super::ofx_scan_toast(&Err("boom".into()), Path::new("r.txt")).is_some_and(|m| m.contains("boom")));
+    }
+
+    /// The scan report says which binaries came from the scan cache, and why the others were loaded.
+    #[test]
+    fn ofx_scan_report_lists_the_scan_cache() {
+        use serde_json::json;
+        let host = Ok(
+            json!({"name": "EffectCraft", "source": "default", "settingsFile": "C:/cfg/ofx_settings.json", "configured": null, "problem": null, "restartRequired": false}),
+        );
+        let on = Ok(json!({
+            "loaded": [],
+            "errors": [],
+            "cache": {
+                "enabled": true,
+                "file": "C:/cfg/ofx_cache.json",
+                "hits": 1,
+                "scanned": 1,
+                "lines": ["from the cache: C:/OFX/A.ofx (3 plug-in(s), library not loaded)", "scanned: C:/OFX/B.ofx (not in the scan cache yet)"],
+                "problems": ["C:/cfg/ofx_cache.json is not valid JSON (x); it is ignored and rebuilt"]
+            }
+        }));
+        let t = super::ofx_scan_report(&[], &on, &host);
+        assert!(t.contains("Scan cache (C:/cfg/ofx_cache.json): 1 plug-in binary registered from the cache"), "{t}");
+        assert!(t.contains("1 loaded and described now"), "{t}");
+        assert!(t.contains("  from the cache: C:/OFX/A.ofx") && t.contains("  scanned: C:/OFX/B.ofx (not in the scan cache yet)"), "{t}");
+        assert!(t.contains("Problem: C:/cfg/ofx_cache.json is not valid JSON") && t.contains("effect.plugins.rescanOfx"), "{t}");
+        let off = Ok(json!({"loaded": [], "errors": [], "cache": {"enabled": false, "file": null, "hits": 0, "scanned": 0, "lines": [], "problems": []}}));
+        let t = super::ofx_scan_report(&[], &off, &host);
+        assert!(t.contains("Scan cache: off") && t.contains("\"scan_cache\": true"), "{t}");
+        // An older result without the member says nothing about the cache.
+        let none = Ok(json!({"loaded": [], "errors": []}));
+        assert!(!super::ofx_scan_report(&[], &none, &host).contains("Scan cache"));
     }
 
     /// The window's wgpu instance skips indirect-call validation (Intel Metal, #1153).

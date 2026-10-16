@@ -136,6 +136,24 @@ pub(crate) fn begin_phase(bin: &Path, label: &str, last: bool) -> Result<LoadGua
     check_and_mark(&dir, bin, label, std::process::id()).map(|marker| LoadGuard { marker, forgive: last })
 }
 
+/// Whether the binary at `bin` is skipped because it crashed the process while loading (the
+/// loader asks before it registers a binary from the scan cache, which does not load it). `Err` is
+/// the reason, worded for the report; the binary is not loaded or registered.
+pub(crate) fn check(bin: &Path, label: &str) -> Result<(), String> {
+    let Some(dir) = state_dir() else { return Ok(()) };
+    if !RECOVERED.swap(true, Ordering::SeqCst) {
+        recover(&dir);
+    }
+    if is_blocked(&dir, &bin.to_string_lossy()) { Err(blocked_message(&dir, label)) } else { Ok(()) }
+}
+
+fn blocked_message(dir: &Path, label: &str) -> String {
+    format!(
+        "{label}: skipped: it crashed EffectCraft while loading {STRIKES} times in a row (update or reinstall it, remove its line from {} or run effect.plugins.scanOfx {{\"retry\": true}} to try again)",
+        dir.join(LIST).display()
+    )
+}
+
 /// How paths are compared: case-insensitively on Windows.
 fn norm(path: &str) -> String {
     if cfg!(windows) { path.to_lowercase() } else { path.to_string() }
@@ -242,10 +260,7 @@ fn take_dead(marker: &Path) -> Option<File> {
 fn check_and_mark(dir: &Path, bin: &Path, label: &str, owner: u32) -> Result<Option<Marker>, String> {
     let key = bin.to_string_lossy();
     if is_blocked(dir, &key) {
-        return Err(format!(
-            "{label}: skipped: it crashed EffectCraft while loading {STRIKES} times in a row (update or reinstall it, remove its line from {} or run effect.plugins.scanOfx {{\"retry\": true}} to try again)",
-            dir.join(LIST).display()
-        ));
+        return Err(blocked_message(dir, label));
     }
     // A path with a line break can't be stored one per line; it just goes unprotected.
     if key.contains(['\n', '\r']) {

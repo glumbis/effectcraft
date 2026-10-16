@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use effectcraft_effects::plugin::{PluginHost, PluginImage};
+use serde::{Deserialize, Serialize};
 
 use crate::clips::{ClipImage, ClipObj, Comps, Depth};
 use crate::diag::{self, CallCtx, PluginDiag, PropKind};
@@ -53,7 +54,7 @@ pub fn span_frames(first: f64, end: f64, fps: f64) -> Option<(f64, f64)> {
 }
 
 /// `kOfxImageEffectPluginRenderThreadSafety`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Safety {
     /// One render at a time for the whole plug-in.
     Unsafe,
@@ -64,7 +65,7 @@ pub enum Safety {
 }
 
 /// The role a clip plays for this host.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipRole {
     Output,
     /// The effect's own layer (`Source`, or `SourceFrom` in a transition).
@@ -74,7 +75,7 @@ pub enum ClipRole {
 }
 
 /// What the host decided about one clip.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipCfg {
     pub name: String,
     pub role: ClipRole,
@@ -83,13 +84,20 @@ pub struct ClipCfg {
 }
 
 /// Static facts about a described effect.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectCfg {
     pub context: String,
     pub clips: Vec<ClipCfg>,
     pub depth: Depth,
     pub safety: Safety,
     pub slave_params: Vec<String>,
+    /// `kOfxImageEffectPluginPropSingleInstance`: the plug-in allows one instance at a time.
+    #[serde(default)]
+    pub single_instance: bool,
+    /// The plug-in's declared `kOfxImageEffectInstancePropSequentialRender`: 0 frames in any
+    /// order, 1 frames in order (the plug-in keeps state from frame to frame), 2 in order preferred.
+    #[serde(default)]
+    pub sequential_render: i32,
 }
 
 impl EffectCfg {
@@ -1008,7 +1016,15 @@ mod tests {
     fn instances_say_opengl_is_not_enabled_as_an_int() {
         let desc = EffectObj::new_descriptor();
         let entry = Arc::new(PluginEntry { main: nop_entry, ofx_id: "test".into(), lock: Arc::new(Mutex::new(())), diag: PluginDiag::new() });
-        let cfg = Arc::new(EffectCfg { context: CTX_FILTER.into(), clips: vec![], depth: Depth::Float, safety: Safety::InstanceSafe, slave_params: vec![] });
+        let cfg = Arc::new(EffectCfg {
+            context: CTX_FILTER.into(),
+            clips: vec![],
+            depth: Depth::Float,
+            safety: Safety::InstanceSafe,
+            slave_params: vec![],
+            single_instance: false,
+            sequential_render: 0,
+        });
         let inst = Instance::build(entry, cfg, &desc);
         assert!(matches!(inst.obj.props.all(IE_OPENGL_ENABLED).as_slice(), [PVal::Int(0)]));
     }

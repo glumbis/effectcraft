@@ -478,8 +478,11 @@ pub struct Session {
     /// Where `effect.plugins.scanOfx` looks for OpenFX plug-ins (the host's defaults).
     pub ofx_search_paths: Vec<std::path::PathBuf>,
     /// Forgets the OpenFX crash blocklist (plug-ins skipped because they crashed the app while
-    /// loading): `effect.plugins.scanOfx {"retry": true}`.
+    /// loading or rendering): `effect.plugins.scanOfx {"retry": true}`.
     pub ofx_clear_blocklist: Option<fn()>,
+    /// Deletes the OpenFX scan cache so that the next start loads every plug-in again:
+    /// `effect.plugins.rescanOfx`.
+    pub ofx_rescan: Option<OfxRescan>,
     /// The OpenFX host name setting (hosts built with the `openfx` feature):
     /// `effect.plugins.ofxHostName`, `effect.plugins.setOfxHostName`.
     pub ofx_host_name: Option<OfxHostName>,
@@ -560,8 +563,13 @@ pub type PluginLoader = fn(&[u8], &str) -> std::result::Result<Value, String>;
 
 /// Loads OpenFX plug-ins from a path (an `.ofx` binary, an `.ofx.bundle` folder, or a folder
 /// scanned recursively) into the effect registry and describes them
-/// (`{loaded: [{id, name, category, ofxId, context, bundle}], errors: [..]}`).
-pub type OfxLoader = fn(&str) -> std::result::Result<Value, String>;
+/// (`{loaded: [{id, name, category, ofxId, context, bundle}], errors: [..], notes, transcript,
+/// cache}`). The flag says whether binaries that did not change may be registered from the scan
+/// cache without being loaded (the start-up scan does; an explicit load of a plug-in does not).
+pub type OfxLoader = fn(&str, bool) -> std::result::Result<Value, String>;
+
+/// Deletes the OpenFX scan cache (`effect.plugins.rescanOfx`) and reports what it did as JSON.
+pub type OfxRescan = fn() -> std::result::Result<Value, String>;
 
 /// Reads (`None`) or changes (`Some(name)`; empty resets) the host name OpenFX plug-ins are told,
 /// and reports it as JSON (`effect.plugins.ofxHostName`, `effect.plugins.setOfxHostName`).
@@ -622,6 +630,7 @@ impl Default for Session {
             ofx_loader: None,
             ofx_search_paths: vec![],
             ofx_clear_blocklist: None,
+            ofx_rescan: None,
             ofx_host_name: None,
             aep_converter: None,
             script_ui: scriptui::ScriptUi::default(),

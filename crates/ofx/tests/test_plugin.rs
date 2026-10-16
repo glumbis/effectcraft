@@ -136,6 +136,10 @@ fn all_effects_register() {
         // Lists Filter and General, but only General describes.
         ("org.effectcraft.test.ContextFallback", "general"),
         ("org.effectcraft.test.NoSource", "general"),
+        ("org.effectcraft.test.Serial", "filter"),
+        ("org.effectcraft.test.Probe", "filter"),
+        ("org.effectcraft.test.ProbeSingle", "filter"),
+        ("org.effectcraft.test.Crash", "filter"),
     ] {
         let e = r.loaded.iter().find(|e| e.ofx_id == ofx_id).unwrap_or_else(|| panic!("{ofx_id} missing from {:?}", r.loaded));
         assert_eq!(e.id, ofx_id.to_lowercase(), "effect id");

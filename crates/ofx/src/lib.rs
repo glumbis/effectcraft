@@ -26,6 +26,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod blocklist;
+pub mod cache;
 pub mod clips;
 pub mod diag;
 pub mod effect;
@@ -39,7 +40,7 @@ pub mod suites;
 
 use std::path::PathBuf;
 
-pub use loader::{default_search_paths, load_path};
+pub use loader::{default_search_paths, library_loads, load_path, load_path_with};
 pub use settings::host_name_command;
 
 /// Set the directory that holds the crash blocklist and `ofx_settings.json` (the host's config
@@ -48,6 +49,7 @@ pub use settings::host_name_command;
 /// the host name is the default or the environment variable's.
 pub fn set_state_dir(dir: PathBuf) {
     blocklist::set_state_dir(dir);
+    cache::reset();
     let _ = settings::identity();
 }
 
@@ -81,20 +83,39 @@ pub struct LoadReport {
     /// One block of text per binary: what each action answered, what the plug-in said, which
     /// properties and suites it asked for that this host lacks (see [`diag`]).
     pub transcript: Vec<String>,
+    /// What the scan cache did: which binaries registered from it without being loaded, which were
+    /// scanned (and why), problems with the cache file itself.
+    pub cache: cache::CacheReport,
 }
 
-/// Engine hook: [`load_path`] as `{"loaded": [{id, name, category, ofxId, context, bundle}],
-/// "errors": [...], "notes": [...], "transcript": [...]}`. Always `Ok`: a path with nothing to load
-/// is an empty `loaded` and `errors` that say why (the engine turns that into an error for a single
-/// `loadOfx`, and a scan wants the notes and the transcript either way).
-pub fn loader(path: &str) -> Result<serde_json::Value, String> {
-    let report = load_path(&PathBuf::from(path));
+/// Engine hook: [`load_path_with`] as `{"loaded": [{id, name, category, ofxId, context, bundle}],
+/// "errors": [...], "notes": [...], "transcript": [...], "cache": {enabled, file, hits, scanned,
+/// lines, problems}}`. `use_cache`: binaries that did not change register from the scan cache
+/// without being loaded (the start-up scan); `false` loads everything (an explicit load). Always
+/// `Ok`: a path with nothing to load is an empty `loaded` and `errors` that say why (the engine
+/// turns that into an error for a single `loadOfx`, and a scan wants the notes and the transcript
+/// either way).
+pub fn loader(path: &str, use_cache: bool) -> Result<serde_json::Value, String> {
+    let report = load_path_with(&PathBuf::from(path), use_cache);
     let loaded: Vec<serde_json::Value> = report
         .loaded
         .iter()
         .map(|e| serde_json::json!({"id": e.id, "name": e.name, "category": e.category, "ofxId": e.ofx_id, "context": e.context, "bundle": e.bundle}))
         .collect();
-    Ok(serde_json::json!({"loaded": loaded, "errors": report.errors, "notes": report.notes, "transcript": report.transcript}))
+    Ok(serde_json::json!({"loaded": loaded, "errors": report.errors, "notes": report.notes, "transcript": report.transcript, "cache": report.cache}))
+}
+
+/// Engine hook behind `effect.plugins.rescanOfx`: delete the scan cache, so that the next start
+/// loads and describes every plug-in again. (Effects already registered in this process stay as
+/// they are: a registration cannot be replaced.)
+pub fn rescan_command() -> Result<serde_json::Value, String> {
+    let file = cache::clear()?;
+    Ok(serde_json::json!({
+        "cleared": true,
+        "file": file,
+        "restartRequired": true,
+        "note": "the scan cache was deleted: the next start loads and describes every OpenFX plug-in again (this takes effect when EffectCraft restarts)"
+    }))
 }
 
 /// Helper programs plug-ins start and leave running after the host quits (Boris FX Sapphire

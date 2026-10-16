@@ -11,6 +11,8 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use serde::{Deserialize, Serialize};
+
 use crate::diag::PropKind;
 use crate::ffi::*;
 use crate::instance::EffectObj;
@@ -70,7 +72,7 @@ impl ClipObj {
 }
 
 /// OFX pixel depths this host can produce.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Depth {
     Byte,
     Short,
@@ -103,7 +105,7 @@ impl Depth {
 }
 
 /// OFX pixel components this host can produce.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Comps {
     Rgba,
     Rgb,

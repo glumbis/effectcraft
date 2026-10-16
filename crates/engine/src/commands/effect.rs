@@ -81,7 +81,8 @@ fn plugins_load_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     let c = "effect.plugins.loadOfx";
     let loader = s.ofx_loader.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
     let path = str_p(p, "path").ok_or_else(|| bad(c, "missing `path`"))?;
-    let r = loader(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    // An explicit load always loads the plug-in (the user may have just fixed it).
+    let r = loader(path, false).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let n = r["loaded"].as_array().map_or(0, Vec::len);
     let errors: Vec<&str> = r["errors"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     let notes: Vec<&str> = r["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
@@ -127,9 +128,13 @@ fn plugins_set_ofx_host_name(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// `effect.plugins.scanOfx`: load every plug-in in the host's OpenFX search paths
 /// ([`Session::ofx_search_paths`]). Missing folders are skipped; one bad plug-in doesn't stop
-/// the rest. Plug-ins that crashed the app while loading last time are skipped (the host keeps a
-/// blocklist); `retry: true` forgets that list first. Returns `{paths, loaded, errors, notes,
-/// transcript}` (`notes`: plug-ins skipped on purpose; `transcript`: one block of text per binary).
+/// the rest. Binaries that did not change since the last scan are registered from the scan cache
+/// without loading their libraries (`cache: false` loads everything). Plug-ins that crashed the
+/// app while loading or rendering last time are skipped (the host keeps a blocklist); `retry:
+/// true` forgets that list first. Returns `{paths, loaded, errors, notes, transcript, cache,
+/// crashes}` (`notes`: plug-ins skipped on purpose; `transcript`: one block of text per binary;
+/// `cache`: which binaries came from the scan cache; `crashes`: plug-ins that crashed the app
+/// during the previous session).
 fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     let loader = s.ofx_loader.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
     if b_p(p, "retry").unwrap_or(false)
@@ -137,24 +142,72 @@ fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     {
         clear();
     }
-    let (mut paths, mut loaded, mut errors, mut notes, mut transcript) = (vec![], vec![], vec![], vec![], vec![]);
+    let use_cache = b_p(p, "cache").unwrap_or(true);
+    let (mut paths, mut loaded, mut errors, mut notes, mut transcript, mut crashes) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+    let mut cache = json!({"enabled": false, "file": null, "hits": 0, "scanned": 0, "lines": [], "problems": []});
     for dir in s.ofx_search_paths.clone() {
         if !dir.exists() {
             continue;
         }
         let path = dir.to_string_lossy().to_string();
-        match loader(&path) {
+        match loader(&path, use_cache) {
             Ok(r) => {
                 loaded.extend(r["loaded"].as_array().cloned().unwrap_or_default());
                 errors.extend(r["errors"].as_array().cloned().unwrap_or_default());
                 notes.extend(r["notes"].as_array().cloned().unwrap_or_default());
                 transcript.extend(r["transcript"].as_array().cloned().unwrap_or_default());
+                for c in r["crashes"].as_array().into_iter().flatten() {
+                    if !crashes.contains(c) {
+                        crashes.push(c.clone());
+                    }
+                }
+                merge_cache_report(&mut cache, &r["cache"]);
             }
             Err(e) => errors.push(json!(format!("{path}: {e}"))),
         }
         paths.push(path);
     }
-    Ok(json!({"paths": paths, "loaded": loaded, "errors": errors, "notes": notes, "transcript": transcript}))
+    Ok(json!({"paths": paths, "loaded": loaded, "errors": errors, "notes": notes, "transcript": transcript, "cache": cache, "crashes": crashes}))
+}
+
+/// Add one folder's scan-cache report (`{enabled, file, hits, scanned, lines, problems}`) to the
+/// total of a scan.
+fn merge_cache_report(total: &mut Value, one: &Value) {
+    if one.is_null() {
+        return;
+    }
+    if one["enabled"] == true {
+        total["enabled"] = json!(true);
+    }
+    if total["file"].is_null() {
+        total["file"] = one["file"].clone();
+    }
+    for k in ["hits", "scanned"] {
+        total[k] = json!(total[k].as_u64().unwrap_or(0) + one[k].as_u64().unwrap_or(0));
+    }
+    for k in ["lines", "problems"] {
+        let mut list = total[k].as_array().cloned().unwrap_or_default();
+        for v in one[k].as_array().into_iter().flatten() {
+            if k == "lines" || !list.contains(v) {
+                list.push(v.clone());
+            }
+        }
+        total[k] = json!(list);
+    }
+}
+
+fn has_ofx_rescan(s: &Session) -> std::result::Result<(), String> {
+    if s.ofx_rescan.is_some() { Ok(()) } else { Err("OpenFX plug-ins are not available in this build".into()) }
+}
+
+/// `effect.plugins.rescanOfx`: delete the OpenFX scan cache, so that the next start loads and
+/// describes every plug-in again (after a plug-in was installed, licensed or fixed in a way its
+/// file does not show). Plug-ins are registered once per run, so this takes effect at the next start.
+fn plugins_rescan_ofx(s: &mut Session, _: &Value) -> Result<Value> {
+    let hook = s.ofx_rescan.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
+    let r = hook().map_err(EngineError::Other)?;
+    s.toast("The OpenFX scan cache was cleared: every plug-in is loaded again the next time EffectCraft starts".to_string());
+    Ok(r)
 }
 
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
@@ -794,9 +847,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Scan for OpenFX Plug-ins",
             [],
             None,
-            "{retry?} → {paths, loaded, errors, notes, transcript}: loads every OpenFX plug-in in the standard folders and OFX_PLUGIN_PATH; plug-ins that crashed the app while loading last time are skipped unless retry is true",
+            "{retry?, cache?} → {paths, loaded, errors, notes, transcript, cache, crashes}: registers every OpenFX plug-in in the standard folders and OFX_PLUGIN_PATH (binaries that did not change come from the scan cache without being loaded, unless cache is false); plug-ins that crashed the app while loading or rendering last time are skipped unless retry is true",
             has_ofx,
             plugins_scan_ofx
+        ),
+        cmd!(
+            "effect.plugins.rescanOfx",
+            "Rescan OpenFX Plug-ins",
+            [],
+            None,
+            "{} → {cleared, file, restartRequired, note}: deletes the OpenFX scan cache (ofx_cache.json in the config folder), so that the next start loads and describes every plug-in again",
+            has_ofx_rescan,
+            plugins_rescan_ofx
         ),
     ]
 }
