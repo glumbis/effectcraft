@@ -46,6 +46,11 @@ stage_extras() {
 # ---- AppImage -----------------------------------------------------------------------------------
 # EFFECTCRAFT_STAGE_EXTRA is the hook in packaging/linux/package.sh: its contents are copied next to
 # the binaries (usr/bin), and inside the AppImage the app's executable is usr/bin/effectcraft.
+# EFFECTCRAFT_APPIMAGE_UPDATE_INFO=none is another: upstream's AppImage embeds update information that
+# points at a .zsync next to its releases, and this fork never publishes one (a build run locally
+# would even point at upstream's releases). The workflow sets it too; running this script by hand
+# gets the same default.
+export EFFECTCRAFT_APPIMAGE_UPDATE_INFO="${EFFECTCRAFT_APPIMAGE_UPDATE_INFO:-none}"
 echo "==> AppImage"
 mkdir -p "$WORK/appimage-extra"
 stage_extras "$WORK/appimage-extra"

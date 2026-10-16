@@ -229,6 +229,10 @@ jobs:
           echo "== libraries the app opens at run time (dlopen), from the strings in the binary"
           strings -a target/release/effectcraft | grep -oE '\blib[A-Za-z0-9_+-]+\.so(\.[0-9]+)*' | sort -u || true
       - name: Package (tar.gz, AppImage)
+        # The fork publishes no .zsync, so its AppImage embeds no update information
+        # (packaging/linux/package.sh; upstream's own builds keep theirs).
+        env:
+          EFFECTCRAFT_APPIMAGE_UPDATE_INFO: none
         run: bash tools/fork-installer/ci/package-linux.sh "$LABEL" dist
       - name: Check the tar.gz and install.sh / uninstall.sh
         run: |

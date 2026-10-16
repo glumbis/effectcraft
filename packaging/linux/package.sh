@@ -138,12 +138,24 @@ if has appimage; then
   # pre-release. A fork's builds point at its own releases through GITHUB_REPOSITORY.
   REPO="${GITHUB_REPOSITORY:-storytold/effectcraft}"
   UPDATE_INFO="gh-releases-zsync|${REPO%%/*}|${REPO#*/}|latest|effectcraft-*-linux-$ARCH.AppImage.zsync"
+  # Fork hook (unset for upstream builds, which behave exactly as above): EFFECTCRAFT_APPIMAGE_UPDATE_INFO=none
+  # embeds no update information and writes no .zsync. A build whose releases never include a .zsync
+  # (the OFX fork's) would otherwise carry update information that points at a file that is not there.
+  # Any other non-empty value is embedded in place of the string above.
+  UPDATE_OPT=(-u "$UPDATE_INFO")
+  case "${EFFECTCRAFT_APPIMAGE_UPDATE_INFO:-}" in
+    "") ;;
+    none) UPDATE_OPT=() ;;
+    *) UPDATE_OPT=(-u "$EFFECTCRAFT_APPIMAGE_UPDATE_INFO") ;;
+  esac
   # Extract-and-run: works without FUSE (containers, CI). The output embeds the static runtime,
   # so users don't need libfuse2 either. With zsyncmake on the host (CI installs the zsync
   # package) appimagetool also writes the .zsync, into its working directory, hence the cd.
-  (cd "$DIST" && ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" --no-appstream -u "$UPDATE_INFO" "$APPDIR" "$OUT")
+  (cd "$DIST" && ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" --no-appstream ${UPDATE_OPT[@]+"${UPDATE_OPT[@]}"} "$APPDIR" "$OUT")
   echo "wrote $OUT"
-  if [ -s "$OUT.zsync" ]; then
+  if [ ${#UPDATE_OPT[@]} -eq 0 ]; then
+    echo "no update information embedded (EFFECTCRAFT_APPIMAGE_UPDATE_INFO=none), so no .zsync"
+  elif [ -s "$OUT.zsync" ]; then
     echo "wrote $OUT.zsync"
   else
     warn "zsyncmake not found, so $OUT.zsync was not written; AppImage delta updates need it"
