@@ -82,7 +82,7 @@ fn two_crashes_and_the_plugin_is_skipped(how: &str) {
     let Some(f) = Fixture::new(&format!("crash-{how}")) else { return };
     // A clean start finds nothing to report.
     let v = report(&f, "report");
-    assert_eq!((text(&v, "crashes"), v["registered"].clone(), v["loaded"].clone()), (String::new(), json!(true), json!(15)), "{v}");
+    assert_eq!((text(&v, "crashes"), v["registered"].clone(), v["loaded"].clone()), (String::new(), json!(true), json!(16)), "{v}");
 
     // First crash: the next start names the plug-in and the action, one strike, still registered.
     crash(&f, how);
@@ -95,7 +95,7 @@ fn two_crashes_and_the_plugin_is_skipped(how: &str) {
         // The unhandled exception filter saw the exception and where it happened.
         assert!(lines.contains("exception 0xC0000005") && lines.contains("cachetest.ofx"), "{lines}");
     }
-    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(15)), "{v}");
+    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(16)), "{v}");
     assert_eq!(v["in_flight_files_before_quit"], 0, "the dead process's record is removed once read: {v}");
     assert!(v["strikes"].as_str().is_some_and(|s| s.starts_with("1\t") && s.contains("org.effectcraft.test.Crash")), "{v}");
     // The next start does not report it again.
@@ -115,7 +115,7 @@ fn two_crashes_and_the_plugin_is_skipped(how: &str) {
 
     // "retry" brings it back.
     let v = report(&f, "retry");
-    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(15)), "{v}");
+    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(16)), "{v}");
     assert!(v["strikes"].is_null(), "{v}");
 }
 
@@ -159,5 +159,5 @@ fn an_updated_binary_is_tried_again() {
     assert_eq!(v["registered"], false, "{v}");
     f.touch();
     let v = report(&f, "report");
-    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(15)), "{v}");
+    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(16)), "{v}");
 }

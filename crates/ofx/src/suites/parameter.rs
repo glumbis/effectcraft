@@ -94,7 +94,7 @@ fn write_value(kind: PKind, vals: &[PVal], va: &mut VarArgs) -> OfxStatus {
         PKind::Double2D | PKind::Int2D => 2,
         PKind::Double3D | PKind::Int3D | PKind::Rgb => 3,
         PKind::Rgba => 4,
-        PKind::Bytes | PKind::Group | PKind::Page | PKind::Push => return K_STAT_ERR_UNSUPPORTED,
+        PKind::Bytes | PKind::Group | PKind::Page | PKind::Push | PKind::Parametric => return K_STAT_ERR_UNSUPPORTED,
     };
     for i in 0..n {
         let p: *mut c_void = va.next_ptr();
@@ -276,7 +276,7 @@ fn read_new_value(kind: PKind, va: &mut VarArgs) -> Option<Vec<PVal>> {
             // SAFETY: a C string from the plug-in.
             vec![PVal::text(unsafe { str_arg(p) }.unwrap_or(""))]
         }
-        PKind::Bytes | PKind::Group | PKind::Page | PKind::Push => return None,
+        PKind::Bytes | PKind::Group | PKind::Page | PKind::Push | PKind::Parametric => return None,
     })
 }
 
@@ -462,6 +462,11 @@ extern "C" fn param_copy(to: Handle, from: Handle, _offset: f64, _range: *const 
             return K_STAT_ERR_BAD_HANDLE;
         }
         a.set_values(b.values());
+        if a.kind == PKind::Parametric {
+            // The curves are a parametric parameter's value.
+            let curves = b.curves.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            *a.curves.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = curves;
+        }
         K_STAT_OK
     })
 }

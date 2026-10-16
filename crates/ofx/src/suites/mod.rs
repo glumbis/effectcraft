@@ -17,6 +17,7 @@ pub mod message;
 pub mod misc;
 pub mod multithread;
 pub mod parameter;
+pub mod parametric;
 pub mod property;
 
 /// The `OfxHost` struct plus the property set it points at.
@@ -111,6 +112,7 @@ extern "C" fn fetch_suite(_host: Handle, name: *const c_char, version: c_int) ->
         match (name, version) {
             (SUITE_PROPERTY, 1) => &property::SUITE as *const OfxPropertySuiteV1 as *const c_void,
             (SUITE_PARAMETER, 1) => &parameter::SUITE as *const OfxParameterSuiteV1 as *const c_void,
+            (SUITE_PARAMETRIC, 1) => &parametric::SUITE as *const OfxParametricParameterSuiteV1 as *const c_void,
             (SUITE_IMAGE_EFFECT, 1) => &image_effect::SUITE as *const OfxImageEffectSuiteV1 as *const c_void,
             (SUITE_MEMORY, 1) => &memory::SUITE as *const OfxMemorySuiteV1 as *const c_void,
             (SUITE_MULTI_THREAD, 1) => &multithread::SUITE as *const OfxMultiThreadSuiteV1 as *const c_void,

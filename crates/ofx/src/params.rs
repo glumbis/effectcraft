@@ -14,8 +14,9 @@
 //! to Angle. Position values (double type XY or XY absolute) map to Point (2D) or Point3 (3D),
 //! converted between buffer pixels and OFX canonical y-up coordinates for absolute ones. Every
 //! other 2D/3D value (Plain included) maps to one slider per component named `<id>_x`, `_y`,
-//! `_z`. Groups and pages become the `group` path; push buttons, bytes and secret numeric
-//! parameters are not exposed (the plug-in keeps their default).
+//! `_z`. Groups and pages become the `group` path; push buttons, bytes, parametric curves and
+//! secret numeric parameters are not exposed (the plug-in keeps their default; a parametric
+//! parameter keeps the control points the plug-in described, see [`crate::curve`]).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -24,6 +25,7 @@ use std::sync::{Mutex, PoisonError};
 use effectcraft_effects::plugin::{PluginParam, PluginParamKind};
 use serde::{Deserialize, Serialize};
 
+use crate::curve::Curve;
 use crate::diag::PropKind;
 use crate::ffi::*;
 use crate::instance::EffectObj;
@@ -56,6 +58,8 @@ pub enum PKind {
     Group,
     Page,
     Push,
+    /// `OfxParamTypeParametric`: curves the plug-in evaluates through the parametric suite.
+    Parametric,
 }
 
 impl PKind {
@@ -78,6 +82,7 @@ impl PKind {
             PT_GROUP => PKind::Group,
             PT_PAGE => PKind::Page,
             PT_PUSH_BUTTON => PKind::Push,
+            PT_PARAMETRIC => PKind::Parametric,
             _ => return None,
         })
     }
@@ -101,12 +106,13 @@ impl PKind {
             PKind::Group => PT_GROUP,
             PKind::Page => PT_PAGE,
             PKind::Push => PT_PUSH_BUTTON,
+            PKind::Parametric => PT_PARAMETRIC,
         }
     }
 
     /// Whether the parameter carries a value.
     pub fn has_value(self) -> bool {
-        !matches!(self, PKind::Group | PKind::Page | PKind::Push | PKind::Bytes)
+        !matches!(self, PKind::Group | PKind::Page | PKind::Push | PKind::Bytes | PKind::Parametric)
     }
 }
 
@@ -118,6 +124,9 @@ pub struct ParamObj {
     pub name: String,
     pub props: PropSet,
     pub value: Mutex<Vec<PVal>>,
+    /// The control points of a parametric parameter, one curve per dimension (empty for every
+    /// other kind). A descriptor's curves are the plug-in's defaults; instances start as copies.
+    pub curves: Mutex<Vec<Curve>>,
     /// The effect (descriptor or instance) this parameter belongs to.
     pub owner: *const EffectObj,
 }
@@ -181,7 +190,7 @@ impl ParamSet {
         let props = PropSet::with_kind(PropKind::Param);
         init_props(kind, name, &props, instance);
         let value = Mutex::new(initial_value(kind, &props));
-        let p = Box::new(ParamObj { magic: PARAM_MAGIC, kind, name: name.to_string(), props, value, owner });
+        let p = Box::new(ParamObj { magic: PARAM_MAGIC, kind, name: name.to_string(), props, value, curves: Mutex::new(Vec::new()), owner });
         let ptr: *const ParamObj = &*p;
         items.push(p);
         Ok(ptr)
@@ -210,14 +219,15 @@ impl ParamSet {
     }
 
     /// Copy this descriptor set into `dst` as instance parameters: same definitions, values
-    /// reset to the defaults.
+    /// reset to the defaults (parametric curves are copied: they are the plug-in's defaults).
     pub fn instantiate_into(&self, dst: &ParamSet, owner: *const EffectObj) {
         let mut out = dst.lock();
         for p in self.lock().iter() {
             let props = p.props.clone();
             props.put_str(P_TYPE, TYPE_PARAMETER_INSTANCE);
             let value = Mutex::new(initial_value(p.kind, &props));
-            out.push(Box::new(ParamObj { magic: PARAM_MAGIC, kind: p.kind, name: p.name.clone(), props, value, owner }));
+            let curves = Mutex::new(p.curves.lock().unwrap_or_else(PoisonError::into_inner).clone());
+            out.push(Box::new(ParamObj { magic: PARAM_MAGIC, kind: p.kind, name: p.name.clone(), props, value, curves, owner }));
         }
     }
 }
@@ -299,6 +309,15 @@ fn init_props(kind: PKind, name: &str, props: &PropSet, instance: bool) {
         }
         PKind::Group => props.put_int(PP_GROUP_OPEN, 1),
         PKind::Page => props.put(PP_PAGE_CHILD, vec![]),
+        PKind::Parametric => {
+            // One curve, over [0, 1], drawn white, with no background interact; the plug-in sets
+            // what differs. The host does not animate these (`OfxParamHostPropSupportsParametricAnimation` is 0).
+            props.put_int(PP_PARAMETRIC_DIMENSION, 1);
+            props.put_doubles(PP_PARAMETRIC_RANGE, &[0.0, 1.0]);
+            props.put_doubles(PP_PARAMETRIC_UI_COLOUR, &[1.0, 1.0, 1.0]);
+            props.put_ptr(PP_PARAMETRIC_INTERACT_BACKGROUND, 0);
+            props.put_int(PP_ANIMATES, 0);
+        }
         PKind::Bytes | PKind::Push => {}
     }
 }
@@ -317,7 +336,7 @@ pub fn initial_value(kind: PKind, props: &PropSet) -> Vec<PVal> {
         PKind::Int2D => ints(2),
         PKind::Int3D => ints(3),
         PKind::Str | PKind::Custom | PKind::StrChoice => vec![PVal::text(&d.first().and_then(as_string).unwrap_or_default())],
-        PKind::Bytes | PKind::Group | PKind::Page | PKind::Push => vec![],
+        PKind::Bytes | PKind::Group | PKind::Page | PKind::Push | PKind::Parametric => vec![],
     }
 }
 
@@ -697,7 +716,7 @@ pub fn map_params(set: &ParamSet, page_order: &[String], layer_clips: &[String])
                 bindings.items.push(Binding { name: p.name.clone(), kind: p.kind, src: Src::Text { at: texts }, choices: vec![] });
                 texts += 1;
             }
-            PKind::Bytes | PKind::Group | PKind::Page | PKind::Push => {}
+            PKind::Bytes | PKind::Group | PKind::Page | PKind::Push | PKind::Parametric => {}
         }
     }
     Mapped { params, bindings }

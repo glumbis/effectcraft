@@ -142,6 +142,7 @@ fn all_effects_register() {
         ("org.effectcraft.test.Crash", "filter"),
         ("org.effectcraft.test.ProbeSlow", "filter"),
         ("org.effectcraft.test.Memory", "filter"),
+        ("org.effectcraft.test.Parametric", "filter"),
     ] {
         let e = r.loaded.iter().find(|e| e.ofx_id == ofx_id).unwrap_or_else(|| panic!("{ofx_id} missing from {:?}", r.loaded));
         assert_eq!(e.id, ofx_id.to_lowercase(), "effect id");
@@ -329,4 +330,36 @@ fn mix_uses_the_matte_layer() {
     // Without a matte layer the source passes through.
     let (.., out) = run(&*p, w, h, &src, &[], &FakeHost::default());
     assert!(out.iter().all(|g| close(*g, [1.0; 4])));
+}
+
+/// A plug-in that defines a parametric parameter (`OfxParamTypeParametric`) describes and renders:
+/// the type is accepted (the Support library throws out of `DescribeInContext` when it is not), the
+/// control points it adds to the descriptor's parameter are what its instances read back through
+/// `OfxParametricParameterSuite` at render, and EffectCraft shows no control for the curves (it has no
+/// curve editor, so they keep the plug-in's defaults). The plug-in paints what it read into the first
+/// four pixels of the bottom row (see `parametric_render` in the test plug-in).
+#[test]
+fn parametric_parameters_are_described_and_read_back_at_render() {
+    let Some(p) = effect("org.effectcraft.test.Parametric") else { return };
+    // No curve in Effect Controls, and nothing for a project to save for it.
+    assert!(p.manifest().params.is_empty(), "{:?}", p.manifest().params);
+    let (w, h) = (4u32, 3u32);
+    let px = vec![[0.5, 0.5, 0.5, 1.0]; (w * h) as usize];
+    let (fw, fh, _, out) = run(&*p, w, h, &px, &[], &FakeHost::default());
+    let at = |i: u32| out[((fh - 1) * fw + i) as usize];
+    let want = |a: Px, b: Px| assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5), "got {a:?}, want {b:?}");
+    // Curve 0 (0,0.2) (0.5,0.8) (1,0.4), added out of order with one replaced point: piecewise
+    // linear between points, held after the last. Curve 1 has no points: the identity.
+    want(at(0), [0.5, 0.6, 0.3, 0.4]);
+    // Three control points on curve 0, none on curve 1; the second one is (0.5, 0.8).
+    want(at(1), [3.0, 0.0, 0.5, 0.8]);
+    // Curve 2, curve -1 and point 3 do not exist (kOfxStatErrBadIndex is 10); the host does not
+    // animate parametric parameters.
+    want(at(2), [10.0, 10.0, 10.0, 0.0]);
+    // The default range, one dimension of two curves; a point added while rendering is seen at once
+    // (a single point is a constant) and was deleted again.
+    want(at(3), [0.0, 1.0, 2.0, 0.5]);
+    // A second render sees the curves as described, not as the first render left them.
+    let (fw, fh, _, again) = run(&*p, w, h, &px, &[], &FakeHost::default());
+    assert_eq!(again[((fh - 1) * fw + 1) as usize][..2], [3.0, 0.0]);
 }

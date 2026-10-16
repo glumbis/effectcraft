@@ -1,4 +1,4 @@
-//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports fifteen effects:
+//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports sixteen effects:
 //!
 //! * `org.effectcraft.test.Invert`: filter, inverts the colours (double param `amount`);
 //! * `org.effectcraft.test.Echo`: filter, averages Source at `t` and `t - 1` (temporal access);
@@ -30,6 +30,9 @@
 //!   has sent `kOfxActionPurgeCaches` it renders, and it paints how many renders and purges it saw;
 //! * `org.effectcraft.test.Crash`: passes the image through, but crashes the process in Render when
 //!   the environment variable `EC_TEST_OFX_CRASH` is `segv` (a null write) or `abort`.
+//! * `org.effectcraft.test.Parametric`: defines a two-curve parametric parameter with default control
+//!   points while it describes itself, and at render reads them back through the parametric suite and
+//!   paints what it saw into the first four pixels of the bottom row (see `parametric_render`).
 //!
 //! With the environment variable `EC_TEST_OFX_LOG` set to a file, the probes append a line for
 //! each `BeginSequenceRender`, `EndSequenceRender`, `DestroyInstance` and every plug-in a line for
@@ -70,8 +73,9 @@ const PROBE_SINGLE: usize = 13;
 const CRASH: usize = 14;
 const PROBE_SLOW: usize = 15;
 const MEMORY: usize = 16;
+const PARAMETRIC: usize = 17;
 
-const LABELS: [&CStr; 17] = [
+const LABELS: [&CStr; 18] = [
     c"EC Test Invert",
     c"EC Test Echo",
     c"EC Test Border",
@@ -89,6 +93,7 @@ const LABELS: [&CStr; 17] = [
     c"EC Test Crash",
     c"EC Test Probe Slow",
     c"EC Test Memory",
+    c"EC Test Parametric",
 ];
 
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(null_mut());
@@ -143,7 +148,7 @@ macro_rules! plug {
     };
 }
 
-static PLUGINS: [Plug; 15] = [
+static PLUGINS: [Plug; 16] = [
     plug!(c"org.effectcraft.test.Invert", INVERT),
     plug!(c"org.effectcraft.test.Echo", ECHO),
     plug!(c"org.effectcraft.test.Border", BORDER),
@@ -159,6 +164,7 @@ static PLUGINS: [Plug; 15] = [
     plug!(c"org.effectcraft.test.Crash", CRASH),
     plug!(c"org.effectcraft.test.ProbeSlow", PROBE_SLOW),
     plug!(c"org.effectcraft.test.Memory", MEMORY),
+    plug!(c"org.effectcraft.test.Parametric", PARAMETRIC),
 ];
 
 /// What `EC_TEST_OFX_MODE=extras` exports instead of [`PLUGINS`].
@@ -377,6 +383,12 @@ unsafe fn describe_in_context(k: usize, effect: Effect, in_args: Props) -> Statu
                 s.set_int(p, c"OfxParamPropMax", 0, 256);
             }
             ALL_PARAMS => describe_all_params(set),
+            PARAMETRIC => {
+                let status = describe_parametric(set);
+                if status != OK {
+                    return status;
+                }
+            }
             CONTEXT_FALLBACK => {
                 if context == "OfxImageEffectContextFilter" {
                     // Fails after defining a parameter: the host must not keep it for the General
@@ -431,6 +443,43 @@ unsafe fn describe_support_lib_params(set: ParamSet) -> Result<(), Status> {
         append_str(set_props, c"OfxPluginPropParamPageOrder", c"pageA")?;
     }
     Ok(())
+}
+
+/// A two-curve parametric parameter, described the way the Support library does it: the dimension
+/// and colours are properties, the control points go through the suite on the descriptor's parameter
+/// handle (fetched with `paramGetHandle`). Curve 0 gets four points added out of order (the last one
+/// is at the key of an earlier one and replaces it); curve 1 gets none, so it stays the identity.
+/// Any failing status fails the description, as the Support library's exceptions would.
+unsafe fn describe_parametric(set: ParamSet) -> Status {
+    let s = suites();
+    let Some(ps) = s.parametric else { return ERR_MISSING_HOST_FEATURE };
+    unsafe {
+        let mut props = null_mut();
+        let st = (s.param.define)(set, c"OfxParamTypeParametric".as_ptr(), c"curve".as_ptr(), &mut props);
+        if st != OK {
+            return st;
+        }
+        s.set_str(props, c"OfxPropLabel", 0, c"Curve");
+        s.set_int(props, c"OfxParamPropParametricDimension", 0, 2);
+        // Red for the first curve, green for the second (three numbers per curve).
+        for (i, v) in [1.0, 0.0, 0.0, 0.0, 1.0, 0.0].into_iter().enumerate() {
+            s.set_dbl(props, c"OfxParamPropParametricUIColour", i as c_int, v);
+        }
+        // The range stays at its default, [0, 1]; no background interact.
+        s.set_ptr(props, c"OfxParamPropParametricInteractBackground", 0, null_mut());
+        let mut handle = null_mut();
+        let st = (s.param.get_handle)(set, c"curve".as_ptr(), &mut handle, null_mut());
+        if st != OK {
+            return st;
+        }
+        for (key, value) in [(1.0, 0.4), (0.0, 0.2), (0.5, 0.9), (0.5, 0.8)] {
+            let st = (ps.add_control_point)(handle, 0, 0.0, key, value, false);
+            if st != OK {
+                return st;
+            }
+        }
+    }
+    OK
 }
 
 /// One parameter of every OFX type, plus a group (with a child) and a page listing them all.
@@ -760,6 +809,59 @@ unsafe fn probe_render(k: usize, effect: Effect, in_args: Props, out: &Img) -> S
     OK
 }
 
+/// The Parametric effect: reads its curves back through the suite and paints, into the first four
+/// pixels of the output's bottom row,
+///
+/// 1. `[curve 0 at 0.25, curve 0 at 0.75, curve 1 at 0.3, curve 0 at 2.0]`,
+/// 2. `[control points of curve 0, of curve 1, key and value of curve 0's second point]`,
+/// 3. `[status of a value on curve 2, of a count on curve -1, of the fourth point of curve 0, the host's
+///    OfxParamHostPropSupportsParametricAnimation]`,
+/// 4. `[range min, range max, dimension, curve 1 at 0.3 while a point at (1, 0.5) is added to it]`
+///    (the point is deleted again, so the next render sees the curve as it was described).
+unsafe fn parametric_render(effect: Effect, out: &Img) -> Status {
+    let s = suites();
+    let Some(ps) = s.parametric else { return ERR_MISSING_HOST_FEATURE };
+    unsafe {
+        let (mut set, mut handle, mut props) = (null_mut(), null_mut(), null_mut());
+        (s.fx.get_param_set)(effect, &mut set);
+        if (s.param.get_handle)(set, c"curve".as_ptr(), &mut handle, &mut props) != OK {
+            return FAILED;
+        }
+        let value = |curve: c_int, x: f64| {
+            let mut v = f64::NAN;
+            let st = (ps.get_value)(handle, curve, 0.0, x, &mut v);
+            (st, v as f32)
+        };
+        let count = |curve: c_int| {
+            let mut n = -1;
+            let st = (ps.get_n_control_points)(handle, curve, 0.0, &mut n);
+            (st, n as f32)
+        };
+        let nth = |curve: c_int, n: c_int| {
+            let (mut k, mut v) = (f64::NAN, f64::NAN);
+            let st = (ps.get_nth_control_point)(handle, curve, 0.0, n, &mut k, &mut v);
+            (st, k as f32, v as f32)
+        };
+        let host = HOST.load(Ordering::SeqCst).as_ref().map_or(null_mut(), |h| h.host);
+        let animation = s.get_int(host, c"OfxParamHostPropSupportsParametricAnimation", 0).unwrap_or(-1);
+        let (_, second_key, second_value) = nth(0, 1);
+        let range = [s.get_dbl(props, c"OfxParamPropParametricRange", 0).unwrap_or(-1.0), s.get_dbl(props, c"OfxParamPropParametricRange", 1).unwrap_or(-1.0)];
+        let dimension = s.get_int(props, c"OfxParamPropParametricDimension", 0).unwrap_or(-1);
+        let first = [value(0, 0.25).1, value(0, 0.75).1, value(1, 0.3).1, value(0, 2.0).1];
+        let second = [count(0).1, count(1).1, second_key, second_value];
+        let third = [value(2, 0.5).0 as f32, count(-1).0 as f32, nth(0, 3).0 as f32, animation as f32];
+        // An edit while rendering, undone straight away.
+        let _ = (ps.add_control_point)(handle, 1, 0.0, 1.0, 0.5, false);
+        let edited = value(1, 0.3).1;
+        let _ = (ps.delete_all_control_points)(handle, 1);
+        let fourth = [range[0] as f32, range[1] as f32, dimension as f32, edited];
+        for (i, v) in [first, second, third, fourth].into_iter().enumerate() {
+            out.set(out.bounds[0] + i as i32, out.bounds[1], v);
+        }
+    }
+    OK
+}
+
 /// What the Memory effect's instance counts.
 struct MemoryData {
     renders: u32,
@@ -857,6 +959,9 @@ unsafe fn render(k: usize, effect: Effect, in_args: Props) -> Status {
         }
         if k == MEMORY {
             return memory_render(effect, &out);
+        }
+        if k == PARAMETRIC {
+            return parametric_render(effect, &out);
         }
         if k == CRASH {
             crash_if_asked();

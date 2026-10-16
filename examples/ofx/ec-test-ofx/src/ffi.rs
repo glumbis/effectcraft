@@ -75,6 +75,18 @@ pub struct ParameterSuite {
     _rest: [*const c_void; 12],
 }
 
+/// `OfxParametricParameterSuiteV1` (`ofxParametricParam.h`); `bool` as in the header.
+#[repr(C)]
+pub struct ParametricSuite {
+    pub get_value: unsafe extern "C" fn(Param, c_int, c_double, c_double, *mut c_double) -> Status,
+    pub get_n_control_points: unsafe extern "C" fn(Param, c_int, c_double, *mut c_int) -> Status,
+    pub get_nth_control_point: unsafe extern "C" fn(Param, c_int, c_double, c_int, *mut c_double, *mut c_double) -> Status,
+    pub set_nth_control_point: unsafe extern "C" fn(Param, c_int, c_double, c_int, c_double, c_double, bool) -> Status,
+    pub add_control_point: unsafe extern "C" fn(Param, c_int, c_double, c_double, c_double, bool) -> Status,
+    pub delete_control_point: unsafe extern "C" fn(Param, c_int, c_int) -> Status,
+    pub delete_all_control_points: unsafe extern "C" fn(Param, c_int) -> Status,
+}
+
 #[repr(C)]
 pub struct ImageEffectSuite {
     pub get_property_set: unsafe extern "C" fn(Effect, *mut Props) -> Status,
@@ -101,6 +113,8 @@ pub struct Suites {
     pub fx: &'static ImageEffectSuite,
     /// Optional, as in the Support library.
     pub msg: Option<&'static MessageSuite>,
+    /// Optional, as in the Support library: only plug-ins with parametric parameters need it.
+    pub parametric: Option<&'static ParametricSuite>,
 }
 
 impl Suites {
@@ -115,6 +129,7 @@ impl Suites {
                 param: (get(c"OfxParameterSuite") as *const ParameterSuite).as_ref()?,
                 fx: (get(c"OfxImageEffectSuite") as *const ImageEffectSuite).as_ref()?,
                 msg: (get(c"OfxMessageSuite") as *const MessageSuite).as_ref(),
+                parametric: (get(c"OfxParametricParameterSuite") as *const ParametricSuite).as_ref(),
             })
         }
     }

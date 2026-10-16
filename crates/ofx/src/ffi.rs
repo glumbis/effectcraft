@@ -2,7 +2,7 @@
 //!
 //! Transcribed by hand from the OpenFX 1.4/1.5 public headers (`ofxCore.h`, `ofxProperty.h`,
 //! `ofxParam.h`, `ofxImageEffect.h`, `ofxMemory.h`, `ofxMultiThread.h`, `ofxMessage.h`,
-//! `ofxInteract.h`, `ofxProgress.h`, `ofxTimeLine.h`, `ofxPixels.h`), which are
+//! `ofxInteract.h`, `ofxProgress.h`, `ofxTimeLine.h`, `ofxPixels.h`, `ofxParametricParam.h`), which are
 //! Copyright OpenFX and contributors to the OpenFX project, licensed BSD-3-Clause
 //! (<https://github.com/AcademySoftwareFoundation/openfx>). Only the interface (names, layouts and
 //! numbers the specification fixes) is reproduced; no host implementation code is copied from
@@ -194,6 +194,28 @@ pub struct OfxParameterSuiteV1 {
     pub param_copy: extern "C" fn(Handle, Handle, f64, *const OfxRangeD) -> OfxStatus,
     pub param_edit_begin: extern "C" fn(Handle, *const c_char) -> OfxStatus,
     pub param_edit_end: extern "C" fn(Handle) -> OfxStatus,
+}
+
+/// `OfxParametricParameterSuiteV1` (`ofxParametricParam.h`). None of its functions is variadic, so
+/// the declarations are the plain C ones. The header's `bool addAnimationKey` is a `u8` here: the
+/// value is ignored (this host does not animate parametric parameters), and a byte that is not 0
+/// or 1 must not be an invalid Rust `bool`.
+#[repr(C)]
+pub struct OfxParametricParameterSuiteV1 {
+    /// `parametricParamGetValue(param, curveIndex, time, parametricPosition, *returnValue)`.
+    pub get_value: extern "C" fn(Handle, c_int, f64, f64, *mut f64) -> OfxStatus,
+    /// `parametricParamGetNControlPoints(param, curveIndex, time, *returnValue)`.
+    pub get_n_control_points: extern "C" fn(Handle, c_int, f64, *mut c_int) -> OfxStatus,
+    /// `parametricParamGetNthControlPoint(param, curveIndex, time, nthCtl, *key, *value)`.
+    pub get_nth_control_point: extern "C" fn(Handle, c_int, f64, c_int, *mut f64, *mut f64) -> OfxStatus,
+    /// `parametricParamSetNthControlPoint(param, curveIndex, time, nthCtl, key, value, addAnimationKey)`.
+    pub set_nth_control_point: extern "C" fn(Handle, c_int, f64, c_int, f64, f64, u8) -> OfxStatus,
+    /// `parametricParamAddControlPoint(param, curveIndex, time, key, value, addAnimationKey)`.
+    pub add_control_point: extern "C" fn(Handle, c_int, f64, f64, f64, u8) -> OfxStatus,
+    /// `parametricParamDeleteControlPoint(param, curveIndex, nthCtl)`.
+    pub delete_control_point: extern "C" fn(Handle, c_int, c_int) -> OfxStatus,
+    /// `parametricParamDeleteAllControlPoints(param, curveIndex)`.
+    pub delete_all_control_points: extern "C" fn(Handle, c_int) -> OfxStatus,
 }
 
 /// `OfxImageEffectSuiteV1`.
@@ -428,6 +450,7 @@ pub const SUITE_MESSAGE: &str = "OfxMessageSuite";
 pub const SUITE_INTERACT: &str = "OfxInteractSuite";
 pub const SUITE_PROGRESS: &str = "OfxProgressSuite";
 pub const SUITE_TIMELINE: &str = "OfxTimeLineSuite";
+pub const SUITE_PARAMETRIC: &str = "OfxParametricParameterSuite";
 
 // Core properties.
 pub const P_API_VERSION: &str = "OfxPropAPIVersion";
@@ -589,6 +612,7 @@ pub const PT_BYTES: &str = "OfxParamTypeBytes";
 pub const PT_GROUP: &str = "OfxParamTypeGroup";
 pub const PT_PAGE: &str = "OfxParamTypePage";
 pub const PT_PUSH_BUTTON: &str = "OfxParamTypePushButton";
+pub const PT_PARAMETRIC: &str = "OfxParamTypeParametric";
 
 // Parameter properties.
 pub const PP_TYPE: &str = "OfxParamPropType";
@@ -622,6 +646,10 @@ pub const PP_DIGITS: &str = "OfxParamPropDigits";
 pub const PP_DIMENSION_LABEL: &str = "OfxParamPropDimensionLabel";
 pub const PP_STRING_MODE: &str = "OfxParamPropStringMode";
 pub const PP_STRING_FILE_PATH_EXISTS: &str = "OfxParamPropStringFilePathExists";
+pub const PP_PARAMETRIC_DIMENSION: &str = "OfxParamPropParametricDimension";
+pub const PP_PARAMETRIC_UI_COLOUR: &str = "OfxParamPropParametricUIColour";
+pub const PP_PARAMETRIC_INTERACT_BACKGROUND: &str = "OfxParamPropParametricInteractBackground";
+pub const PP_PARAMETRIC_RANGE: &str = "OfxParamPropParametricRange";
 pub const DOUBLE_TYPE_PLAIN: &str = "OfxParamDoubleTypePlain";
 pub const DOUBLE_TYPE_ANGLE: &str = "OfxParamDoubleTypeAngle";
 pub const DOUBLE_TYPE_XY: &str = "OfxParamDoubleTypeXY";

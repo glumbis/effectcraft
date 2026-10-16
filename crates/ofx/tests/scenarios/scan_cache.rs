@@ -15,7 +15,7 @@ use effectcraft_ofx::{library_loads, load_path_with};
 use serde_json::{Value, json};
 
 /// The effects the test bundle registers.
-const EFFECTS: usize = 15;
+const EFFECTS: usize = 16;
 
 /// The child process: one start-up of EffectCraft's OpenFX host. A normal run of this test binary
 /// does nothing here.
@@ -81,7 +81,9 @@ fn a_warm_start_registers_from_the_cache_without_loading_any_library() {
     assert!(lines(&cold, "lines").contains("not in the scan cache yet"), "{cold}");
     let text = f.cache_text();
     assert!(
-        text.contains("\"format\":1") && text.contains("org.effectcraft.test.Invert") && text.contains("\"host\":\"EffectCraft\""),
+        text.contains(&format!("\"format\":{}", effectcraft_ofx::cache::FORMAT))
+            && text.contains("org.effectcraft.test.Invert")
+            && text.contains("\"host\":\"EffectCraft\""),
         "{}",
         &text[..text.len().min(300)]
     );

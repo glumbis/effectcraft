@@ -37,8 +37,10 @@ use crate::params::Bindings;
 
 /// The cache file inside the config folder.
 pub const FILE: &str = "ofx_cache.json";
-/// Bumped whenever the stored shape changes (an older file is then ignored and rebuilt).
-pub const FORMAT: u32 = 1;
+/// Bumped whenever the stored shape changes, or the host starts to accept something it refused
+/// (an older file is then ignored and rebuilt; a plug-in cached as a failure may work now). 2: the
+/// parametric parameter type and the half-float pixel depth.
+pub const FORMAT: u32 = 2;
 /// The largest entry (one binary) that is cached; a larger description is scanned every start.
 const MAX_ENTRY_BYTES: usize = 24 << 20;
 /// The largest cache file that is read or written.

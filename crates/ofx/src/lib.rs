@@ -14,7 +14,7 @@
 //! crate is empty.
 //!
 //! Modules: [`ffi`] (the C ABI), [`props`] (property sets), [`params`] (parameter storage and the
-//! mapping to EffectCraft parameters), [`clips`] (clips, images and pixel conversion),
+//! mapping to EffectCraft parameters), [`curve`] (the curves of parametric parameters), [`clips`] (clips, images and pixel conversion),
 //! [`instance`] (effect handles, geometry, per-render context, actions), [`effect`] (the
 //! `EffectPlugin` implementation), [`suites`] (the host suites), [`loader`] (bundle discovery
 //! and registration), [`blocklist`] (skips plug-ins that crashed the app while loading),
@@ -28,6 +28,7 @@
 pub mod blocklist;
 pub mod cache;
 pub mod clips;
+pub mod curve;
 pub mod diag;
 pub mod effect;
 pub mod ffi;
