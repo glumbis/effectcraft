@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(value(h, 1, 0.75), Ok(0.75));
         // Editing: move a point past its neighbour, delete one, delete all.
         assert_eq!((SUITE.set_nth_control_point)(h, 0, 0.0, 0, 0.9, 0.0, 1), K_STAT_OK);
-        assert_eq!((nth(h, 0, 0), nth(h, 0, 2)), (Ok((0.5, 0.8)), Ok((0.9, 0.0))));
+        assert_eq!((nth(h, 0, 0), nth(h, 0, 1), nth(h, 0, 2)), (Ok((0.5, 0.8)), Ok((0.9, 0.0)), Ok((1.0, 0.4))));
         assert_eq!((SUITE.delete_control_point)(h, 0, 1), K_STAT_OK);
         assert_eq!(count(h, 0), Ok(2));
         assert_eq!((SUITE.delete_all_control_points)(h, 0), K_STAT_OK);

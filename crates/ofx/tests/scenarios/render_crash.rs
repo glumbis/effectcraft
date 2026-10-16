@@ -106,7 +106,7 @@ fn two_crashes_and_the_plugin_is_skipped(how: &str) {
     let v = report(&f, "report");
     let lines = text(&v, "crashes");
     assert!(lines.contains("crashed EffectCraft 2 times in a row and is skipped from now on") && lines.contains("ofx_render_crashes.txt"), "{lines}");
-    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(false), json!(14)), "{v}");
+    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(false), json!(15)), "{v}");
     assert!(text(&v, "errors").contains("org.effectcraft.test.Crash: skipped: it crashed EffectCraft while rendering 2 times in a row"), "{v}");
     // Still skipped later, with nothing new to report.
     let v = report(&f, "report");
