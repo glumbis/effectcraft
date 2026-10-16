@@ -16,14 +16,22 @@
 //! `paramGetValue`, `paramSetValue`, `paramGetValueAtTime`, `paramSetValueAtTime`,
 //! `paramGetDerivative`, `paramGetIntegral` and the message suite's printf-style functions are C
 //! variadic, and stable Rust cannot *define* a variadic function. They are declared here as
-//! ordinary functions that read the argument slots the C caller filled: on Windows x64 every
-//! variadic argument occupies one 8-byte slot (doubles are duplicated into the integer
-//! register), on the System V ABIs (Linux, macOS x86-64) integers and doubles are taken from
-//! separate register files. Both are modelled by [`VarArgs`]. Apple Silicon passes variadic
-//! arguments on the stack, which this does not model, so the parameter suite is not available
-//! there. The message functions are declared with extra slots too ([`VarMessageFn`]) and the host
-//! expands the common printf conversions itself; on Apple Silicon they only read their fixed
-//! arguments (the format string is logged with its conversions unexpanded).
+//! ordinary functions that read the argument slots the C caller filled, which depends on the ABI:
+//!
+//! * Windows x64: every variadic argument occupies one 8-byte slot (doubles are duplicated into
+//!   the integer register).
+//! * System V (Linux and macOS x86-64) and AAPCS64 outside Apple (Linux arm64): variadic
+//!   arguments are passed like any others, integers and doubles from separate register files.
+//! * Apple arm64 (macOS and iOS on Apple Silicon): the *named* arguments use registers as usual
+//!   but **every variadic argument is passed on the stack, in its own 8-byte slot** (Apple,
+//!   "Writing ARM64 code for Apple platforms": Apple's variadic convention deviates from AAPCS64
+//!   by passing them on the stack). A non-variadic declaration that reads the stack slots takes
+//!   the unused integer argument registers as dummy parameters (x1..x7 for a function with only
+//!   the handle named, x4..x7 after the four named arguments of the message functions) and then
+//!   one `u64` per slot, a double as its bit pattern. That is the same slot model as Windows.
+//!
+//! The models are [`VarArgs`]. The message functions are declared with extra slots too
+//! ([`VarMessageFn`]) and the host expands the common printf conversions itself.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -129,16 +137,25 @@ pub struct OfxPropertySuiteV1 {
 #[cfg(windows)]
 pub type VarParamFn = extern "C" fn(Handle, u64, u64, u64, u64, u64, u64) -> OfxStatus;
 /// The shape every variadic parameter-suite function is declared with (see the module docs).
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
 pub type VarParamFn = extern "C" fn(Handle, u64, u64, u64, u64, u64, f64, f64, f64, f64, f64) -> OfxStatus;
+/// The shape every variadic parameter-suite function is declared with (see the module docs).
+/// Apple arm64: x1..x7 are dummies, then the stack slots of the variadic arguments (six are
+/// enough for the four pointers or values of an RGBA parameter).
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+pub type VarParamFn = extern "C" fn(Handle, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> OfxStatus;
 /// [`VarParamFn`] for the functions taking a fixed `OfxTime` first: on Windows x64 that double
 /// arrives only in its XMM register, so it must be declared as one.
 #[cfg(windows)]
 pub type VarParamTimeFn = extern "C" fn(Handle, f64, u64, u64, u64, u64, u64) -> OfxStatus;
 /// [`VarParamFn`] for the functions taking a fixed `OfxTime` first (System V reads it from the
 /// first float register already).
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
 pub type VarParamTimeFn = VarParamFn;
+/// [`VarParamFn`] for the functions taking a fixed `OfxTime` first. Apple arm64: the named double
+/// is in d0, x1..x7 are dummies, then the variadic stack slots.
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+pub type VarParamTimeFn = extern "C" fn(Handle, f64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> OfxStatus;
 /// [`VarParamFn`] for `paramGetIntegral`, which has two fixed `OfxTime`s (`time1`, `time2`) before
 /// the variadic out-pointers. On Windows x64 argument positions are fixed: `time1` is the second
 /// argument (XMM1), `time2` the third (XMM2) and the first out-pointer the fourth (R9), the rest on
@@ -149,8 +166,12 @@ pub type VarParamTime2Fn = extern "C" fn(Handle, f64, f64, u64, u64, u64, u64) -
 /// [`VarParamFn`] for `paramGetIntegral` (System V passes the two fixed doubles in the first two
 /// float registers, exactly where [`VarParamFn`]'s `f1`, `f2` are read, and the out-pointers in
 /// the integer registers after the handle).
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
 pub type VarParamTime2Fn = VarParamFn;
+/// [`VarParamFn`] for `paramGetIntegral`. Apple arm64: the two named doubles are in d0 and d1,
+/// x1..x7 are dummies, then the stack slots of the (up to four) out-pointers.
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+pub type VarParamTime2Fn = extern "C" fn(Handle, f64, f64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> OfxStatus;
 
 /// `OfxParameterSuiteV1`.
 #[repr(C)]
@@ -228,10 +249,12 @@ pub type VarMessageFn = extern "C" fn(Handle, *const c_char, *const c_char, *con
 #[cfg(all(not(windows), not(all(target_vendor = "apple", target_arch = "aarch64"))))]
 pub type VarMessageFn =
     extern "C" fn(Handle, *const c_char, *const c_char, *const c_char, u64, u64, u64, u64, u64, u64, f64, f64, f64, f64, f64, f64, f64, f64) -> OfxStatus;
-/// The shape of the printf-style message functions. Apple Silicon passes variadic arguments on the
-/// stack in a way the fixed-slot trick does not model, so only the fixed arguments are declared.
+/// The shape of the printf-style message functions. Apple arm64: x4..x7 are dummies after the four
+/// named arguments, then eight 8-byte stack slots for the variadic arguments (doubles as their
+/// bit pattern).
 #[cfg(all(not(windows), target_vendor = "apple", target_arch = "aarch64"))]
-pub type VarMessageFn = extern "C" fn(Handle, *const c_char, *const c_char, *const c_char) -> OfxStatus;
+pub type VarMessageFn =
+    extern "C" fn(Handle, *const c_char, *const c_char, *const c_char, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> OfxStatus;
 
 /// `OfxMessageSuiteV1`. The printf arguments are read from the declared slots (see
 /// [`VarMessageFn`]).
@@ -307,40 +330,42 @@ pub unsafe fn str_arg<'a>(p: *const c_char) -> Option<&'a str> {
 
 /// The variadic arguments of a suite function, as captured from the declared slots.
 pub struct VarArgs {
-    #[cfg(windows)]
+    #[cfg(any(windows, all(target_vendor = "apple", target_arch = "aarch64")))]
     slots: [u64; 6],
-    #[cfg(windows)]
+    #[cfg(any(windows, all(target_vendor = "apple", target_arch = "aarch64")))]
     next: usize,
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
     ints: [u64; 5],
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
     floats: [f64; 5],
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
     ni: usize,
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
     nf: usize,
 }
 
 impl VarArgs {
-    /// Windows x64: one slot per argument, integers and doubles alike.
-    #[cfg(windows)]
+    /// Windows x64 and Apple arm64: one slot per argument, integers and doubles alike (a double
+    /// as its bit pattern).
+    #[cfg(any(windows, all(target_vendor = "apple", target_arch = "aarch64")))]
     pub fn new(slots: [u64; 6]) -> VarArgs {
         VarArgs { slots, next: 0 }
     }
-    /// System V: integer-class and double arguments come from separate register files.
-    #[cfg(not(windows))]
+    /// System V (and AAPCS64 outside Apple): integer-class and double arguments come from
+    /// separate register files.
+    #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
     pub fn new(ints: [u64; 5], floats: [f64; 5]) -> VarArgs {
         VarArgs { ints, floats, ni: 0, nf: 0 }
     }
     /// The next integer-class argument (pointers, `int`s) as raw bits.
     pub fn next_u64(&mut self) -> u64 {
-        #[cfg(windows)]
+        #[cfg(any(windows, all(target_vendor = "apple", target_arch = "aarch64")))]
         {
             let v = self.slots.get(self.next).copied().unwrap_or(0);
             self.next += 1;
             v
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
         {
             let v = self.ints.get(self.ni).copied().unwrap_or(0);
             self.ni += 1;
@@ -357,11 +382,11 @@ impl VarArgs {
     }
     /// The next `double` argument.
     pub fn next_f64(&mut self) -> f64 {
-        #[cfg(windows)]
+        #[cfg(any(windows, all(target_vendor = "apple", target_arch = "aarch64")))]
         {
             f64::from_bits(self.next_u64())
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
         {
             let v = self.floats.get(self.nf).copied().unwrap_or(0.0);
             self.nf += 1;

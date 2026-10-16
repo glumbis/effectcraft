@@ -3,8 +3,9 @@
 //!
 //! The suite's functions are printf-style variadics, which stable Rust cannot receive. They are
 //! declared as fixed-slot functions instead (see the module docs of [`crate::ffi`] and
-//! [`VarMessageFn`]): eight extra 8-byte slots on Windows x64; six extra integer-class and eight
-//! float arguments on System V. [`expand`] then formats the message with the common printf
+//! [`VarMessageFn`]): eight extra 8-byte slots on Windows x64 and Apple arm64 (where variadic
+//! arguments are on the stack); six extra integer-class and eight float arguments on System V.
+//! [`expand`] then formats the message with the common printf
 //! conversions (`%% %s %d %i %u %x %X %o %c %p %f %e %g` with flags, width, precision and the
 //! `hh h l ll z j t` length modifiers), consuming at most [`MAX_ARGS`] arguments; a conversion it
 //! does not know, or that has no argument left, is kept verbatim.
@@ -16,8 +17,8 @@
 //!   the stack (more than eight doubles), which a message never does.
 //! * The slots beyond what the caller passed read whatever is on its stack frame; they are never
 //!   consumed, because only as many arguments as the format string asks for are taken.
-//! * Apple Silicon passes variadic arguments differently and is not expanded: the format string is
-//!   logged as written (only `%%` is folded).
+//! * Apple arm64 passes every variadic argument on the stack in an 8-byte slot, like Windows x64;
+//!   the four named arguments use x0..x3, so x4..x7 are declared as dummies before the slots.
 
 use std::ffi::c_char;
 
@@ -39,14 +40,15 @@ trait ArgSource {
     fn next_double(&mut self) -> Option<f64>;
 }
 
-/// Windows x64: one slot per argument, integers and doubles (as bit patterns) alike.
-#[cfg(any(windows, test))]
+/// Windows x64 and Apple arm64: one slot per argument, integers and doubles (as bit patterns)
+/// alike.
+#[cfg(any(windows, all(target_vendor = "apple", target_arch = "aarch64"), test))]
 struct SlotArgs {
     slots: [u64; MAX_ARGS],
     next: usize,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, all(target_vendor = "apple", target_arch = "aarch64"), test))]
 impl SlotArgs {
     fn new(slots: [u64; MAX_ARGS]) -> SlotArgs {
         SlotArgs { slots, next: 0 }
@@ -58,7 +60,7 @@ impl SlotArgs {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, all(target_vendor = "apple", target_arch = "aarch64"), test))]
 impl ArgSource for SlotArgs {
     fn next_int(&mut self) -> Option<u64> {
         self.take()
@@ -95,20 +97,6 @@ impl ArgSource for RegArgs {
         let v = self.floats.get(self.nf).copied()?;
         self.nf += 1;
         Some(v)
-    }
-}
-
-/// Apple Silicon: no variadic arguments are readable.
-#[cfg(all(not(windows), target_vendor = "apple", target_arch = "aarch64"))]
-struct NoArgs;
-
-#[cfg(all(not(windows), target_vendor = "apple", target_arch = "aarch64"))]
-impl ArgSource for NoArgs {
-    fn next_int(&mut self) -> Option<u64> {
-        None
-    }
-    fn next_double(&mut self) -> Option<f64> {
-        None
     }
 }
 
@@ -499,9 +487,30 @@ macro_rules! message_fn {
         ) -> OfxStatus {
             post(handle, kind, format, $persistent, &mut RegArgs::new([i1, i2, i3, i4, i5, i6], [f1, f2, f3, f4, f5, f6, f7, f8]))
         }
+        // Apple arm64: variadic arguments are on the stack, one 8-byte slot each (Apple, "Writing
+        // ARM64 code for Apple platforms"). The four named arguments take x0..x3; x4..x7 are
+        // dummies, so the next parameters are the first stack slots.
         #[cfg(all(not(windows), target_vendor = "apple", target_arch = "aarch64"))]
-        extern "C" fn $name(handle: Handle, kind: *const c_char, _id: *const c_char, format: *const c_char) -> OfxStatus {
-            post(handle, kind, format, $persistent, &mut NoArgs)
+        #[allow(clippy::too_many_arguments)]
+        extern "C" fn $name(
+            handle: Handle,
+            kind: *const c_char,
+            _id: *const c_char,
+            format: *const c_char,
+            _x4: u64,
+            _x5: u64,
+            _x6: u64,
+            _x7: u64,
+            s0: u64,
+            s1: u64,
+            s2: u64,
+            s3: u64,
+            s4: u64,
+            s5: u64,
+            s6: u64,
+            s7: u64,
+        ) -> OfxStatus {
+            post(handle, kind, format, $persistent, &mut SlotArgs::new([s0, s1, s2, s3, s4, s5, s6, s7]))
         }
     };
 }

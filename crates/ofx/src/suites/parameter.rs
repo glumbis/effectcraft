@@ -314,7 +314,32 @@ macro_rules! var_fn {
             let va = VarArgs::new([a1, a2, a3, a4, a5, a6]);
             guard(move || $body(h, va))
         }
-        #[cfg(not(windows))]
+        // Apple arm64 passes every variadic argument on the stack, one 8-byte slot each (Apple,
+        // "Writing ARM64 code for Apple platforms"). Only the handle is named, so x1..x7 are the
+        // seven argument registers the C caller did not use: they are taken as dummies, which makes
+        // the next `u64` parameters the first stack slots, i.e. the variadic arguments in order.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        #[allow(clippy::too_many_arguments)]
+        extern "C" fn $name(
+            h: Handle,
+            _x1: u64,
+            _x2: u64,
+            _x3: u64,
+            _x4: u64,
+            _x5: u64,
+            _x6: u64,
+            _x7: u64,
+            s0: u64,
+            s1: u64,
+            s2: u64,
+            s3: u64,
+            s4: u64,
+            s5: u64,
+        ) -> OfxStatus {
+            let va = VarArgs::new([s0, s1, s2, s3, s4, s5]);
+            guard(move || $body(h, va))
+        }
+        #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
         extern "C" fn $name(h: Handle, i1: u64, i2: u64, i3: u64, i4: u64, i5: u64, f1: f64, f2: f64, f3: f64, f4: f64, f5: f64) -> OfxStatus {
             let va = VarArgs::new([i1, i2, i3, i4, i5], [f1, f2, f3, f4, f5]);
             guard(move || $body(h, va))
@@ -333,7 +358,30 @@ macro_rules! var_fn_t {
             let va = VarArgs::new([t.to_bits(), a2, a3, a4, a5, a6]);
             guard(move || $body(h, va))
         }
-        #[cfg(not(windows))]
+        // Apple arm64: the named `OfxTime` is in d0, x1..x7 are dummies (see `var_fn`), then the
+        // variadic stack slots.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        #[allow(clippy::too_many_arguments)]
+        extern "C" fn $name(
+            h: Handle,
+            t: f64,
+            _x1: u64,
+            _x2: u64,
+            _x3: u64,
+            _x4: u64,
+            _x5: u64,
+            _x6: u64,
+            _x7: u64,
+            s0: u64,
+            s1: u64,
+            s2: u64,
+            s3: u64,
+            s4: u64,
+        ) -> OfxStatus {
+            let va = VarArgs::new([t.to_bits(), s0, s1, s2, s3, s4]);
+            guard(move || $body(h, va))
+        }
+        #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
         var_fn!($name, $body);
     };
 }
@@ -347,7 +395,30 @@ macro_rules! var_fn_t2 {
             let va = VarArgs::new([t1.to_bits(), t2.to_bits(), a3, a4, a5, a6]);
             guard(move || $body(h, va))
         }
-        #[cfg(not(windows))]
+        // Apple arm64: the two named `OfxTime`s are in d0 and d1, x1..x7 are dummies, then the
+        // stack slots of the out-pointers.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        #[allow(clippy::too_many_arguments)]
+        extern "C" fn $name(
+            h: Handle,
+            t1: f64,
+            t2: f64,
+            _x1: u64,
+            _x2: u64,
+            _x3: u64,
+            _x4: u64,
+            _x5: u64,
+            _x6: u64,
+            _x7: u64,
+            s0: u64,
+            s1: u64,
+            s2: u64,
+            s3: u64,
+        ) -> OfxStatus {
+            let va = VarArgs::new([t1.to_bits(), t2.to_bits(), s0, s1, s2, s3]);
+            guard(move || $body(h, va))
+        }
+        #[cfg(not(any(windows, all(target_vendor = "apple", target_arch = "aarch64"))))]
         var_fn!($name, $body);
     };
 }
