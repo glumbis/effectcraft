@@ -141,7 +141,8 @@ impl PluginEntry {
         // Raw pointers aren't Send; they cross to the render thread as addresses.
         let (h, i, o) = (handle as usize, i as usize, o as usize);
         let ctx = CallCtx { diag: self.diag.clone(), plugin: self.ofx_id.as_str().into(), action: action.into() };
-        let run = || {
+        // `move`: the call may run on a pooled worker thread, which outlives this frame.
+        let run = move || {
             // The suites attribute messages and unmet requests to this plug-in and action (set on
             // the thread the plug-in code runs on, which may not be this one).
             let _scope = ctx.enter();
@@ -151,15 +152,17 @@ impl PluginEntry {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { main(a.as_ptr(), h as *const c_void, i as *mut c_void, o as *mut c_void) }))
                 .unwrap_or(K_STAT_ERR_FATAL)
         };
-        // Linux plug-ins are built for glibc's 8 MiB thread stacks, and renders run on the
-        // renderer's worker threads (2 MiB): a heavy render (Twixtor's optical flow) overflowed
-        // them and crashed. Renders get a thread with a plug-in-sized stack there.
-        if cfg!(target_os = "linux") && action == ACT_RENDER { on_plugin_stack(run).unwrap_or(K_STAT_ERR_FATAL) } else { run() }
+        // Plug-ins are built for the stacks their platforms give threads (glibc: 8 MiB, macOS: 8 MiB
+        // on the main thread and 512 KiB elsewhere, but their own code assumes plenty), and renders
+        // run on the renderer's worker threads (2 MiB): a heavy render (Twixtor's optical flow)
+        // overflowed them and crashed. Renders, and instance creation (which loads models and
+        // initialises runtimes), run on a thread with a plug-in-sized stack on every OS.
+        if action == ACT_RENDER || action == ACT_CREATE_INSTANCE { on_plugin_stack(run).unwrap_or(K_STAT_ERR_FATAL) } else { run() }
     }
 }
 
-/// Stack size of the threads plug-in code runs on (renders on Linux, `multiThread` workers):
-/// twice glibc's default, which Linux plug-ins are written for.
+/// Stack size of the threads plug-in code runs on (renders, instance creation, `multiThread`
+/// workers): twice glibc's default, which plug-ins are written for.
 pub(crate) const PLUGIN_STACK: usize = 16 << 20;
 
 thread_local! {
@@ -167,25 +170,79 @@ thread_local! {
     pub(crate) static ON_PLUGIN_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Work for a plug-in-stack worker.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The workers that are waiting for work (their inboxes), most recently idle last.
+fn idle_workers() -> &'static Mutex<Vec<std::sync::mpsc::Sender<Job>>> {
+    static IDLE: OnceLock<Mutex<Vec<std::sync::mpsc::Sender<Job>>>> = OnceLock::new();
+    IDLE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The most workers kept waiting. More concurrent calls get a thread of their own, which ends
+/// after its job.
+const MAX_IDLE_WORKERS: usize = 8;
+
+/// A worker thread: run the jobs sent to it, then (while fewer than [`MAX_IDLE_WORKERS`] wait)
+/// wait for the next one. The thread, and so the plug-in's thread-local state, outlives a call:
+/// plug-ins that keep per-thread contexts (GPU, runtimes, licence checks) are not handed a fresh
+/// thread for every frame.
+fn worker_main(first: Arc<Mutex<Option<Job>>>, me: std::sync::mpsc::Sender<Job>, inbox: std::sync::mpsc::Receiver<Job>) {
+    ON_PLUGIN_STACK.with(|c| c.set(true));
+    let mut next = first.lock().unwrap_or_else(PoisonError::into_inner).take();
+    while let Some(job) = next.take() {
+        job();
+        {
+            let mut idle = idle_workers().lock().unwrap_or_else(PoisonError::into_inner);
+            if idle.len() >= MAX_IDLE_WORKERS {
+                return;
+            }
+            idle.push(me.clone());
+        }
+        next = inbox.recv().ok();
+    }
+}
+
 /// Run `f` on a thread with [`PLUGIN_STACK`] and wait for it (directly when this thread already
-/// has one, or when no thread can be started). `None` if `f` panicked.
-pub(crate) fn on_plugin_stack<R: Send>(f: impl FnOnce() -> R + Send) -> Option<R> {
+/// has one, or when no thread can be started). `None` if `f` panicked. Threads are pooled (see
+/// [`worker_main`]).
+pub(crate) fn on_plugin_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Option<R> {
     if ON_PLUGIN_STACK.with(std::cell::Cell::get) {
         return Some(f());
     }
-    let f = Mutex::new(Some(f));
-    let job = || {
-        ON_PLUGIN_STACK.with(|c| c.set(true));
-        f.lock().unwrap_or_else(PoisonError::into_inner).take().map(|f| f())
-    };
-    let spawned = std::thread::scope(|s| match std::thread::Builder::new().name("ofx-render".into()).stack_size(PLUGIN_STACK).spawn_scoped(s, job) {
-        Ok(h) => Some(h.join().ok().flatten()),
-        Err(_) => None,
+    let (reply, answer) = std::sync::mpsc::sync_channel::<Option<R>>(1);
+    let mut job: Job = Box::new(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
+        let _ = reply.send(r);
     });
-    match spawned {
-        Some(r) => r,
-        // No thread: run here (the closure is still unused).
-        None => f.lock().unwrap_or_else(PoisonError::into_inner).take().map(|f| f()),
+    // A waiting worker first (the most recently used: its thread-local state is the warmest).
+    loop {
+        let worker = idle_workers().lock().unwrap_or_else(PoisonError::into_inner).pop();
+        let Some(w) = worker else { break };
+        match w.send(job) {
+            Ok(()) => return answer.recv().ok().flatten(),
+            // That worker is gone: take the job back and try the next.
+            Err(std::sync::mpsc::SendError(j)) => job = j,
+        }
+    }
+    // None waiting: start one with this job. The job travels in a shared cell so it is still
+    // here when the thread cannot be started.
+    let cell = Arc::new(Mutex::new(Some(job)));
+    let (me, inbox) = std::sync::mpsc::channel::<Job>();
+    let started = {
+        let cell = cell.clone();
+        std::thread::Builder::new().name("ofx-plugin".into()).stack_size(PLUGIN_STACK).spawn(move || worker_main(cell, me, inbox))
+    };
+    match started {
+        Ok(_) => answer.recv().ok().flatten(),
+        Err(_) => {
+            // No thread: run here.
+            let job = cell.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(j) = job {
+                j();
+            }
+            answer.recv().ok().flatten()
+        }
     }
 }
 
@@ -946,6 +1003,44 @@ mod tests {
         let cfg = Arc::new(EffectCfg { context: CTX_FILTER.into(), clips: vec![], depth: Depth::Float, safety: Safety::InstanceSafe, slave_params: vec![] });
         let inst = Instance::build(entry, cfg, &desc);
         assert!(matches!(inst.obj.props.all(IE_OPENGL_ENABLED).as_slice(), [PVal::Int(0)]));
+    }
+
+    /// Recursion that needs a few MiB of stack: more than a 2 MiB worker thread has, less than
+    /// [`PLUGIN_STACK`].
+    fn deep(n: u32) -> u64 {
+        let pad = [n as u8; 32 * 1024];
+        let here: u64 = std::hint::black_box(&pad).iter().map(|b| u64::from(*b)).sum();
+        if n == 0 { here } else { here + deep(n - 1) }
+    }
+
+    /// Render and CreateInstance run on threads with plug-in-sized stacks on every OS, the threads
+    /// are reused (a plug-in's thread-local state survives), and a call from such a thread runs
+    /// inline instead of waiting for another.
+    #[test]
+    fn plugin_stack_threads_are_big_pooled_and_not_nested() {
+        let here = std::thread::current().id();
+        let (there, flagged, total) = on_plugin_stack(|| (std::thread::current().id(), ON_PLUGIN_STACK.with(std::cell::Cell::get), deep(200))).unwrap();
+        assert_ne!(there, here);
+        assert!(flagged);
+        assert!(total > 0, "{total}");
+        // Later calls get the same (now idle) worker.
+        for _ in 0..5 {
+            assert_eq!(on_plugin_stack(|| std::thread::current().id()), Some(there));
+        }
+        // A call made on a plug-in-stack thread runs on that thread.
+        let inline = on_plugin_stack(|| {
+            let me = std::thread::current().id();
+            on_plugin_stack(move || std::thread::current().id() == me)
+        });
+        assert_eq!(inline, Some(Some(true)));
+        // Concurrent calls get workers of their own and all finish.
+        let handles: Vec<_> = (0..4).map(|i| std::thread::spawn(move || on_plugin_stack(move || deep(20) + i))).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            assert!(h.join().unwrap().is_some_and(|v| v >= i as u64));
+        }
+        // A panic inside the job is reported as `None`, and the pool still works afterwards.
+        assert_eq!(on_plugin_stack(|| -> u32 { panic!("a plug-in-side bug") }), None);
+        assert_eq!(on_plugin_stack(|| 7), Some(7));
     }
 
     #[test]
