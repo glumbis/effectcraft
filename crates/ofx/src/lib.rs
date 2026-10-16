@@ -45,7 +45,7 @@ pub mod suites;
 
 use std::path::PathBuf;
 
-pub use loader::{default_search_paths, library_loads, load_path, load_path_with};
+pub use loader::{default_search_paths, library_loads, load_path, load_path_with, load_paths_with};
 pub use open::open_command;
 pub use settings::host_name_command;
 
@@ -103,9 +103,15 @@ pub struct LoadReport {
 /// without being loaded (the start-up scan); `false` loads everything (an explicit load). Always
 /// `Ok`: a path with nothing to load is an empty `loaded` and `errors` that say why (the engine
 /// turns that into an error for a single `loadOfx`, and a scan wants the notes and the transcript
-/// either way).
+/// either way). `path` is one path, or several separated by line breaks, which are scanned as one
+/// (copies of a plug-in in different folders are told apart by version, see [`load_paths_with`]).
 pub fn loader(path: &str, use_cache: bool) -> Result<serde_json::Value, String> {
-    let report = load_path_with(&PathBuf::from(path), use_cache);
+    let mut paths: Vec<PathBuf> = path.split('\n').map(|p| p.trim_end_matches('\r')).filter(|p| !p.is_empty()).map(PathBuf::from).collect();
+    if paths.is_empty() {
+        // (An empty path is reported like any other that is not there.)
+        paths.push(PathBuf::from(path));
+    }
+    let report = load_paths_with(&paths, use_cache);
     let loaded: Vec<serde_json::Value> = report
         .loaded
         .iter()

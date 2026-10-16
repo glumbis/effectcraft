@@ -568,7 +568,9 @@ pub type PluginLoader = fn(&[u8], &str) -> std::result::Result<Value, String>;
 /// scanned recursively) into the effect registry and describes them
 /// (`{loaded: [{id, name, category, ofxId, context, bundle}], errors: [..], notes, transcript,
 /// cache}`). The flag says whether binaries that did not change may be registered from the scan
-/// cache without being loaded (the start-up scan does; an explicit load of a plug-in does not).
+/// cache without being loaded (the start-up scan does; an explicit load of a plug-in does not). The
+/// path may be a list, one path per line: they are scanned as one, so that copies of a plug-in in
+/// different folders are told apart by version.
 pub type OfxLoader = fn(&str, bool) -> std::result::Result<Value, String>;
 
 /// Deletes the OpenFX scan cache (`effect.plugins.rescanOfx`) and reports what it did as JSON.

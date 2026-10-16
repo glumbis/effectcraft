@@ -156,20 +156,22 @@ pub fn load_path(path: &Path) -> LoadReport {
 /// [`load_path`]; `use_cache = false` loads every binary even when the scan cache knows it (an
 /// explicit load of a plug-in the user just fixed), still updating the cache.
 pub fn load_path_with(path: &Path, use_cache: bool) -> LoadReport {
+    load_paths_with(&[path.to_path_buf()], use_cache)
+}
+
+/// [`load_path_with`] for several paths as **one** scan, in the order given. Copies of one plug-in
+/// that sit in different paths (the system's folder and the user's, an old alpha beside the release)
+/// are told apart by version across all of them before any is described: the newest stays, and among
+/// equal versions the copy found first (so the order of `paths` is the order of preference). Loading
+/// the folders one call at a time cannot do that: a copy registered by an earlier call stays whatever
+/// the later ones offer.
+pub fn load_paths_with(paths: &[PathBuf], use_cache: bool) -> LoadReport {
     let _guard = load_lock().lock().unwrap_or_else(PoisonError::into_inner);
     // What a crashed session left behind (a plug-in that died while rendering) is dealt with before
     // anything is registered, so that a plug-in struck twice is not.
     crate::inflight::recover_once();
     let mut report = LoadReport::default();
-    let mut binaries: Vec<(PathBuf, String)> = Vec::new();
-    if !path.exists() {
-        report.errors.push(format!("{}: no such file or folder", path.display()));
-        return report;
-    }
-    find_binaries(path, 0, &mut binaries, &mut report.errors);
-    if binaries.is_empty() && report.errors.is_empty() {
-        report.errors.push(format!("{}: no OpenFX plug-ins found", path.display()));
-    }
+    let mut binaries = collect_binaries(paths, &mut report.errors);
     // The same binary can be reached twice (through a link, or a folder listed twice).
     let mut seen = std::collections::HashSet::new();
     binaries.retain(|(bin, _)| seen.insert(std::fs::canonicalize(bin).unwrap_or_else(|_| bin.clone())));
@@ -211,6 +213,24 @@ pub fn load_path_with(path: &Path, use_cache: bool) -> LoadReport {
     }
     report.cache = cache.finish();
     report
+}
+
+/// The plug-in binaries below `paths`, in the order of the paths (a path that does not exist, or has
+/// none in it, is an entry of `errors`).
+fn collect_binaries(paths: &[PathBuf], errors: &mut Vec<String>) -> Vec<(PathBuf, String)> {
+    let mut binaries: Vec<(PathBuf, String)> = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            errors.push(format!("{}: no such file or folder", path.display()));
+            continue;
+        }
+        let (found, problems) = (binaries.len(), errors.len());
+        find_binaries(path, 0, &mut binaries, errors);
+        if binaries.len() == found && errors.len() == problems {
+            errors.push(format!("{}: no OpenFX plug-ins found", path.display()));
+        }
+    }
+    binaries
 }
 
 fn is_bundle(p: &Path) -> bool {
@@ -1341,6 +1361,72 @@ mod tests {
         // Nothing listed is float; a depth this host does not know is nothing.
         assert_eq!(pick_depth(&[]), Some(Depth::Float));
         assert_eq!(pick_depth(&depths(&[DEPTH_NONE, "OfxBitDepthWeird"])), None);
+    }
+
+    /// A scan searches every path it is given, in order, as one list of binaries; a path that is not
+    /// there, or has nothing in it, is an error of its own and does not stop the others.
+    #[test]
+    fn a_scan_collects_the_binaries_of_every_path_in_order() {
+        let root = std::env::temp_dir().join(format!("effectcraft-ofx-collect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (first, second, empty) = (root.join("first"), root.join("second"), root.join("empty-folder"));
+        for dir in [&first, &second, &empty] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(first.join("one.ofx"), b"x").unwrap();
+        std::fs::write(second.join("two.ofx"), b"x").unwrap();
+        std::fs::write(second.join("notes.txt"), b"x").unwrap();
+        let mut errors = Vec::new();
+        let found = collect_binaries(&[first.clone(), root.join("not-there"), empty.clone(), second.clone()], &mut errors);
+        let names: Vec<&str> = found.iter().filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str())).collect();
+        assert_eq!(names, ["one.ofx", "two.ofx"]);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("not-there") && errors[0].contains("no such file or folder"), "{errors:?}");
+        assert!(errors[1].contains("empty-folder") && errors[1].contains("no OpenFX plug-ins found"), "{errors:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A binary the scan cache knows, offering one plug-in `id`.
+    fn cached_unit(label: &str, id: &str, version: (u32, u32)) -> Unit {
+        let plugins = vec![PluginRecord::Failed { id: id.into(), version, error: String::new() }];
+        let entry = BinaryEntry { path: label.into(), bundle: label.into(), size: 0, mtime: 0, stale: None, transcript: vec![], plugins };
+        Unit::Cached(Cached {
+            bin: PathBuf::from(label),
+            bundle: label.into(),
+            label: label.into(),
+            key: PathBuf::from(label),
+            entry: Arc::new(entry),
+            skips: vec![None],
+        })
+    }
+
+    fn skip_of(unit: &Unit) -> Option<String> {
+        match unit {
+            Unit::Cached(c) => c.skips.first().cloned().flatten(),
+            Unit::Probed(p) => p.plugins.first().and_then(|l| l.skip.clone()),
+        }
+    }
+
+    /// The binaries of a scan are in the order of the folders searched (the system's, then the user's):
+    /// an older copy in the folder searched first still loses to a newer one in a later folder, and
+    /// equal versions keep the copy found first.
+    #[test]
+    fn an_older_copy_in_an_earlier_folder_loses_to_a_newer_one_in_a_later_folder() {
+        let mut units = vec![
+            cached_unit("system/Foo.ofx", "test.cross.folder.newer", (1, 0)),
+            cached_unit("user/Foo.ofx", "test.cross.folder.newer", (2, 0)),
+            cached_unit("system/Bar.ofx", "test.cross.folder.equal", (1, 5)),
+            cached_unit("user/Bar.ofx", "test.cross.folder.equal", (1, 5)),
+        ];
+        let mut notes = Vec::new();
+        mark_duplicates(&mut units, &mut notes);
+        assert!(skip_of(&units[0]).is_some_and(|why| why.contains("user/Foo.ofx offers version 2.0")), "{:?}", skip_of(&units[0]));
+        assert_eq!(skip_of(&units[1]), None);
+        assert_eq!(skip_of(&units[2]), None);
+        assert!(skip_of(&units[3]).is_some_and(|why| why.contains("system/Bar.ofx offers version 1.5")), "{:?}", skip_of(&units[3]));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].starts_with("system/Foo.ofx:") && notes[0].contains("kept 2.0 in user/Foo.ofx"), "{notes:?}");
+        assert!(notes[1].starts_with("user/Bar.ofx:") && notes[1].contains("kept 1.5 in system/Bar.ofx"), "{notes:?}");
     }
 
     #[test]

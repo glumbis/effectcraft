@@ -126,6 +126,10 @@ fn plugins_set_ofx_host_name(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(r)
 }
 
+/// What separates the paths of a list handed to [`Session::ofx_loader`] (a path with a line break in
+/// it cannot be listed).
+const LIST_SEPARATOR: &str = "\n";
+
 /// `effect.plugins.scanOfx`: load every plug-in in the host's OpenFX search paths
 /// ([`Session::ofx_search_paths`]). Missing folders are skipped; one bad plug-in doesn't stop
 /// the rest. Binaries that did not change since the last scan are registered from the scan cache
@@ -145,12 +149,12 @@ fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     let use_cache = b_p(p, "cache").unwrap_or(true);
     let (mut paths, mut loaded, mut errors, mut notes, mut transcript, mut crashes) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     let mut cache = json!({"enabled": false, "file": null, "hits": 0, "scanned": 0, "lines": [], "problems": []});
-    for dir in s.ofx_search_paths.clone() {
-        if !dir.exists() {
-            continue;
-        }
-        let path = dir.to_string_lossy().to_string();
-        match loader(&path, use_cache) {
+    // The folders are one scan (the loader takes them as a list, one per line), so that copies of a
+    // plug-in in different folders (the system's and the user's, an old release beside a new one) are
+    // told apart by version: scanning them one after the other kept whichever copy was found first.
+    let dirs: Vec<String> = s.ofx_search_paths.iter().filter(|d| d.exists()).map(|d| d.to_string_lossy().to_string()).collect();
+    if !dirs.is_empty() {
+        match loader(&dirs.join(LIST_SEPARATOR), use_cache) {
             Ok(r) => {
                 loaded.extend(r["loaded"].as_array().cloned().unwrap_or_default());
                 errors.extend(r["errors"].as_array().cloned().unwrap_or_default());
@@ -163,9 +167,9 @@ fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 merge_cache_report(&mut cache, &r["cache"]);
             }
-            Err(e) => errors.push(json!(format!("{path}: {e}"))),
+            Err(e) => errors.push(json!(format!("{}: {e}", dirs.join("; ")))),
         }
-        paths.push(path);
+        paths = dirs;
     }
     Ok(json!({"paths": paths, "loaded": loaded, "errors": errors, "notes": notes, "transcript": transcript, "cache": cache, "crashes": crashes}))
 }
