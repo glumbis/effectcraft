@@ -135,8 +135,9 @@ const LIST_SEPARATOR: &str = "\n";
 /// the rest. Binaries that did not change since the last scan are registered from the scan cache
 /// without loading their libraries (`cache: false` loads everything). Plug-ins that crashed the
 /// app while loading or rendering last time are skipped (the host keeps a blocklist); `retry:
-/// true` forgets that list first. Returns `{paths, loaded, errors, notes, transcript, cache,
-/// crashes}` (`notes`: plug-ins skipped on purpose; `transcript`: one block of text per binary;
+/// true` forgets that list first. Returns `{paths, loaded, errors, emptyFolders, notes, transcript,
+/// cache, crashes}` (`emptyFolders`: searched folders with no plug-in in them, which are not
+/// errors; `notes`: plug-ins skipped on purpose; `transcript`: one block of text per binary;
 /// `cache`: which binaries came from the scan cache; `crashes`: plug-ins that crashed the app
 /// during the previous session).
 fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
@@ -147,7 +148,7 @@ fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
         clear();
     }
     let use_cache = b_p(p, "cache").unwrap_or(true);
-    let (mut paths, mut loaded, mut errors, mut notes, mut transcript, mut crashes) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+    let (mut paths, mut loaded, mut errors, mut empty, mut notes, mut transcript, mut crashes) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
     let mut cache = json!({"enabled": false, "file": null, "hits": 0, "scanned": 0, "lines": [], "problems": []});
     // The folders are one scan (the loader takes them as a list, one per line), so that copies of a
     // plug-in in different folders (the system's and the user's, an old release beside a new one) are
@@ -158,6 +159,7 @@ fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
             Ok(r) => {
                 loaded.extend(r["loaded"].as_array().cloned().unwrap_or_default());
                 errors.extend(r["errors"].as_array().cloned().unwrap_or_default());
+                empty.extend(r["emptyFolders"].as_array().cloned().unwrap_or_default());
                 notes.extend(r["notes"].as_array().cloned().unwrap_or_default());
                 transcript.extend(r["transcript"].as_array().cloned().unwrap_or_default());
                 for c in r["crashes"].as_array().into_iter().flatten() {
@@ -171,7 +173,9 @@ fn plugins_scan_ofx(s: &mut Session, p: &Value) -> Result<Value> {
         }
         paths = dirs;
     }
-    Ok(json!({"paths": paths, "loaded": loaded, "errors": errors, "notes": notes, "transcript": transcript, "cache": cache, "crashes": crashes}))
+    Ok(
+        json!({"paths": paths, "loaded": loaded, "errors": errors, "emptyFolders": empty, "notes": notes, "transcript": transcript, "cache": cache, "crashes": crashes}),
+    )
 }
 
 /// Add one folder's scan-cache report (`{enabled, file, hits, scanned, lines, problems}`) to the
@@ -869,7 +873,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Scan for OpenFX Plug-ins",
             [],
             None,
-            "{retry?, cache?} → {paths, loaded, errors, notes, transcript, cache, crashes}: registers every OpenFX plug-in in the standard folders and OFX_PLUGIN_PATH (binaries that did not change come from the scan cache without being loaded, unless cache is false); plug-ins that crashed the app while loading or rendering last time are skipped unless retry is true",
+            "{retry?, cache?} → {paths, loaded, errors, emptyFolders, notes, transcript, cache, crashes}: registers every OpenFX plug-in in the standard folders and OFX_PLUGIN_PATH (binaries that did not change come from the scan cache without being loaded, unless cache is false); plug-ins that crashed the app while loading or rendering last time are skipped unless retry is true",
             has_ofx,
             plugins_scan_ofx
         ),

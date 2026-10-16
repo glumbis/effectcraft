@@ -86,6 +86,9 @@ pub struct LoadReport {
     pub loaded: Vec<LoadedEffect>,
     /// What stopped a plug-in from becoming an effect (one line each, naming the binary).
     pub errors: Vec<String>,
+    /// The paths that exist and hold no plug-in binary (an empty plug-in folder, say). Not a
+    /// problem: the scan report lists them as searched folders with nothing in them.
+    pub empty_folders: Vec<String>,
     /// Plug-ins that were skipped on purpose, and why: not an image effect, declined this host,
     /// exports no plug-ins, a duplicate of another copy (not failures).
     pub notes: Vec<String>,
@@ -98,12 +101,14 @@ pub struct LoadReport {
 }
 
 /// Engine hook: [`load_path_with`] as `{"loaded": [{id, name, category, ofxId, context, bundle}],
-/// "errors": [...], "notes": [...], "transcript": [...], "cache": {enabled, file, hits, scanned,
-/// lines, problems}, "crashes": [...]}` (`crashes`: the plug-ins that crashed the previous session). `use_cache`: binaries that did not change register from the scan cache
+/// "errors": [...], "emptyFolders": [...], "notes": [...], "transcript": [...], "cache": {enabled,
+/// file, hits, scanned, lines, problems}, "crashes": [...]}` (`crashes`: the plug-ins that crashed
+/// the previous session; `emptyFolders`: paths that exist and have no plug-in in them, which are not
+/// errors). `use_cache`: binaries that did not change register from the scan cache
 /// without being loaded (the start-up scan); `false` loads everything (an explicit load). Always
-/// `Ok`: a path with nothing to load is an empty `loaded` and `errors` that say why (the engine
-/// turns that into an error for a single `loadOfx`, and a scan wants the notes and the transcript
-/// either way). `path` is one path, or several separated by line breaks, which are scanned as one
+/// `Ok`: a path that is not there, or cannot be read, is an empty `loaded` and `errors` that say why
+/// (the engine turns that into an error for a single `loadOfx`, and a scan wants the notes and the
+/// transcript either way). `path` is one path, or several separated by line breaks, which are scanned as one
 /// (copies of a plug-in in different folders are told apart by version, see [`load_paths_with`]).
 pub fn loader(path: &str, use_cache: bool) -> Result<serde_json::Value, String> {
     let mut paths: Vec<PathBuf> = path.split('\n').map(|p| p.trim_end_matches('\r')).filter(|p| !p.is_empty()).map(PathBuf::from).collect();
@@ -120,6 +125,7 @@ pub fn loader(path: &str, use_cache: bool) -> Result<serde_json::Value, String> 
     Ok(serde_json::json!({
         "loaded": loaded,
         "errors": report.errors,
+        "emptyFolders": report.empty_folders,
         "notes": report.notes,
         "transcript": report.transcript,
         "cache": report.cache,

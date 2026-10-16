@@ -54,6 +54,9 @@ fn is_project_file(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("ecproj") || ext.eq_ignore_ascii_case("ecprojx"))
 }
 
+/// What `ofx_scan.txt` says after a searched folder that exists and holds no plug-in.
+const OFX_EMPTY_FOLDER_NOTE: &str = "  (no plug-ins in it)";
+
 /// The start-up OpenFX scan as plain text for `<config>/ofx_scan.txt`: the host name plug-ins were
 /// told, the folders searched, the effects registered, every problem, the plug-ins skipped on
 /// purpose and the load transcript (what each plug-in answered, said and asked for). `result` is
@@ -81,9 +84,15 @@ fn ofx_scan_report(search_paths: &[std::path::PathBuf], result: &Result<serde_js
         }
     }
     t.push_str("\nFolders searched:\n");
+    // Folders that exist and have no plug-in in them (the per-user folder usually stays empty until a
+    // plug-in is copied there) are not a problem; the report says so next to them.
+    let empty: Vec<&str> =
+        result.as_ref().ok().and_then(|r| r["emptyFolders"].as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
     for p in search_paths {
         let state = if p.is_dir() { "found  " } else { "missing" };
-        let _ = writeln!(t, "  [{state}] {}", p.display());
+        let shown = p.to_string_lossy();
+        let note = if p.is_dir() && empty.iter().any(|e| *e == shown) { OFX_EMPTY_FOLDER_NOTE } else { "" };
+        let _ = writeln!(t, "  [{state}] {}{note}", p.display());
     }
     let r = match result {
         Ok(r) => r,
@@ -759,6 +768,41 @@ mod tests {
         let none = Ok(json!({"loaded": [{"name": "Blur", "category": "X", "id": "a", "bundle": "b"}], "errors": [], "crashes": []}));
         assert_eq!(super::ofx_scan_toast(&none, Path::new("r.txt")), None);
         assert!(!super::ofx_scan_report(&[], &none, &host).contains("previous session"));
+    }
+
+    /// A searched folder that exists and has no plug-in in it (the per-user folder, until a plug-in is
+    /// copied there) is listed as found, with a note, and is neither a problem nor a reason for a toast.
+    #[test]
+    fn ofx_scan_report_lists_an_empty_folder_without_a_problem() {
+        use serde_json::json;
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!("effectcraft-ofx-report-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (empty, full) = (dir.join("OFX"), dir.join("Plugins"));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&full).unwrap();
+        let host = Ok(
+            json!({"name": "EffectCraft", "source": "default", "settingsFile": "C:/cfg/ofx_settings.json", "configured": null, "problem": null, "restartRequired": false}),
+        );
+        let scan = Ok(json!({
+            "loaded": [{"name": "Invert", "category": "EC Test", "id": "org.x.invert", "bundle": "x.ofx.bundle"}],
+            "errors": [],
+            "emptyFolders": [empty.to_string_lossy()]
+        }));
+        let t = super::ofx_scan_report(&[full.clone(), empty.clone(), dir.join("missing")], &scan, &host);
+        assert!(t.contains(&format!("  [found  ] {}  (no plug-ins in it)\n", empty.display())), "{t}");
+        // The folder with plug-ins and the one that is not there say nothing of the kind.
+        assert!(t.contains(&format!("  [found  ] {}\n", full.display())) && t.contains(&format!("  [missing] {}\n", dir.join("missing").display())), "{t}");
+        assert!(t.contains("Problems: 0"), "{t}");
+        assert_eq!(super::ofx_scan_toast(&scan, Path::new("r.txt")), None);
+        // A scan that found nothing anywhere is quiet too (the report says what to do); only a real
+        // error brings the toast.
+        let nothing = Ok(json!({"loaded": [], "errors": [], "emptyFolders": [empty.to_string_lossy()]}));
+        assert_eq!(super::ofx_scan_toast(&nothing, Path::new("r.txt")), None);
+        assert!(super::ofx_scan_report(std::slice::from_ref(&empty), &nothing, &host).contains("No OpenFX effects were found"));
+        let broken = Ok(json!({"loaded": [], "errors": ["a.ofx: cannot load the library"], "emptyFolders": [empty.to_string_lossy()]}));
+        assert!(super::ofx_scan_toast(&broken, Path::new("r.txt")).is_some_and(|m| m.contains("1 problem(s)")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The window's wgpu instance skips indirect-call validation (Intel Metal, #1153).

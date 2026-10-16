@@ -171,7 +171,7 @@ pub fn load_paths_with(paths: &[PathBuf], use_cache: bool) -> LoadReport {
     // anything is registered, so that a plug-in struck twice is not.
     crate::inflight::recover_once();
     let mut report = LoadReport::default();
-    let mut binaries = collect_binaries(paths, &mut report.errors);
+    let mut binaries = collect_binaries(paths, &mut report.errors, &mut report.empty_folders);
     // The same binary can be reached twice (through a link, or a folder listed twice).
     let mut seen = std::collections::HashSet::new();
     binaries.retain(|(bin, _)| seen.insert(std::fs::canonicalize(bin).unwrap_or_else(|_| bin.clone())));
@@ -215,9 +215,11 @@ pub fn load_paths_with(paths: &[PathBuf], use_cache: bool) -> LoadReport {
     report
 }
 
-/// The plug-in binaries below `paths`, in the order of the paths (a path that does not exist, or has
-/// none in it, is an entry of `errors`).
-fn collect_binaries(paths: &[PathBuf], errors: &mut Vec<String>) -> Vec<(PathBuf, String)> {
+/// The plug-in binaries below `paths`, in the order of the paths. A path that does not exist, a
+/// folder that cannot be read and a bundle with no binary for this platform are entries of `errors`;
+/// a path that exists and simply has no plug-in in it (an empty plug-in folder) is not a problem: it
+/// goes to `empty`.
+fn collect_binaries(paths: &[PathBuf], errors: &mut Vec<String>, empty: &mut Vec<String>) -> Vec<(PathBuf, String)> {
     let mut binaries: Vec<(PathBuf, String)> = Vec::new();
     for path in paths {
         if !path.exists() {
@@ -227,7 +229,7 @@ fn collect_binaries(paths: &[PathBuf], errors: &mut Vec<String>) -> Vec<(PathBuf
         let (found, problems) = (binaries.len(), errors.len());
         find_binaries(path, 0, &mut binaries, errors);
         if binaries.len() == found && errors.len() == problems {
-            errors.push(format!("{}: no OpenFX plug-ins found", path.display()));
+            empty.push(path.display().to_string());
         }
     }
     binaries
@@ -1367,26 +1369,34 @@ mod tests {
         assert_eq!(pick_depth(&depths(&[DEPTH_NONE, "OfxBitDepthWeird"])), None);
     }
 
-    /// A scan searches every path it is given, in order, as one list of binaries; a path that is not
-    /// there, or has nothing in it, is an error of its own and does not stop the others.
+    /// A scan searches every path it is given, in order, as one list of binaries. A path that is not
+    /// there, and a bundle with no binary for this platform, are errors of their own and do not stop
+    /// the others; a folder with no plug-in in it is not a problem, it is only listed as empty.
     #[test]
     fn a_scan_collects_the_binaries_of_every_path_in_order() {
         let root = std::env::temp_dir().join(format!("effectcraft-ofx-collect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (first, second, empty) = (root.join("first"), root.join("second"), root.join("empty-folder"));
-        for dir in [&first, &second, &empty] {
+        // A folder with a bundle that has no binary for this platform (only a made-up platform's).
+        let other = root.join("other-platform");
+        for dir in [&first, &second, &empty, &other.join("Foo.ofx.bundle").join("Contents").join("NoSuchPlatform")] {
             std::fs::create_dir_all(dir).unwrap();
         }
+        std::fs::write(other.join("Foo.ofx.bundle").join("Contents").join("NoSuchPlatform").join("Foo.ofx"), b"x").unwrap();
         std::fs::write(first.join("one.ofx"), b"x").unwrap();
         std::fs::write(second.join("two.ofx"), b"x").unwrap();
         std::fs::write(second.join("notes.txt"), b"x").unwrap();
-        let mut errors = Vec::new();
-        let found = collect_binaries(&[first.clone(), root.join("not-there"), empty.clone(), second.clone()], &mut errors);
+        let (mut errors, mut empties) = (Vec::new(), Vec::new());
+        let paths = [first.clone(), root.join("not-there"), empty.clone(), second.clone(), other.clone()];
+        let found = collect_binaries(&paths, &mut errors, &mut empties);
         let names: Vec<&str> = found.iter().filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str())).collect();
         assert_eq!(names, ["one.ofx", "two.ofx"]);
+        // The real problems stay errors: a path that is not there, a bundle without this platform's binary.
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].contains("not-there") && errors[0].contains("no such file or folder"), "{errors:?}");
-        assert!(errors[1].contains("empty-folder") && errors[1].contains("no OpenFX plug-ins found"), "{errors:?}");
+        assert!(errors[1].contains("Foo.ofx.bundle") && errors[1].contains("binary in this bundle"), "{errors:?}");
+        // The empty folder is not one: it is only listed (and the folders with plug-ins or a problem are not).
+        assert_eq!(empties, [empty.display().to_string()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
