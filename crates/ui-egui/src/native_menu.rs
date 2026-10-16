@@ -169,8 +169,16 @@ pub fn build(app: &EffectcraftApp) -> NativeMenu {
                 MenuNode::Submenu { label, children } => {
                     let mut kids = vec![];
                     rec(app, children, &id, &mut kids);
-                    let shown = effectcraft_engine::menus::submenu_label(&app.session, label, &crate::menus::dyn_ctx(&app.ui.workspace, &[]));
-                    out.push(NativeNode::Submenu { label: crate::i18n::submenu(app, label, shown), children: kids });
+                    // The generated Effect menu's category submenus draw the catalog's name
+                    // (#821); every other submenu goes through the menu catalog.
+                    let shown = crate::i18n::effect_category(children, label).unwrap_or_else(|| {
+                        crate::i18n::submenu(
+                            app,
+                            label,
+                            effectcraft_engine::menus::submenu_label(&app.session, label, &crate::menus::dyn_ctx(&app.ui.workspace, &[])),
+                        )
+                    });
+                    out.push(NativeNode::Submenu { label: shown, children: kids });
                 }
                 MenuNode::Item(e) => {
                     let role = match e.command.as_str() {
@@ -196,6 +204,8 @@ pub fn build(app: &EffectcraftApp) -> NativeMenu {
                                     "Servicios"
                                 } else if crate::i18n::brazilian_portuguese(app) {
                                     "Serviços"
+                                } else if crate::i18n::czech(app) {
+                                    "Služby"
                                 } else {
                                     "Services"
                                 }
@@ -427,6 +437,7 @@ mod tests {
     #[test]
     fn saved_workspaces_are_in_the_native_workspace_menu() {
         let mut app = app();
+        app.session.config = Some(std::sync::Arc::new(effectcraft_engine::config::MemoryConfig::default()));
         let ctx = egui::Context::default();
         crate::menus::invoke(&mut app, &ctx, "window.saveWorkspaceAs", json!({"name": "My Layout"})).unwrap();
         let entry = |app: &EffectcraftApp| build(app).items().into_iter().find(|i| i.label == "My Layout").cloned();
@@ -455,6 +466,27 @@ mod tests {
         let mut translated = vec![];
         labels(&build(&app).menus, &mut translated);
         assert_eq!(translated, ["Служби", "Приховати EffectCraft", "Приховати решту", "Показати все"]);
+    }
+
+    #[test]
+    fn czech_translates_macos_predefined_items() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("prefs.set", json!({"key": "general.language", "value": "cs"})).unwrap();
+        fn labels(nodes: &[NativeNode], out: &mut Vec<String>) {
+            for node in nodes {
+                match node {
+                    NativeNode::Predefined { label, .. } => out.push(label.clone()),
+                    NativeNode::Submenu { children, .. } => labels(children, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut translated = vec![];
+        labels(&build(&app).menus, &mut translated);
+        assert_eq!(translated, ["Služby", "Skrýt EffectCraft", "Skrýt ostatní", "Zobrazit vše"]);
     }
 
     #[test]

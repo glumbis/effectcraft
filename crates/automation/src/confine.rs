@@ -40,6 +40,9 @@ const REFUSED: &[&str] = &[
     "layer.openSource",
     "help.revealLogFile",
     "file.autoSave",
+    // Native OpenFX plug-ins are unsandboxed code: an agent never chooses which one runs.
+    "effect.plugins.loadOfx",
+    "effect.plugins.scanOfx",
 ];
 
 /// Commands that read files named by these parameters.
@@ -51,6 +54,7 @@ const READS: &[(&str, &[&str])] = &[
     ("file.importRecent", &["path"]),
     ("file.importLottie", &["path"]),
     ("file.importTimeline", &["path"]),
+    ("file.importAep", &["path"]),
     ("file.replaceFootage", &["path"]),
     ("file.relinkFootage", &["folder"]),
     ("file.setProxy", &["path"]),

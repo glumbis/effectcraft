@@ -5,13 +5,15 @@
 
 use crate::EffectcraftApp;
 
+/// Effect names, keyed by effect id (#821).
+pub(crate) mod effects;
 /// Translations for the panels, tooltips and dialogs below the menu bar (see the module docs).
 mod ui;
-use effectcraft_engine::menus::MenuEntry;
+use effectcraft_engine::menus::{MenuEntry, MenuNode};
 pub(crate) use ui::{set_current, tr, tr_args};
 
 /// Every language with a catalog, in the order Settings ▸ General ▸ Language lists them.
-const CATALOG_CODES: [&str; 9] = ["ja", "zh-hans", "zh-hant", "uk", "es", "pt-br", "ru", "fr", "de"];
+const CATALOG_CODES: [&str; 10] = ["ja", "zh-hans", "zh-hant", "uk", "es", "pt-br", "ru", "fr", "de", "cs"];
 
 /// The active interface language: the stored preference when it names a catalog, otherwise `en`
 /// (English is the source of every label and needs no lookup).
@@ -57,6 +59,11 @@ pub(crate) fn brazilian_portuguese(app: &EffectcraftApp) -> bool {
     language(app) == "pt-br"
 }
 
+/// The UI is in Czech.
+pub(crate) fn czech(app: &EffectcraftApp) -> bool {
+    language(app) == "cs"
+}
+
 /// Settings ▸ General ▸ Language ▸ Match System: the operating system's interface language
 /// where EffectCraft has it, else English (#229), as After Effects installs in the system's
 /// language. The browser build stays in English because it has no system-locale probe.
@@ -72,7 +79,7 @@ fn system_language() -> &'static str {
 }
 
 /// The language EffectCraft shows for a BCP 47 locale (`ja-JP` → `ja`, `zh-Hans-CN` → `zh-hans`,
-/// `zh-TW` → `zh-hant`, `uk-UA` → `uk`, `es-ES` → `es`, `pt-BR` → `pt-br`).
+/// `zh-TW` → `zh-hant`, `uk-UA` → `uk`, `es-ES` → `es`, `pt-BR` → `pt-br`, `cs-CZ` → `cs`).
 fn supported(locale: Option<&str>) -> &'static str {
     let Some(locale) = locale else { return "en" };
     let mut parts = locale.split(['-', '_']);
@@ -82,6 +89,7 @@ fn supported(locale: Option<&str>) -> &'static str {
         "ja" => "ja",
         "uk" => "uk",
         "es" => "es",
+        "cs" => "cs",
         // The only Portuguese catalog: Brazil's, also for Portugal rather than English.
         "pt" => "pt-br",
         "zh" => {
@@ -103,6 +111,13 @@ pub(crate) fn label<'a>(app: &EffectcraftApp, command: &str, source: &'a str) ->
             _ => {}
         }
     }
+    if language == "cs" && matches!(command, "file.revealInFinder" | "layer.revealInFinder") {
+        match source {
+            "Reveal in Explorer" => return "Zobrazit v Průzkumníku",
+            "Reveal in File Manager" => return "Zobrazit ve správci souborů",
+            _ => {}
+        }
+    }
     match language {
         "ja" => lookup(JAPANESE, command, source),
         "zh-hans" => lookup(SIMPLIFIED_CHINESE, command, source),
@@ -113,6 +128,7 @@ pub(crate) fn label<'a>(app: &EffectcraftApp, command: &str, source: &'a str) ->
         "ru" => lookup(RUSSIAN, command, source),
         "fr" => lookup(FRENCH, command, source),
         "de" => lookup(GERMAN, command, source),
+        "cs" => lookup(CZECH, command, source),
         _ => source,
     }
 }
@@ -124,6 +140,15 @@ fn lookup<'a>(catalog: &[(&str, &str, &'a str)], command: &str, source: &'a str)
 }
 
 pub(crate) fn entry(app: &EffectcraftApp, e: &MenuEntry, shown: String) -> String {
+    // The generated Effect menu's entries label themselves with the effect's registry name; the
+    // catalog replaces it with the interface language's (#821). The entry keeps its command and
+    // its `{"effect": <id>}` params, so a script, an expression or the control channel is
+    // unaffected by what the menu draws.
+    if e.command == "effect.apply"
+        && let Some(id) = e.params.get("effect").and_then(|v| v.as_str())
+    {
+        return effects::name(id, &e.label);
+    }
     // Undo/redo names come from the history, so they are formatted per language here rather than
     // looked up in a catalog. An English (or untranslated) interface keeps the shown label.
     let (undo, no_undo, redo, no_redo) = match language(app) {
@@ -133,6 +158,7 @@ pub(crate) fn entry(app: &EffectcraftApp, e: &MenuEntry, shown: String) -> Strin
         "uk" => ("Скасувати", "Немає дій для скасування", "Повторити", "Немає дій для повторення"),
         "es" => ("Deshacer", "No se puede deshacer", "Rehacer", "No se puede rehacer"),
         "pt-br" => ("Desfazer", "Não há nada para desfazer", "Refazer", "Não há nada para refazer"),
+        "cs" => ("Zpět", "Není co vrátit", "Znovu", "Není co zopakovat"),
         _ => return shown,
     };
     match e.command.as_str() {
@@ -153,8 +179,29 @@ pub(crate) fn entry(app: &EffectcraftApp, e: &MenuEntry, shown: String) -> Strin
     }
 }
 
+/// The label to draw for a generated Effect-menu category submenu, or `None` for every other
+/// submenu (whose label goes through [`submenu`]).
+///
+/// The generated submenus are the only ones whose children are all `effect.apply` entries, which
+/// is what identifies them: their label is one of the registry's 21 categories, drawn as a
+/// submenu in the Effect menu and as a folder row in Effects & Presets (#821).
+pub(crate) fn effect_category(children: &[MenuNode], source: &str) -> Option<String> {
+    (!children.is_empty() && children.iter().all(|c| matches!(c, MenuNode::Item(e) if e.command == "effect.apply"))).then(|| effects::category(source))
+}
+
 pub(crate) fn submenu(app: &EffectcraftApp, source: &str, shown: String) -> String {
     match language(app) {
+        "cs" => {
+            if source == "Assign Shortcut to Workspace" {
+                if let Some(name) = shown.strip_prefix("Assign Shortcut to “").and_then(|s| s.strip_suffix("” Workspace")) {
+                    return format!("Přiřadit zkratku pracovnímu prostoru „{name}“");
+                }
+            } else if source == "Assign Shortcut to 3D View"
+                && let Some(name) = shown.strip_prefix("Assign Shortcut to “").and_then(|s| s.strip_suffix('”'))
+            {
+                return format!("Přiřadit zkratku 3D zobrazení „{name}“");
+            }
+        }
         "uk" => {
             if source == "Assign Shortcut to Workspace" {
                 if let Some(name) = shown.strip_prefix("Assign Shortcut to “").and_then(|s| s.strip_suffix("” Workspace")) {
@@ -278,6 +325,7 @@ const SIMPLIFIED_CHINESE: &[(&str, &str, &str)] = &[
     ("file.importMultiple", "Multiple Files...", "多个文件..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Adobe Premiere Pro 项目..."),
     ("file.importAep", "After Effects Project...", "After Effects 项目..."),
+    ("file.importProject", "EffectCraft Project...", "EffectCraft 项目..."),
     ("file.importPlaceholder", "Placeholder...", "占位符..."),
     ("file.importSolid", "Solid...", "纯色..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -753,6 +801,9 @@ const SIMPLIFIED_CHINESE: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "对齐到参考线"),
     ("view.lockGuides", "Lock Guides", "锁定参考线"),
     ("view.addGuide", "Add Guide...", "添加参考线..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "添加百分比参考线..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "将参考线转换为百分比"),
+    ("view.convertGuides", "Convert Guides to Pixels", "将参考线转换为像素"),
     ("view.clearGuides", "Clear Guides", "清除参考线"),
     ("view.importGuides", "Import Guides...", "导入参考..."),
     ("view.exportGuides", "Export Guides...", "导出参考..."),
@@ -910,6 +961,7 @@ const TRADITIONAL_CHINESE: &[(&str, &str, &str)] = &[
     ("file.importMultiple", "Multiple Files...", "多個檔案..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Adobe Premiere Pro 專案..."),
     ("file.importAep", "After Effects Project...", "After Effects 專案..."),
+    ("file.importProject", "EffectCraft Project...", "EffectCraft 專案..."),
     ("file.importPlaceholder", "Placeholder...", "預留位置..."),
     ("file.importSolid", "Solid...", "純色..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -1385,6 +1437,9 @@ const TRADITIONAL_CHINESE: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "靠齊參考線"),
     ("view.lockGuides", "Lock Guides", "鎖定參考線"),
     ("view.addGuide", "Add Guide...", "新增參考線..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "新增百分比參考線..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "將參考線轉換為百分比"),
+    ("view.convertGuides", "Convert Guides to Pixels", "將參考線轉換為像素"),
     ("view.clearGuides", "Clear Guides", "清除參考線"),
     ("view.importGuides", "Import Guides...", "匯入參考線..."),
     ("view.exportGuides", "Export Guides...", "匯出參考線..."),
@@ -1542,6 +1597,7 @@ const JAPANESE: &[(&str, &str, &str)] = &[
     ("file.importPlaceholder", "Placeholder...", "プレースホルダー..."),
     ("file.importSolid", "Solid...", "平面..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
+    ("file.importProject", "EffectCraft Project...", "EffectCraftプロジェクト..."),
     ("file.importVanishingPoint", "Vanishing Point (.vpe)...", "Vanishing Point (.vpe)..."),
     ("essential.importTemplate", "Essential Graphics Template...", "エッセンシャルグラフィックステンプレート..."),
     ("", "Import Recent Footage", "最近使用したフッテージを読み込み"),
@@ -2014,6 +2070,9 @@ const JAPANESE: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "ガイドにスナップ"),
     ("view.lockGuides", "Lock Guides", "ガイドをロック"),
     ("view.addGuide", "Add Guide...", "ガイドを追加..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "パーセントガイドを追加..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "ガイドをパーセントに変換"),
+    ("view.convertGuides", "Convert Guides to Pixels", "ガイドをピクセルに変換"),
     ("view.clearGuides", "Clear Guides", "ガイドを消去"),
     ("view.importGuides", "Import Guides...", "ガイドを読み込み..."),
     ("view.exportGuides", "Export Guides...", "ガイドを書き出し..."),
@@ -2171,6 +2230,7 @@ const UKRAINIAN: &[(&str, &str, &str)] = &[
     ("file.importMultiple", "Multiple Files...", "Кілька файлів..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Проєкт Adobe Premiere Pro..."),
     ("file.importAep", "After Effects Project...", "Проєкт After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Проєкт EffectCraft..."),
     ("file.importPlaceholder", "Placeholder...", "Заповнювач..."),
     ("file.importSolid", "Solid...", "Суцільний колір..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -2646,6 +2706,9 @@ const UKRAINIAN: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "Прив’язувати до напрямних"),
     ("view.lockGuides", "Lock Guides", "Заблокувати напрямні"),
     ("view.addGuide", "Add Guide...", "Додати напрямну..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "Додати відсоткову напрямну..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "Перетворити напрямні на відсотки"),
+    ("view.convertGuides", "Convert Guides to Pixels", "Перетворити напрямні на пікселі"),
     ("view.clearGuides", "Clear Guides", "Очистити напрямні"),
     ("view.importGuides", "Import Guides...", "Імпортувати напрямні..."),
     ("view.exportGuides", "Export Guides...", "Експортувати напрямні..."),
@@ -2803,6 +2866,8 @@ const SPANISH: &[(&str, &str, &str)] = &[
     ("file.import", "File...", "Archivo..."),
     ("file.importMultiple", "Multiple Files...", "Varios archivos..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Proyecto de Adobe Premiere Pro..."),
+    ("file.importAep", "After Effects Project...", "Proyecto de After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Proyecto de EffectCraft..."),
     ("file.importPlaceholder", "Placeholder...", "Marcador de posición..."),
     ("file.importSolid", "Solid...", "Sólido..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -3167,6 +3232,7 @@ const SPANISH: &[(&str, &str, &str)] = &[
     ("effect.removeAll", "Remove All", "Quitar todo"),
     ("effect.manage", "Manage Effects...", "Administrar efectos..."),
     ("effect.plugins.load", "Load Effect Plug-in...", "Cargar complemento de efecto..."),
+    ("effect.plugins.loadOfx", "Load OpenFX Plug-in...", "Cargar complemento OpenFX..."),
     ("", "Animation", "Animación"),
     ("anim.savePreset", "Save Animation Preset...", "Guardar ajuste preestablecido de animación..."),
     ("anim.applyPreset", "Apply Animation Preset...", "Aplicar ajuste preestablecido de animación..."),
@@ -3277,6 +3343,9 @@ const SPANISH: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "Ajustar a las guías"),
     ("view.lockGuides", "Lock Guides", "Bloquear guías"),
     ("view.addGuide", "Add Guide...", "Añadir guía..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "Añadir guía porcentual..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "Convertir guías a porcentaje"),
+    ("view.convertGuides", "Convert Guides to Pixels", "Convertir guías a píxeles"),
     ("view.clearGuides", "Clear Guides", "Borrar guías"),
     ("view.importGuides", "Import Guides...", "Importar guías..."),
     ("view.exportGuides", "Export Guides...", "Exportar guías..."),
@@ -3432,6 +3501,8 @@ const PORTUGUESE: &[(&str, &str, &str)] = &[
     ("file.import", "File...", "Arquivo..."),
     ("file.importMultiple", "Multiple Files...", "Vários arquivos..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Projeto do Adobe Premiere Pro..."),
+    ("file.importAep", "After Effects Project...", "Projeto do After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Projeto do EffectCraft..."),
     ("file.importPlaceholder", "Placeholder...", "Espaço reservado..."),
     ("file.importSolid", "Solid...", "Sólido..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -3796,6 +3867,7 @@ const PORTUGUESE: &[(&str, &str, &str)] = &[
     ("effect.removeAll", "Remove All", "Remover todos"),
     ("effect.manage", "Manage Effects...", "Gerenciar efeitos..."),
     ("effect.plugins.load", "Load Effect Plug-in...", "Carregar plug-in de efeito..."),
+    ("effect.plugins.loadOfx", "Load OpenFX Plug-in...", "Carregar plug-in OpenFX..."),
     ("", "Animation", "Animação"),
     ("anim.savePreset", "Save Animation Preset...", "Salvar predefinição de animação..."),
     ("anim.applyPreset", "Apply Animation Preset...", "Aplicar predefinição de animação..."),
@@ -3906,6 +3978,9 @@ const PORTUGUESE: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "Encaixar nas guias"),
     ("view.lockGuides", "Lock Guides", "Bloquear guias"),
     ("view.addGuide", "Add Guide...", "Adicionar guia..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "Adicionar guia percentual..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "Converter guias em porcentagem"),
+    ("view.convertGuides", "Convert Guides to Pixels", "Converter guias em pixels"),
     ("view.clearGuides", "Clear Guides", "Limpar guias"),
     ("view.importGuides", "Import Guides...", "Importar guias..."),
     ("view.exportGuides", "Export Guides...", "Exportar guias..."),
@@ -4069,6 +4144,8 @@ const RUSSIAN: &[(&str, &str, &str)] = &[
     ("file.import", "File...", "Файл..."),
     ("file.importMultiple", "Multiple Files...", "Несколько файлов..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Проект Adobe Premiere Pro..."),
+    ("file.importAep", "After Effects Project...", "Проект After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Проект EffectCraft..."),
     ("file.importPlaceholder", "Placeholder...", "Заполнитель..."),
     ("file.importSolid", "Solid...", "Сплошной цвет..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -4432,6 +4509,7 @@ const RUSSIAN: &[(&str, &str, &str)] = &[
     ("effect.removeAll", "Remove All", "Удалить все"),
     ("effect.manage", "Manage Effects...", "Управление эффектами..."),
     ("effect.plugins.load", "Load Effect Plug-in...", "Загрузить плагин эффектов..."),
+    ("effect.plugins.loadOfx", "Load OpenFX Plug-in...", "Загрузить плагин OpenFX..."),
     ("", "Animation", "Анимация"),
     ("anim.savePreset", "Save Animation Preset...", "Сохранить заготовку анимации..."),
     ("anim.applyPreset", "Apply Animation Preset...", "Применить заготовку анимации..."),
@@ -4537,6 +4615,9 @@ const RUSSIAN: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "Привязывать к направляющим"),
     ("view.lockGuides", "Lock Guides", "Закрепить направляющие"),
     ("view.addGuide", "Add Guide...", "Добавить направляющую..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "Добавить процентную направляющую..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "Преобразовать направляющие в проценты"),
+    ("view.convertGuides", "Convert Guides to Pixels", "Преобразовать направляющие в пиксели"),
     ("view.clearGuides", "Clear Guides", "Очистить направляющие"),
     ("view.importGuides", "Import Guides...", "Импортировать направляющие..."),
     ("view.exportGuides", "Export Guides...", "Экспортировать направляющие..."),
@@ -4698,6 +4779,8 @@ const FRENCH: &[(&str, &str, &str)] = &[
     ("file.import", "File...", "Fichier..."),
     ("file.importMultiple", "Multiple Files...", "Plusieurs fichiers..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Projet Adobe Premiere Pro..."),
+    ("file.importAep", "After Effects Project...", "Projet After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Projet EffectCraft..."),
     ("file.importPlaceholder", "Placeholder...", "Espace réservé..."),
     ("file.importSolid", "Solid...", "Solide..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -5061,6 +5144,7 @@ const FRENCH: &[(&str, &str, &str)] = &[
     ("effect.removeAll", "Remove All", "Tout supprimer"),
     ("effect.manage", "Manage Effects...", "Gérer les effets..."),
     ("effect.plugins.load", "Load Effect Plug-in...", "Charger un plug-in d'effet..."),
+    ("effect.plugins.loadOfx", "Load OpenFX Plug-in...", "Charger un plug-in OpenFX..."),
     ("", "Animation", "Animation"),
     ("anim.savePreset", "Save Animation Preset...", "Enregistrer une animation prédéfinie..."),
     ("anim.applyPreset", "Apply Animation Preset...", "Appliquer une animation prédéfinie..."),
@@ -5166,6 +5250,9 @@ const FRENCH: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "Aimanter sur les repères"),
     ("view.lockGuides", "Lock Guides", "Verrouiller les repères"),
     ("view.addGuide", "Add Guide...", "Ajouter un repère..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "Ajouter un repère en pourcentage..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "Convertir les repères en pourcentage"),
+    ("view.convertGuides", "Convert Guides to Pixels", "Convertir les repères en pixels"),
     ("view.clearGuides", "Clear Guides", "Effacer les repères"),
     ("view.importGuides", "Import Guides...", "Importer des repères..."),
     ("view.exportGuides", "Export Guides...", "Exporter des repères..."),
@@ -5327,6 +5414,8 @@ const GERMAN: &[(&str, &str, &str)] = &[
     ("file.import", "File...", "Datei..."),
     ("file.importMultiple", "Multiple Files...", "Mehrere Dateien..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Adobe Premiere Pro-Projekt..."),
+    ("file.importAep", "After Effects Project...", "After Effects-Projekt..."),
+    ("file.importProject", "EffectCraft Project...", "EffectCraft-Projekt..."),
     ("file.importPlaceholder", "Placeholder...", "Platzhalter..."),
     ("file.importSolid", "Solid...", "Farbfläche..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -5690,6 +5779,7 @@ const GERMAN: &[(&str, &str, &str)] = &[
     ("effect.removeAll", "Remove All", "Alle entfernen"),
     ("effect.manage", "Manage Effects...", "Effekte verwalten..."),
     ("effect.plugins.load", "Load Effect Plug-in...", "Effekt-Plug-in laden..."),
+    ("effect.plugins.loadOfx", "Load OpenFX Plug-in...", "OpenFX-Plug-in laden..."),
     ("", "Animation", "Animation"),
     ("anim.savePreset", "Save Animation Preset...", "Animationsvorgabe speichern..."),
     ("anim.applyPreset", "Apply Animation Preset...", "Animationsvorgabe anwenden..."),
@@ -5795,6 +5885,9 @@ const GERMAN: &[(&str, &str, &str)] = &[
     ("view.snapToGuides", "Snap to Guides", "An Hilfslinien einrasten"),
     ("view.lockGuides", "Lock Guides", "Hilfslinien sperren"),
     ("view.addGuide", "Add Guide...", "Hilfslinie hinzufügen..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "Prozentuale Hilfslinie hinzufügen..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "Hilfslinien in Prozent umwandeln"),
+    ("view.convertGuides", "Convert Guides to Pixels", "Hilfslinien in Pixel umwandeln"),
     ("view.clearGuides", "Clear Guides", "Hilfslinien entfernen"),
     ("view.importGuides", "Import Guides...", "Hilfslinien importieren..."),
     ("view.exportGuides", "Export Guides...", "Hilfslinien exportieren..."),
@@ -5903,12 +5996,727 @@ const GERMAN: &[(&str, &str, &str)] = &[
 
 // <<< generated i18n catalogs
 
+/// Czech (cs): original phrase translations of every fixed menu entry.
+const CZECH: &[(&str, &str, &str)] = &[
+    ("", "Front", "Přední strana"),
+    ("", "Bevel", "Zkosení"),
+    ("", "Side", "Boční strana"),
+    ("", "Back", "Zadní strana"),
+    ("layer.addTextAnimator", "Color", "Barva"),
+    ("", "EffectCraft", "EffectCraft"),
+    ("app.about", "About EffectCraft...", "O aplikaci EffectCraft..."),
+    ("", "Settings...", "Nastavení..."),
+    ("app.settings", "General...", "Obecné..."),
+    ("app.settings", "Startup & Repair...", "Spuštění a oprava..."),
+    ("app.settings", "Project...", "Projekt..."),
+    ("app.settings", "Composition...", "Kompozice..."),
+    ("app.settings", "Previews...", "Náhledy..."),
+    ("app.settings", "Appearance...", "Vzhled..."),
+    ("app.settings", "Grids & Guides...", "Mřížky a vodítka..."),
+    ("app.settings", "Labels...", "Štítky..."),
+    ("app.settings", "Type...", "Text..."),
+    ("app.settings", "Import...", "Import..."),
+    ("app.settings", "Export...", "Export..."),
+    ("app.settings", "Audio...", "Zvuk..."),
+    ("app.settings", "Disk...", "Disk..."),
+    ("app.settings", "Memory & CPU...", "Paměť a CPU..."),
+    ("app.settings", "Video...", "Video..."),
+    ("app.settings", "3D...", "3D..."),
+    ("app.settings", "Scripting & Expressions...", "Skripty a výrazy..."),
+    ("app.hide", "Hide EffectCraft", "Skrýt EffectCraft"),
+    ("app.hideOthers", "Hide Others", "Skrýt ostatní"),
+    ("app.showAll", "Show All", "Zobrazit vše"),
+    ("app.quit", "Quit EffectCraft", "Ukončit EffectCraft"),
+    ("", "File", "Soubor"),
+    ("", "New", "Nový"),
+    ("file.newProject", "New Project", "Nový projekt"),
+    ("file.newFromTemplate", "New Project from Template...", "Nový projekt ze šablony..."),
+    ("project.newFolder", "New Folder", "Nová složka"),
+    ("file.open", "Open Project...", "Otevřít projekt..."),
+    ("", "Open Recent", "Otevřít nedávné"),
+    ("file.clearRecent", "Clear Recent Projects", "Vymazat nedávné projekty"),
+    ("file.close", "Close", "Zavřít"),
+    ("file.closeProject", "Close Project", "Zavřít projekt"),
+    ("file.save", "Save", "Uložit"),
+    ("", "Save As", "Uložit jako"),
+    ("file.saveAs", "Save As...", "Uložit jako..."),
+    ("file.saveCopy", "Save a Copy...", "Uložit kopii..."),
+    ("file.saveCopyAsXml", "Save a Copy As XML...", "Uložit kopii jako XML..."),
+    ("templates.saveAs", "Save as Template...", "Uložit jako šablonu..."),
+    ("file.incrementAndSave", "Increment and Save", "Zvýšit číslo verze a uložit"),
+    ("file.revert", "Revert", "Vrátit k uložené verzi"),
+    ("", "Import", "Importovat"),
+    ("file.import", "File...", "Soubor..."),
+    ("file.importMultiple", "Multiple Files...", "Více souborů..."),
+    ("file.importTimeline", "Adobe Premiere Pro Project...", "Projekt Adobe Premiere Pro..."),
+    ("file.importAep", "After Effects Project...", "Projekt After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Projekt EffectCraft..."),
+    ("file.importPlaceholder", "Placeholder...", "Zástupný záznam..."),
+    ("file.importSolid", "Solid...", "Plná vrstva..."),
+    ("file.importLottie", "Lottie...", "Lottie..."),
+    ("file.importVanishingPoint", "Vanishing Point (.vpe)...", "Úběžný bod (.vpe)..."),
+    ("essential.importTemplate", "Essential Graphics Template...", "Šablona základní grafiky..."),
+    ("", "Import Recent Footage", "Importovat nedávný záznam"),
+    ("file.clearRecentFootage", "Clear Recent Footage", "Vymazat nedávné záznamy"),
+    ("", "Export", "Exportovat"),
+    ("renderQueue.add", "Add to Render Queue", "Přidat do fronty vykreslování"),
+    ("file.exportTimeline", "Adobe Premiere Pro Project...", "Projekt Adobe Premiere Pro..."),
+    ("file.exportLottie", "Lottie JSON...", "Lottie JSON..."),
+    ("essential.exportTemplate", "Essential Graphics Template...", "Šablona základní grafiky..."),
+    ("app.find", "Find", "Najít"),
+    ("layer.addItem", "Add Footage to Comp", "Přidat záznam do kompozice"),
+    ("file.newCompFromSelection", "New Comp from Selection...", "Nová kompozice z výběru..."),
+    ("", "Dependencies", "Závislosti"),
+    ("file.collectFiles", "Collect Files...", "Shromáždit soubory..."),
+    ("file.consolidateFootage", "Consolidate All Footage", "Sloučit duplicitní záznamy"),
+    ("file.removeUnusedFootage", "Remove Unused Footage", "Odstranit nepoužité záznamy"),
+    ("file.reduceProject", "Reduce Project", "Zredukovat projekt"),
+    ("file.findMissing", "Find Missing Effects", "Najít chybějící efekty"),
+    ("file.findMissing", "Find Missing Fonts", "Najít chybějící písma"),
+    ("file.findMissing", "Find Missing Footage", "Najít chybějící záznamy"),
+    ("file.relinkFootage", "Relink Missing Footage...", "Znovu připojit chybějící záznamy..."),
+    ("file.watchFolder", "Watch Folder...", "Sledovat složku..."),
+    ("", "Scripts", "Skripty"),
+    ("file.installScript", "Install Script File...", "Nainstalovat soubor skriptu..."),
+    ("file.installScriptUIPanel", "Install ScriptUI Panel...", "Nainstalovat panel ScriptUI..."),
+    ("file.runScript", "Run Script File...", "Spustit soubor skriptu..."),
+    ("", "Create Proxy", "Vytvořit zástupný soubor"),
+    ("file.createProxy", "Still...", "Statický snímek..."),
+    ("file.createProxy", "Movie...", "Video..."),
+    ("", "Set Proxy", "Nastavit zástupný soubor"),
+    ("file.setProxy", "File...", "Soubor..."),
+    ("file.setProxyNone", "None", "Žádný"),
+    ("", "Interpret Footage", "Interpretovat záznam"),
+    ("file.interpretFootage", "Main...", "Hlavní..."),
+    ("file.interpretProxy", "Proxy...", "Zástupný..."),
+    ("file.rememberInterpretation", "Remember Interpretation", "Zapamatovat interpretaci"),
+    ("file.applyInterpretation", "Apply Interpretation", "Použít interpretaci"),
+    ("", "Replace Footage", "Nahradit záznam"),
+    ("file.replaceFootage", "File...", "Soubor..."),
+    ("file.replaceWithPlaceholder", "Placeholder...", "Zástupný záznam..."),
+    ("file.replaceWithSolid", "Solid...", "Plná vrstva..."),
+    ("file.replaceWithLayeredComp", "With Layered Comp", "Kompozicí s vrstvami"),
+    ("file.reloadFootage", "Reload Footage", "Znovu načíst záznam"),
+    ("file.revealInFinder", "Reveal in Finder", "Zobrazit ve Finderu"),
+    ("file.projectSettings", "Project Settings...", "Nastavení projektu..."),
+    ("app.quit", "Exit", "Ukončit"),
+    ("", "Edit", "Úpravy"),
+    ("edit.undo", "Undo", "Zpět"),
+    ("edit.redo", "Redo", "Znovu"),
+    ("", "History", "Historie"),
+    ("app.commandPalette", "Quick Apply...", "Rychle použít..."),
+    ("edit.cut", "Cut", "Vyjmout"),
+    ("edit.copy", "Copy", "Kopírovat"),
+    ("edit.copyWithPropertyLinks", "Copy with Property Links", "Kopírovat s odkazy na vlastnosti"),
+    ("edit.copyWithRelativePropertyLinks", "Copy with Relative Property Links", "Kopírovat s relativními odkazy na vlastnosti"),
+    ("edit.copyExpressionOnly", "Copy Expression Only", "Kopírovat pouze výraz"),
+    ("edit.paste", "Paste", "Vložit"),
+    ("edit.pasteReversedKeyframes", "Paste Reversed Keyframes", "Vložit klíčové snímky v opačném pořadí"),
+    ("edit.pasteTextMatchFormatting", "Paste Text and Match Formatting", "Vložit text a přizpůsobit formátování"),
+    ("edit.pasteTextFormattingOnly", "Paste Text Formatting Only", "Vložit pouze formátování textu"),
+    ("edit.clear", "Clear", "Vymazat"),
+    ("edit.duplicate", "Duplicate", "Duplikovat"),
+    ("edit.splitLayer", "Split Layer", "Rozdělit vrstvu"),
+    ("edit.liftWorkArea", "Lift Work Area", "Vyjmout pracovní oblast bez posunu"),
+    ("edit.extractWorkArea", "Extract Work Area", "Vyjmout pracovní oblast s posunem"),
+    ("edit.selectAll", "Select All", "Vybrat vše"),
+    ("edit.deselectAll", "Deselect All", "Zrušit výběr"),
+    ("", "Label", "Štítek"),
+    ("edit.selectLabelGroup", "Select Label Group", "Vybrat skupinu podle štítku"),
+    ("edit.label", "None", "Žádný"),
+    ("edit.label", "Red", "Červený"),
+    ("edit.label", "Yellow", "Žlutý"),
+    ("edit.label", "Aqua", "Akvamarínový"),
+    ("edit.label", "Pink", "Růžový"),
+    ("edit.label", "Lavender", "Levandulový"),
+    ("edit.label", "Peach", "Broskvový"),
+    ("edit.label", "Sea Foam", "Mořská pěna"),
+    ("edit.label", "Blue", "Modrý"),
+    ("edit.label", "Green", "Zelený"),
+    ("edit.label", "Purple", "Fialový"),
+    ("edit.label", "Orange", "Oranžový"),
+    ("edit.label", "Brown", "Hnědý"),
+    ("edit.label", "Fuchsia", "Fuchsiový"),
+    ("edit.label", "Cyan", "Azurový"),
+    ("edit.label", "Sandstone", "Pískovcový"),
+    ("edit.label", "Dark Green", "Tmavě zelený"),
+    ("app.settings", "Edit Label Colors...", "Upravit barvy štítků..."),
+    ("", "Select Keyframe Label Group", "Vybrat skupinu podle štítku klíčových snímků"),
+    ("keys.selectLabelGroup", "On Selected Layers", "Na vybraných vrstvách"),
+    ("keys.selectLabelGroup", "On All Layers", "Na všech vrstvách"),
+    ("keys.selectLabelGroup", "Visible Keyframes on Selected Layers", "Viditelné klíčové snímky na vybraných vrstvách"),
+    ("keys.selectLabelGroup", "Visible Keyframes on All Layers", "Viditelné klíčové snímky na všech vrstvách"),
+    ("", "Purge", "Vyprázdnit"),
+    ("edit.purge", "All Cache...", "Celou mezipaměť..."),
+    ("edit.purge", "All Memory & Disk Cache...", "Celou paměťovou a diskovou mezipaměť..."),
+    ("edit.purge", "All Memory", "Veškerou paměť"),
+    ("edit.purge", "All Disk Cache...", "Celou diskovou mezipaměť..."),
+    ("edit.purge", "All 3D Cache...", "Celou 3D mezipaměť..."),
+    ("edit.purgeUndo", "Undo", "Historii vracení změn"),
+    ("edit.purge", "Image Cache Memory", "Paměť obrazové mezipaměti"),
+    ("edit.purge", "Snapshot", "Snímek náhledu"),
+    ("edit.editOriginal", "Edit Original...", "Upravit originál..."),
+    ("", "Templates", "Šablony"),
+    ("app.templates", "Render Settings...", "Nastavení vykreslování..."),
+    ("app.templates", "Output Module...", "Výstupní modul..."),
+    ("app.keyboardShortcuts", "Keyboard Shortcuts", "Klávesové zkratky"),
+    ("", "Preferences", "Předvolby"),
+    ("", "Composition", "Kompozice"),
+    ("comp.new", "New Composition...", "Nová kompozice..."),
+    ("comp.settings", "Composition Settings...", "Nastavení kompozice..."),
+    ("comp.setPosterTime", "Set Poster Time", "Nastavit čas reprezentativního snímku"),
+    ("comp.trimToWorkArea", "Trim Comp to Work Area", "Oříznout kompozici na pracovní oblast"),
+    ("comp.cropToRegionOfInterest", "Crop Comp to Region of Interest", "Oříznout kompozici na oblast zájmu"),
+    ("comp.cropToLayerBounds", "Crop Comp to Selected Layer(s) Bounds", "Oříznout kompozici na hranice vybrané vrstvy (vrstev)"),
+    ("render.addOutputModule", "Add Output Module", "Přidat výstupní modul"),
+    ("", "Preview", "Náhled"),
+    ("playback.toggle", "Play Current Preview", "Přehrát aktuální náhled"),
+    ("playback.cacheWhenIdle", "Cache Frames When Idle", "Ukládat snímky do mezipaměti při nečinnosti"),
+    ("playback.audio", "Audio", "Zvuk"),
+    ("", "Save Frame As", "Uložit snímek jako"),
+    ("comp.saveFrameAs", "File...", "Soubor..."),
+    ("comp.saveFrameAsPsd", "Photoshop Layers...", "Vrstvy Photoshopu..."),
+    ("comp.saveFrameAsExr", "ProEXR...", "ProEXR..."),
+    ("comp.copyFrame", "Copy Frame to Clipboard", "Kopírovat snímek do schránky"),
+    ("render.preRender", "Pre-render...", "Předvykreslit..."),
+    ("render.saveCurrentPreview", "Save Current Preview...", "Uložit aktuální náhled..."),
+    ("comp.openInEssentialGraphics", "Open in Essential Graphics", "Otevřít v základní grafice"),
+    ("", "Responsive Design — Time", "Responzivní návrh — čas"),
+    ("comp.responsiveTime", "Create Intro", "Vytvořit úvod"),
+    ("comp.responsiveTime", "Create Outro", "Vytvořit závěr"),
+    ("comp.responsiveTime", "Create Protected Region from Work Area", "Vytvořit chráněnou oblast z pracovní oblasti"),
+    ("comp.flowchart", "Composition Flowchart", "Vývojový diagram kompozice"),
+    ("comp.miniFlowchart", "Composition Mini-Flowchart", "Malý vývojový diagram kompozice"),
+    ("", "VR", "VR"),
+    ("comp.vr.createEnvironment", "Create VR Environment...", "Vytvořit prostředí VR..."),
+    ("comp.vr.extractCubemap", "Extract Cubemap...", "Extrahovat krychlovou mapu..."),
+    ("", "Layer", "Vrstva"),
+    ("layer.newText", "Text", "Text"),
+    ("layer.newSolid", "Solid...", "Plná vrstva..."),
+    ("layer.newLight", "Light...", "Světlo..."),
+    ("layer.newCamera", "Camera...", "Kamera..."),
+    ("layer.newNull", "Null Object", "Prázdný objekt"),
+    ("layer.newShape", "Shape Layer", "Vrstva tvaru"),
+    ("layer.newAdjustment", "Adjustment Layer", "Vrstva úprav"),
+    ("layer.newContentAwareFill", "Content-Aware Fill Layer...", "Vrstva výplně podle obsahu..."),
+    ("layer.new3dPrimitive", "Cube", "Krychle"),
+    ("layer.new3dPrimitive", "Sphere", "Koule"),
+    ("layer.new3dPrimitive", "Plane", "Rovina"),
+    ("layer.new3dPrimitive", "Torus", "Prstenec"),
+    ("layer.new3dPrimitive", "Cone", "Kužel"),
+    ("layer.new3dPrimitive", "Cylinder", "Válec"),
+    ("layer.settings", "Layer Settings...", "Nastavení vrstvy..."),
+    ("layer.openLayer", "Open Layer", "Otevřít vrstvu"),
+    ("layer.openSource", "Open Layer Source", "Otevřít zdroj vrstvy"),
+    ("layer.revealInFinder", "Reveal in Finder", "Zobrazit ve Finderu"),
+    ("", "Mask", "Maska"),
+    ("layer.addMask", "New Mask", "Nová maska"),
+    ("layer.mask.shape", "Mask Shape...", "Tvar masky..."),
+    ("layer.mask.set", "Mask Feather...", "Prolnutí okrajů masky..."),
+    ("layer.mask.set", "Mask Opacity...", "Krytí masky..."),
+    ("layer.mask.set", "Mask Expansion...", "Rozšíření masky..."),
+    ("layer.mask.reset", "Reset Mask", "Obnovit masku"),
+    ("layer.mask.remove", "Remove Mask", "Odstranit masku"),
+    ("layer.mask.removeAll", "Remove All Masks", "Odstranit všechny masky"),
+    ("track.mask", "Track Mask", "Sledovat masku"),
+    ("", "Mode", "Režim"),
+    ("layer.mask.mode", "None", "Žádný"),
+    ("layer.mask.mode", "Add", "Přičíst"),
+    ("layer.mask.mode", "Subtract", "Odečíst"),
+    ("layer.mask.mode", "Intersect", "Průnik"),
+    ("layer.mask.mode", "Lighten", "Zesvětlit"),
+    ("layer.mask.mode", "Darken", "Ztmavit"),
+    ("layer.mask.mode", "Difference", "Rozdíl"),
+    ("layer.mask.invert", "Inverted", "Invertovaná"),
+    ("layer.mask.lock", "Locked", "Zamknutá"),
+    ("", "Motion Blur", "Rozostření pohybem"),
+    ("layer.mask.motionBlur", "Same As Layer", "Stejné jako u vrstvy"),
+    ("layer.mask.motionBlur", "On", "Zapnuto"),
+    ("layer.mask.motionBlur", "Off", "Vypnuto"),
+    ("", "Feather Falloff", "Průběh prolnutí okrajů"),
+    ("layer.mask.featherFalloff", "Smooth", "Plynulý"),
+    ("layer.mask.featherFalloff", "Linear", "Lineární"),
+    ("layer.mask.unlockAll", "Unlock All Masks", "Odemknout všechny masky"),
+    ("layer.mask.lockOthers", "Lock Other Masks", "Zamknout ostatní masky"),
+    ("layer.mask.hideLocked", "Hide Locked Masks", "Skrýt zamknuté masky"),
+    ("", "Mask and Shape Path", "Cesta masky a tvaru"),
+    ("path.rotoBezier", "RotoBezier", "RotoBezier"),
+    ("mask.setClosed", "Closed", "Uzavřená"),
+    ("path.convertToBezier", "Convert To Bezier Path", "Převést na Bézierovu cestu"),
+    ("path.setFirstVertex", "Set First Vertex", "Nastavit první vrchol"),
+    ("path.freeTransform", "Free Transform Points", "Volně transformovat body"),
+    ("", "Quality", "Kvalita"),
+    ("layer.quality", "Best", "Nejlepší"),
+    ("layer.quality", "Draft", "Pracovní"),
+    ("layer.quality", "Wireframe", "Drátový model"),
+    ("layer.sampling", "Bilinear", "Bilineární"),
+    ("layer.sampling", "Bicubic", "Bikubické"),
+    ("", "Switches", "Přepínače"),
+    ("layer.hideOtherVideo", "Hide Other Video", "Skrýt ostatní video"),
+    ("layer.showAllVideo", "Show All Video", "Zobrazit veškeré video"),
+    ("layer.unlockAll", "Unlock All Layers", "Odemknout všechny vrstvy"),
+    ("layer.expressions", "Enable Expressions", "Povolit výrazy"),
+    ("layer.expressions", "Disable Expressions", "Zakázat výrazy"),
+    ("layer.setSwitch", "Shy", "Skrýt z časové osy"),
+    ("layer.setSwitch", "Lock", "Zamknout"),
+    ("layer.setSwitch", "Audio", "Zvuk"),
+    ("layer.setSwitch", "Video", "Video"),
+    ("layer.setSwitch", "Solo", "Sólo"),
+    ("layer.setSwitch", "Effect", "Efekt"),
+    ("layer.setSwitch", "Collapse", "Sbalit transformace"),
+    ("layer.setSwitch", "Motion Blur", "Rozostření pohybem"),
+    ("layer.setSwitch", "Adjustment Layer", "Vrstva úprav"),
+    ("", "Transform", "Transformace"),
+    ("layer.transform", "Reset", "Obnovit"),
+    ("layer.setTransform", "Anchor Point...", "Kotevní bod..."),
+    ("layer.setTransform", "Position...", "Pozice..."),
+    ("layer.setTransform", "Scale...", "Měřítko..."),
+    ("layer.setTransform", "Orientation...", "Orientace..."),
+    ("layer.setTransform", "Rotation...", "Otočení..."),
+    ("layer.setTransform", "Opacity...", "Krytí..."),
+    ("layer.transform", "Flip Horizontal", "Převrátit vodorovně"),
+    ("layer.transform", "Flip Vertical", "Převrátit svisle"),
+    ("layer.transform", "Center In View", "Vystředit v zobrazení"),
+    ("layer.centerAnchor", "Center Anchor Point in Layer Content", "Vystředit kotevní bod v obsahu vrstvy"),
+    ("layer.transform", "Fit to Comp", "Přizpůsobit kompozici"),
+    ("layer.transform", "Fit to Comp Width", "Přizpůsobit šířce kompozice"),
+    ("layer.transform", "Fit to Comp Height", "Přizpůsobit výšce kompozice"),
+    ("layer.autoOrient", "Auto-Orient...", "Automaticky orientovat..."),
+    ("", "Time", "Čas"),
+    ("layer.enableTimeRemap", "Enable Time Remapping", "Povolit přemapování času"),
+    ("layer.timeReverse", "Time-Reverse Layer", "Obrátit čas vrstvy"),
+    ("layer.timeStretch", "Time Stretch...", "Roztažení času..."),
+    ("layer.freezeFrame", "Freeze Frame", "Zmrazit snímek"),
+    ("layer.freezeOnLastFrame", "Freeze On Last Frame", "Zmrazit na posledním snímku"),
+    ("layer.alignVideoToData", "Align Video to Data", "Zarovnat video podle dat"),
+    ("", "Frame Blending", "Prolnutí snímků"),
+    ("layer.frameBlending", "Off", "Vypnuto"),
+    ("layer.frameBlending", "Frame Mix", "Smíchání snímků"),
+    ("layer.frameBlending", "Pixel Motion", "Pohyb pixelů"),
+    ("layer.setSwitch", "3D Layer", "3D vrstva"),
+    ("layer.setSwitch", "Guide Layer", "Pomocná vrstva"),
+    ("layer.environment", "Environment Layer", "Vrstva prostředí"),
+    ("", "Markers", "Značky"),
+    ("layer.addMarker", "Add Marker", "Přidat značku"),
+    ("layer.updateMarkersFromSource", "Update Markers From Source", "Aktualizovat značky ze zdroje"),
+    ("layer.markersLock", "Lock Markers", "Zamknout značky"),
+    ("layer.deleteAllMarkers", "Delete All Markers", "Odstranit všechny značky"),
+    ("layer.setSwitch", "Preserve Transparency", "Zachovat průhlednost"),
+    ("", "Blending Mode", "Režim prolnutí"),
+    ("layer.setBlendMode", "Normal", "Normální"),
+    ("layer.setBlendMode", "Dissolve", "Rozpustit"),
+    ("layer.setBlendMode", "Dancing Dissolve", "Tančící rozpuštění"),
+    ("layer.setBlendMode", "Darken", "Ztmavit"),
+    ("layer.setBlendMode", "Multiply", "Násobit"),
+    ("layer.setBlendMode", "Color Burn", "Ztmavit barvy"),
+    ("layer.setBlendMode", "Classic Color Burn", "Klasické ztmavení barev"),
+    ("layer.setBlendMode", "Linear Burn", "Lineárně ztmavit"),
+    ("layer.setBlendMode", "Darker Color", "Tmavší barva"),
+    ("layer.setBlendMode", "Add", "Přičíst"),
+    ("layer.setBlendMode", "Lighten", "Zesvětlit"),
+    ("layer.setBlendMode", "Screen", "Závoj"),
+    ("layer.setBlendMode", "Color Dodge", "Zesvětlit barvy"),
+    ("layer.setBlendMode", "Classic Color Dodge", "Klasické zesvětlení barev"),
+    ("layer.setBlendMode", "Linear Dodge", "Lineárně zesvětlit"),
+    ("layer.setBlendMode", "Lighter Color", "Světlejší barva"),
+    ("layer.setBlendMode", "Overlay", "Překrýt"),
+    ("layer.setBlendMode", "Soft Light", "Měkké světlo"),
+    ("layer.setBlendMode", "Hard Light", "Tvrdé světlo"),
+    ("layer.setBlendMode", "Linear Light", "Lineární světlo"),
+    ("layer.setBlendMode", "Vivid Light", "Jasné světlo"),
+    ("layer.setBlendMode", "Pin Light", "Kolíkové světlo"),
+    ("layer.setBlendMode", "Hard Mix", "Tvrdé míchání"),
+    ("layer.setBlendMode", "Difference", "Rozdíl"),
+    ("layer.setBlendMode", "Classic Difference", "Klasický rozdíl"),
+    ("layer.setBlendMode", "Exclusion", "Vyloučit"),
+    ("layer.setBlendMode", "Subtract", "Odečíst"),
+    ("layer.setBlendMode", "Divide", "Dělit"),
+    ("layer.setBlendMode", "Hue", "Odstín"),
+    ("layer.setBlendMode", "Saturation", "Sytost"),
+    ("layer.setBlendMode", "Color", "Barva"),
+    ("layer.setBlendMode", "Luminosity", "Světlost"),
+    ("layer.setBlendMode", "Stencil Alpha", "Šablona alfa"),
+    ("layer.setBlendMode", "Stencil Luma", "Šablona jasu"),
+    ("layer.setBlendMode", "Silhouette Alpha", "Silueta alfa"),
+    ("layer.setBlendMode", "Silhouette Luma", "Silueta jasu"),
+    ("layer.setBlendMode", "Alpha Add", "Přičíst alfu"),
+    ("layer.setBlendMode", "Luminescent Premul", "Luminiscenční přednásobení"),
+    ("layer.setBlendMode", "Next Blending Mode", "Následující režim prolnutí"),
+    ("layer.setBlendMode", "Previous Blending Mode", "Předchozí režim prolnutí"),
+    ("", "Track Matte", "Maska stopy"),
+    ("layer.trackMatte", "No Track Matte", "Bez masky stopy"),
+    ("layer.trackMatte", "Alpha Matte", "Alfa maska"),
+    ("layer.trackMatte", "Alpha Inverted Matte", "Invertovaná alfa maska"),
+    ("layer.trackMatte", "Luma Matte", "Maska jasu"),
+    ("layer.trackMatte", "Luma Inverted Matte", "Invertovaná maska jasu"),
+    ("layer.trackMatte", "Matte with Layer Above", "Maskovat vrstvou výše"),
+    ("layer.trackMatte", "Matte with Layer Below", "Maskovat vrstvou níže"),
+    ("", "Layer Styles", "Styly vrstvy"),
+    ("layer.style.options", "Layer Style Options...", "Možnosti stylu vrstvy..."),
+    ("layer.style.convertToEditable", "Convert to Editable Styles", "Převést na upravitelné styly"),
+    ("layer.style.showAll", "Show All", "Zobrazit vše"),
+    ("layer.style.removeAll", "Remove All", "Odstranit vše"),
+    ("layer.style.dropShadow", "Drop Shadow", "Vržený stín"),
+    ("layer.style.innerShadow", "Inner Shadow", "Vnitřní stín"),
+    ("layer.style.outerGlow", "Outer Glow", "Vnější záře"),
+    ("layer.style.innerGlow", "Inner Glow", "Vnitřní záře"),
+    ("layer.style.bevelEmboss", "Bevel and Emboss", "Úkos a reliéf"),
+    ("layer.style.satin", "Satin", "Satén"),
+    ("layer.style.colorOverlay", "Color Overlay", "Překrytí barvou"),
+    ("layer.style.gradientOverlay", "Gradient Overlay", "Překrytí přechodem"),
+    ("layer.style.stroke", "Stroke", "Tah"),
+    ("path.groupShapes", "Group Shapes", "Seskupit tvary"),
+    ("path.ungroupShapes", "Ungroup Shapes", "Zrušit seskupení tvarů"),
+    ("", "Arrange", "Uspořádat"),
+    ("layer.arrange", "Bring Layer to Front", "Přenést vrstvu do popředí"),
+    ("layer.arrange", "Bring Layer Forward", "Posunout vrstvu vpřed"),
+    ("layer.arrange", "Send Layer Backward", "Posunout vrstvu vzad"),
+    ("layer.arrange", "Send Layer to Back", "Přenést vrstvu do pozadí"),
+    ("", "Reveal", "Zobrazit"),
+    ("layer.revealSource", "Reveal Layer Source in Project", "Zobrazit zdroj vrstvy v projektu"),
+    ("comp.flowchart", "Reveal Layer in Project Flowchart", "Zobrazit vrstvu ve vývojovém diagramu projektu"),
+    ("comp.revealInProject", "Reveal Composition in Project", "Zobrazit kompozici v projektu"),
+    ("layer.revealExpressionErrors", "Reveal Expression Errors", "Zobrazit chyby výrazů"),
+    ("", "Create", "Vytvořit"),
+    ("layer.create", "Convert to Editable Text", "Převést na upravitelný text"),
+    ("layer.create", "Create Shapes from Text", "Vytvořit tvary z textu"),
+    ("layer.create", "Create Masks from Text", "Vytvořit masky z textu"),
+    ("layer.create", "Create Shapes from Vector Layer", "Vytvořit tvary z vektorové vrstvy"),
+    ("layer.create", "Create Keyframes from Data", "Vytvořit klíčové snímky z dat"),
+    ("layer.create", "Null Controllers for Positional Points", "Prázdné ovladače pro poziční body"),
+    ("layer.create", "Null Controllers for Path Points", "Prázdné ovladače pro body cesty"),
+    ("layer.create", "Nulls Following Path Points", "Prázdné objekty sledující body cesty"),
+    ("layer.create", "Null Tracing Along Path", "Prázdný objekt pohybující se po cestě"),
+    ("layer.create", "Create 3D Layer Instance", "Vytvořit instanci 3D vrstvy"),
+    ("", "Camera", "Kamera"),
+    ("camera.fromView", "Create Camera from 3D View", "Vytvořit kameru z 3D zobrazení"),
+    ("camera.stereoRig", "Create Stereo 3D Rig", "Vytvořit stereoskopickou 3D sestavu"),
+    ("camera.orbitNull", "Create Orbit Null", "Vytvořit prázdný objekt pro obíhání"),
+    ("camera.fromModel", "Create Cameras from 3D Model", "Vytvořit kamery z 3D modelu"),
+    ("camera.linkFocusToPoi", "Link Focus Distance to Point of Interest", "Propojit vzdálenost zaostření s bodem zájmu"),
+    ("camera.linkFocusToLayer", "Link Focus Distance to Layer", "Propojit vzdálenost zaostření s vrstvou"),
+    ("camera.setFocusToLayer", "Set Focus Distance to Layer", "Nastavit vzdálenost zaostření na vrstvu"),
+    ("layer.cameraSettings", "Camera Settings...", "Nastavení kamery..."),
+    ("view.reset3DView", "Reset 3D View", "Obnovit 3D zobrazení"),
+    ("", "Light", "Světlo"),
+    ("light.fromModel", "Create Lights from 3D Model", "Vytvořit světla z 3D modelu"),
+    ("light.controlWithCamera", "Control Light with Camera", "Ovládat světlo kamerou"),
+    ("light.environmentBackground", "Create Environment Light Background Layer", "Vytvořit vrstvu pozadí pro světlo prostředí"),
+    ("", "Material", "Materiál"),
+    ("material.revealSource", "Reveal Material Source in Project", "Zobrazit zdroj materiálu v projektu"),
+    ("material.reset", "Reset Material", "Obnovit materiál"),
+    ("material.duplicateAssign", "Duplicate and Assign Material", "Duplikovat a přiřadit materiál"),
+    ("layer.autoTrace", "Auto-trace...", "Automaticky obkreslit..."),
+    ("layer.precompose", "Pre-compose...", "Předkomponovat..."),
+    ("layer.sceneEditDetection", "Scene Edit Detection...", "Rozpoznat střihy scén..."),
+    ("", "Effect", "Efekt"),
+    ("window.panel", "Effect Controls", "Ovládací prvky efektu"),
+    ("effect.applyLast", "Last Effect", "Poslední efekt"),
+    ("effect.removeAll", "Remove All", "Odstranit vše"),
+    ("effect.manage", "Manage Effects...", "Spravovat efekty..."),
+    ("effect.plugins.load", "Load Effect Plug-in...", "Načíst zásuvný modul efektu..."),
+    ("effect.plugins.loadOfx", "Load OpenFX Plug-in...", "Načíst zásuvný modul OpenFX..."),
+    ("", "Animation", "Animace"),
+    ("anim.savePreset", "Save Animation Preset...", "Uložit přednastavení animace..."),
+    ("anim.applyPreset", "Apply Animation Preset...", "Použít přednastavení animace..."),
+    ("", "Recent Animation Presets", "Nedávná přednastavení animace"),
+    ("anim.clearRecentPresets", "Clear Recent Presets", "Vymazat nedávná přednastavení"),
+    ("anim.browsePresets", "Browse Presets...", "Procházet přednastavení..."),
+    ("", "Text Animation Presets", "Přednastavení animace textu"),
+    ("layer.applyTextPreset", "Typewriter", "Psací stroj"),
+    ("layer.applyTextPreset", "Fade Up Characters", "Postupně zobrazit znaky"),
+    ("layer.applyTextPreset", "Bounce In Words", "Slova s odskokem"),
+    ("layer.applyTextPreset", "Tracking In", "Zúžit prostrkání"),
+    ("layer.applyTextPreset", "Scramble", "Promíchat znaky"),
+    ("layer.applyTextPreset", "Blur In", "Zaostřit text"),
+    ("layer.applyTextPreset", "Jitter", "Chvění"),
+    ("layer.applyTextPreset", "Drop In Lines", "Spustit řádky shora"),
+    ("anim.addKeyframe", "Add Keyframe", "Přidat klíčový snímek"),
+    ("keys.toggleHold", "Toggle Hold Keyframe", "Přepnout podržení klíčového snímku"),
+    ("keys.interpolation", "Keyframe Interpolation...", "Interpolace klíčových snímků..."),
+    ("keys.velocity", "Keyframe Velocity...", "Rychlost klíčového snímku..."),
+    ("", "Keyframe Assistant", "Pomocník klíčových snímků"),
+    ("keys.audioToKeyframes", "Convert Audio to Keyframes", "Převést zvuk na klíčové snímky"),
+    ("prop.convertExpressionToKeyframes", "Convert Expression to Keyframes", "Převést výraz na klíčové snímky"),
+    ("keys.easyEase", "Easy Ease", "Snadné zpomalení"),
+    ("keys.easyEaseIn", "Easy Ease In", "Snadné zpomalení na vstupu"),
+    ("keys.easyEaseOut", "Easy Ease Out", "Snadné zpomalení na výstupu"),
+    ("keys.exponentialScale", "Exponential Scale", "Exponenciální měřítko"),
+    ("keys.rpfCameraImport", "RPF Camera Import", "Import kamery RPF"),
+    ("layer.sequence", "Sequence Layers...", "Seřadit vrstvy za sebe..."),
+    ("keys.timeReverse", "Time-Reverse Keyframes", "Obrátit čas klíčových snímků"),
+    ("", "Animate Text", "Animovat text"),
+    ("layer.enablePerChar3D", "Enable Per-character 3D", "Povolit 3D pro jednotlivé znaky"),
+    ("layer.addTextAnimator", "Anchor Point", "Kotevní bod"),
+    ("layer.addTextAnimator", "Position", "Pozice"),
+    ("layer.addTextAnimator", "Scale", "Měřítko"),
+    ("layer.addTextAnimator", "Skew", "Zkosení"),
+    ("layer.addTextAnimator", "Rotation", "Otočení"),
+    ("layer.addTextAnimator", "Opacity", "Krytí"),
+    ("layer.addTextAnimator", "All Transform Properties", "Všechny vlastnosti transformace"),
+    ("", "Fill Color", "Barva výplně"),
+    ("layer.addTextAnimator", "RGB", "RGB"),
+    ("layer.addTextAnimator", "Hue", "Odstín"),
+    ("layer.addTextAnimator", "Saturation", "Sytost"),
+    ("layer.addTextAnimator", "Brightness", "Jas"),
+    ("", "Stroke Color", "Barva tahu"),
+    ("layer.addTextAnimator", "Stroke Width", "Šířka tahu"),
+    ("layer.addTextAnimator", "Tracking", "Prostrkání"),
+    ("layer.addTextAnimator", "Line Anchor", "Kotevní bod řádku"),
+    ("layer.addTextAnimator", "Line Spacing", "Řádkování"),
+    ("layer.addTextAnimator", "Character Offset", "Posun znaku"),
+    ("layer.addTextAnimator", "Character Value", "Hodnota znaku"),
+    ("layer.addTextAnimator", "Blur", "Rozostření"),
+    ("text.animatorFontAxes", "Variable Font Axes", "Osy variabilního písma"),
+    ("", "Add Text Selector", "Přidat selektor textu"),
+    ("text.addSelector", "Range", "Rozsah"),
+    ("text.addSelector", "Wiggly", "Chvějivý"),
+    ("text.addSelector", "Expression", "Výraz"),
+    ("text.removeAllAnimators", "Remove All Text Animators", "Odstranit všechny animátory textu"),
+    ("prop.setExpression", "Add Expression", "Přidat výraz"),
+    ("essential.addProperty", "Add Property to Essential Graphics", "Přidat vlastnost do základní grafiky"),
+    ("prop.separateDimensions", "Separate Dimensions", "Oddělit rozměry"),
+    ("track.camera", "Track Camera", "Sledovat kameru"),
+    ("track.warpStabilizer", "Warp Stabilizer VFX", "Stabilizátor deformací VFX"),
+    ("track.motion", "Track Motion", "Sledovat pohyb"),
+    ("track.stabilize", "Stabilize Motion", "Stabilizovat pohyb"),
+    ("track.property", "Track this Property", "Sledovat tuto vlastnost"),
+    ("anim.reveal", "Reveal Properties with Keyframes", "Zobrazit vlastnosti s klíčovými snímky"),
+    ("anim.reveal", "Reveal Properties with Animation", "Zobrazit vlastnosti s animací"),
+    ("anim.reveal", "Reveal All Modified Properties", "Zobrazit všechny změněné vlastnosti"),
+    ("", "View", "Zobrazení"),
+    ("view.newViewer", "New Viewer", "Nový prohlížeč"),
+    ("view.splitLockedViewer", "Split with New Locked Viewer", "Rozdělit s novým zamknutým prohlížečem"),
+    ("view.zoomIn", "Zoom In", "Přiblížit"),
+    ("view.zoomOut", "Zoom Out", "Oddálit"),
+    ("", "Resolution", "Rozlišení"),
+    ("view.res.full", "Full", "Plné"),
+    ("view.res.half", "Half", "Poloviční"),
+    ("view.res.third", "Third", "Třetinové"),
+    ("view.res.quarter", "Quarter", "Čtvrtinové"),
+    ("view.res.custom", "Custom...", "Vlastní..."),
+    ("view.displayColorManagement", "Use Display Color Management", "Použít správu barev monitoru"),
+    ("", "Simulate Output", "Simulovat výstup"),
+    ("view.simulateOutput", "No Output Simulation", "Bez simulace výstupu"),
+    ("view.simulateOutput", "HDTV (Rec. 709)", "HDTV (Rec. 709)"),
+    ("view.simulateOutput", "SDTV NTSC", "SDTV NTSC"),
+    ("view.simulateOutput", "SDTV PAL", "SDTV PAL"),
+    ("view.simulateOutput", "Legacy Macintosh RGB (Gamma 1.8)", "Starší Macintosh RGB (gama 1.8)"),
+    ("view.simulateOutput", "Internet Standard RGB (sRGB)", "Internetový standard RGB (sRGB)"),
+    ("view.simulateOutput", "UHDTV (Rec. 2020)", "UHDTV (Rec. 2020)"),
+    ("view.simulateOutput", "Display P3", "Display P3"),
+    ("view.simulateOutput", "Linear (1.0 Gamma)", "Lineární (gama 1.0)"),
+    ("view.customRgb", "My Custom RGB...", "Moje vlastní RGB..."),
+    ("view.simulateOutput", "Custom...", "Vlastní..."),
+    ("view.rulers", "Show Rulers", "Zobrazit pravítka"),
+    ("", "Panel Background Color", "Barva pozadí panelu"),
+    ("view.panelBackground", "Black", "Černá"),
+    ("view.panelBackground", "Dark Gray", "Tmavě šedá"),
+    ("view.panelBackground", "Medium Gray (Default)", "Středně šedá (výchozí)"),
+    ("view.panelBackground", "Light Gray", "Světle šedá"),
+    ("view.panelBackground", "White", "Bílá"),
+    ("view.panelBackground", "Custom", "Vlastní"),
+    ("view.panelBackground", "Select Custom Background Color...", "Vybrat vlastní barvu pozadí..."),
+    ("view.guides", "Show Guides", "Zobrazit vodítka"),
+    ("view.snapToGuides", "Snap to Guides", "Přichytávat k vodítkům"),
+    ("view.lockGuides", "Lock Guides", "Zamknout vodítka"),
+    ("view.addGuide", "Add Guide...", "Přidat vodítko..."),
+    ("view.addPercentGuide", "Add Percentage Guide...", "Přidat procentuální vodítko..."),
+    ("view.convertGuides", "Convert Guides to Percentage", "Převést vodítka na procenta"),
+    ("view.convertGuides", "Convert Guides to Pixels", "Převést vodítka na pixely"),
+    ("view.clearGuides", "Clear Guides", "Vymazat vodítka"),
+    ("view.importGuides", "Import Guides...", "Importovat vodítka..."),
+    ("view.exportGuides", "Export Guides...", "Exportovat vodítka..."),
+    ("view.grid", "Show Grid", "Zobrazit mřížku"),
+    ("view.snapToGrid", "Snap to Grid", "Přichytávat k mřížce"),
+    ("view.snapping", "Snapping", "Přichytávání"),
+    ("view.options", "View Options...", "Možnosti zobrazení..."),
+    ("view.layerControls", "Show Layer Controls", "Zobrazit ovládací prvky vrstvy"),
+    ("", "Switch View Layout", "Přepnout rozložení zobrazení"),
+    ("view.layout", "1 View", "1 zobrazení"),
+    ("view.layout", "2 Views", "2 zobrazení"),
+    ("view.layout", "4 Views", "4 zobrazení"),
+    ("view.shareViewOptions", "Share View Options", "Sdílet možnosti zobrazení"),
+    ("", "Switch 3D View", "Přepnout 3D zobrazení"),
+    ("view.3d.activeCamera", "Active Camera", "Aktivní kamera"),
+    ("view.3d.default", "Default", "Výchozí"),
+    ("view.3d.front", "Front", "Zepředu"),
+    ("view.3d.left", "Left", "Zleva"),
+    ("view.3d.top", "Top", "Shora"),
+    ("view.3d.back", "Back", "Zezadu"),
+    ("view.3d.right", "Right", "Zprava"),
+    ("view.3d.bottom", "Bottom", "Zdola"),
+    ("view.3d.custom1", "Custom View 1", "Vlastní zobrazení 1"),
+    ("view.3d.custom2", "Custom View 2", "Vlastní zobrazení 2"),
+    ("view.3d.custom3", "Custom View 3", "Vlastní zobrazení 3"),
+    ("", "Assign Shortcut to 3D View", "Přiřadit zkratku 3D zobrazení"),
+    ("view.3d.last", "Switch to Last 3D View", "Přepnout na poslední 3D zobrazení"),
+    ("view.lookAtSelected", "Look at Selected Layers", "Zaměřit vybrané vrstvy"),
+    ("view.lookAtAll", "Look at All Layers", "Zaměřit všechny vrstvy"),
+    ("time.set", "Go to Time...", "Přejít na čas..."),
+    ("view.fullScreen", "Enter Full Screen", "Přejít na celou obrazovku"),
+    ("", "Window", "Okno"),
+    ("", "Workspace", "Pracovní prostor"),
+    ("window.workspace", "Default", "Výchozí"),
+    ("window.workspace", "Review", "Revize"),
+    ("window.workspace", "Learn", "Výuka"),
+    ("window.workspace", "Small Screen", "Malá obrazovka"),
+    ("window.workspace", "Standard", "Standardní"),
+    ("window.workspace", "All Panels", "Všechny panely"),
+    ("window.workspace", "Animation", "Animace"),
+    ("window.workspace", "Color", "Barva"),
+    ("window.workspace", "Effects", "Efekty"),
+    ("window.workspace", "Essential Graphics", "Základní grafika"),
+    ("window.workspace", "Minimal", "Minimální"),
+    ("window.workspace", "Motion Tracking", "Sledování pohybu"),
+    ("window.workspace", "Paint", "Malování"),
+    ("window.workspace", "Text", "Text"),
+    ("window.workspace", "Undocked Panels", "Odpojené panely"),
+    ("window.resetWorkspace", "Reset to Saved Layout", "Obnovit uložené rozložení"),
+    ("window.saveWorkspace", "Save Changes to this Workspace", "Uložit změny tohoto pracovního prostoru"),
+    ("window.saveWorkspaceAs", "Save as New Workspace...", "Uložit jako nový pracovní prostor..."),
+    ("window.editWorkspaces", "Edit Workspaces...", "Upravit pracovní prostory..."),
+    ("", "Assign Shortcut to Workspace", "Přiřadit zkratku pracovnímu prostoru"),
+    ("window.panel", "Align", "Zarovnání"),
+    ("window.panel", "Audio", "Zvuk"),
+    ("window.panel", "Brushes", "Štětce"),
+    ("window.panel", "Character", "Znak"),
+    ("window.panel", "Content-Aware Fill", "Výplň podle obsahu"),
+    ("window.panel", "Effects & Presets", "Efekty a přednastavení"),
+    ("window.panel", "Essential Graphics", "Základní grafika"),
+    ("window.panel", "Info", "Informace"),
+    ("help.inAppTutorials", "Learn", "Výuka"),
+    ("window.panel", "Lumetri Scopes", "Měřicí přístroje Lumetri"),
+    ("window.panel", "Mask Interpolation", "Interpolace masek"),
+    ("window.panel", "Media Browser", "Prohlížeč médií"),
+    ("window.panel", "Metadata", "Metadata"),
+    ("window.panel", "Motion Sketch", "Náčrt pohybu"),
+    ("window.panel", "Paint", "Malování"),
+    ("window.panel", "Paragraph", "Odstavec"),
+    ("window.panel", "Preview", "Náhled"),
+    ("window.panel", "Progress", "Průběh"),
+    ("window.panel", "Properties", "Vlastnosti"),
+    ("window.panel", "Script Console", "Konzole skriptů"),
+    ("window.panel", "Smoother", "Vyhlazení"),
+    ("window.panel", "Tools", "Nástroje"),
+    ("window.panel", "Tracker", "Sledování"),
+    ("window.panel", "Wiggler", "Generátor chvění"),
+    ("window.panel", "Composition", "Kompozice"),
+    ("window.panel", "Flowchart", "Vývojový diagram"),
+    ("window.panel", "Footage", "Záznam"),
+    ("window.panel", "Layer", "Vrstva"),
+    ("window.panel", "Project", "Projekt"),
+    ("window.panel", "Render Queue", "Fronta vykreslování"),
+    ("window.panel", "Timeline", "Časová osa"),
+    ("window.panel", "Create Nulls From Paths", "Vytvořit prázdné objekty z cest"),
+    ("window.panel", "VR Comp Editor", "Editor kompozice VR"),
+    ("", "Help", "Nápověda"),
+    ("help.docs", "EffectCraft Help...", "Nápověda k EffectCraft..."),
+    ("help.docs", "Scripting Help...", "Nápověda ke skriptování..."),
+    ("help.docs", "Expression Reference...", "Referenční příručka výrazů..."),
+    ("help.docs", "Effect Reference...", "Referenční příručka efektů..."),
+    ("anim.browsePresets", "Animation Presets...", "Přednastavení animace..."),
+    ("app.keyboardShortcuts", "Keyboard Shortcuts...", "Klávesové zkratky..."),
+    ("help.inAppTutorials", "In-App Tutorials...", "Výukové lekce v aplikaci..."),
+    ("help.onlineTutorials", "Online Tutorials...", "Výukové lekce online..."),
+    ("help.systemReport", "System Compatibility Report...", "Zpráva o kompatibilitě systému..."),
+    ("help.enableLogging", "Enable Logging", "Povolit protokolování"),
+    ("help.revealLogFile", "Reveal Logging File", "Zobrazit soubor protokolu"),
+    ("help.discord", "Join the ArtCraft Discord...", "Připojit se na Discord ArtCraft..."),
+    ("help.reportIssue", "Provide Feedback...", "Poskytnout zpětnou vazbu..."),
+    ("help.website", "ArtCraft Website", "Web ArtCraft"),
+    ("help.appPage", "EffectCraft Home Page", "Domovská stránka EffectCraft"),
+    ("help.github", "EffectCraft on GitHub", "EffectCraft na GitHubu"),
+    ("file.openDemoProject", "Open Demo Project", "Otevřít ukázkový projekt"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use effectcraft_engine::menus::{MenuNode, TREE, parse};
     use serde_json::json;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn czech_translates_menus_without_changing_bindings_or_user_names() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("prefs.set", json!({"key": "general.language", "value": "en"})).unwrap();
+        app.session.prefs.push_recent("File.ecproj");
+        let en = crate::native_menu::build(&app);
+        let state = crate::native_menu::state_key(&app);
+        app.session.execute("prefs.set", json!({"key": "general.language", "value": "cs"})).unwrap();
+        let cs = crate::native_menu::build(&app);
+        assert_eq!(language(&app), "cs");
+        assert!(czech(&app));
+        assert_eq!(code("cs"), "cs");
+        assert_ne!(state, crate::native_menu::state_key(&app));
+        let bindings = |menu: &crate::native_menu::NativeMenu| {
+            menu.items().into_iter().map(|i| (i.id.clone(), i.command.clone(), i.params.clone(), i.shortcut.clone(), i.enabled, i.checked)).collect::<Vec<_>>()
+        };
+        assert_eq!(bindings(&en), bindings(&cs));
+        assert!(cs.items().iter().any(|i| i.command == "comp.new" && i.label == "Nová kompozice..."));
+        assert!(cs.items().iter().any(|i| i.command == "layer.newText" && i.label == "Text"));
+        assert!(cs.items().iter().any(|i| i.command == "keys.easyEase" && i.label == "Snadné zpomalení"));
+        assert!(cs.items().iter().any(|i| i.command == "file.openRecent" && i.label == "File.ecproj"));
+        for (source, translated) in [
+            ("File", "Soubor"),
+            ("Edit", "Úpravy"),
+            ("Composition", "Kompozice"),
+            ("Layer", "Vrstva"),
+            ("Effect", "Efekt"),
+            ("Animation", "Animace"),
+            ("View", "Zobrazení"),
+            ("Window", "Okno"),
+            ("Help", "Nápověda"),
+        ] {
+            assert_eq!(label(&app, "", source), translated);
+        }
+        assert_eq!(label(&app, "unknown.command", "Text"), "Text");
+        let panel =
+            MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel": "layer"}), shortcut: None, alt_shortcuts: vec![] };
+        assert_eq!(entry(&app, &panel, "Layer: File Čeština".into()), "Vrstva: File Čeština");
+        assert_eq!(
+            submenu(&app, "Assign Shortcut to Workspace", "Assign Shortcut to “File Čeština” Workspace".into()),
+            "Přiřadit zkratku pracovnímu prostoru „File Čeština“"
+        );
+        assert_eq!(submenu(&app, "Assign Shortcut to 3D View", "Assign Shortcut to “Top”".into()), "Přiřadit zkratku 3D zobrazení „Top“");
+        assert_eq!(submenu(&app, "Assign Shortcut to Workspace", "Assign Shortcut to Workspace".into()), "Přiřadit zkratku pracovnímu prostoru");
+        app.session.execute("prefs.set", json!({"key": "general.language", "value": "en"})).unwrap();
+        assert_eq!(crate::native_menu::build(&app), en);
+    }
+
+    #[test]
+    fn czech_undo_redo_keeps_history_labels_verbatim() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("prefs.set", json!({"key": "general.language", "value": "cs"})).unwrap();
+        let undo = MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] };
+        let redo = MenuEntry { label: "Redo".into(), command: "edit.redo".into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] };
+        assert_eq!(entry(&app, &undo, "Can't Undo".into()), "Není co vrátit");
+        assert_eq!(entry(&app, &redo, "Can't Redo".into()), "Není co zopakovat");
+        app.session.history.undo.push(("File Čeština".into(), app.session.project.clone()));
+        app.session.history.redo.push(("Text Čeština".into(), app.session.project.clone()));
+        assert_eq!(entry(&app, &undo, "Undo File Čeština".into()), "Zpět File Čeština");
+        assert_eq!(entry(&app, &redo, "Redo Text Čeština".into()), "Znovu Text Čeština");
+    }
+
+    #[test]
+    fn czech_reveal_labels_follow_the_platform_file_manager() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("prefs.set", json!({"key": "general.language", "value": "cs"})).unwrap();
+        for command in ["file.revealInFinder", "layer.revealInFinder"] {
+            for (source, translated) in [
+                ("Reveal in Finder", "Zobrazit ve Finderu"),
+                ("Reveal in Explorer", "Zobrazit v Průzkumníku"),
+                ("Reveal in File Manager", "Zobrazit ve správci souborů"),
+            ] {
+                let e = MenuEntry { label: source.into(), command: command.into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] };
+                assert_eq!(label(&app, command, source), translated);
+                assert_eq!(entry(&app, &e, source.into()), translated);
+                assert_eq!(label(&app, "file.openRecent", source), source);
+            }
+            assert_eq!(label(&app, command, "My file.mp4"), "My file.mp4");
+        }
+    }
 
     fn keys(nodes: &[MenuNode], out: &mut BTreeSet<(String, String)>) {
         for node in nodes {
@@ -5940,6 +6748,7 @@ mod tests {
         let mut russian_keys = BTreeSet::new();
         let mut french_keys = BTreeSet::new();
         let mut german_keys = BTreeSet::new();
+        let mut czech_keys = BTreeSet::new();
         for (catalog, unique) in [
             (JAPANESE, &mut japanese_keys),
             (SIMPLIFIED_CHINESE, &mut chinese_keys),
@@ -5950,6 +6759,7 @@ mod tests {
             (RUSSIAN, &mut russian_keys),
             (FRENCH, &mut french_keys),
             (GERMAN, &mut german_keys),
+            (CZECH, &mut czech_keys),
         ] {
             for (command, en, translated) in catalog {
                 let key = (command.to_string(), en.to_string());
@@ -5979,6 +6789,7 @@ mod tests {
         assert_eq!(ukrainian_keys, russian_keys, "the languages must translate the same entries");
         assert_eq!(russian_keys, french_keys, "the languages must translate the same entries");
         assert_eq!(french_keys, german_keys, "the languages must translate the same entries");
+        assert_eq!(japanese_keys, czech_keys, "the languages must translate the same entries");
     }
 
     /// Exercise each engine spelling on every host: a macOS-only run must still catch a
@@ -5993,7 +6804,8 @@ mod tests {
                 ("Reveal in Explorer", "Показати у Провіднику"),
                 ("Reveal in File Manager", "Показати у файловому менеджері"),
             ] {
-                let e = MenuEntry { label: source.into(), command: command.into(), params: json!({"item": "My file.mp4"}), shortcut: None };
+                let e =
+                    MenuEntry { label: source.into(), command: command.into(), params: json!({"item": "My file.mp4"}), shortcut: None, alt_shortcuts: vec![] };
                 assert_eq!(label(&app, command, source), translated);
                 assert_eq!(entry(&app, &e, source.into()), translated);
                 assert_eq!(label(&app, "file.openRecent", source), source);
@@ -6022,7 +6834,7 @@ mod tests {
         assert_eq!(
             entry(
                 &app,
-                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None },
+                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None, alt_shortcuts: vec![] },
                 "Layer: File".into()
             ),
             "レイヤー: File"
@@ -6060,6 +6872,10 @@ mod tests {
             (Some("es-419"), "es"),
             (Some("pt-BR"), "pt-br"),
             (Some("pt_PT.UTF-8"), "pt-br"),
+            (Some("cs"), "cs"),
+            (Some("cs-CZ"), "cs"),
+            (Some("cs_CZ.UTF-8"), "cs"),
+            (Some("CS_cz.UTF-8"), "cs"),
             (Some("en-US"), "en"),
             (Some("jv-ID"), "en"),
             (Some("de-DE"), "en"),
@@ -6073,6 +6889,7 @@ mod tests {
         assert_eq!(simplified(&app), system_language() == "zh-hans");
         assert_eq!(traditional(&app), system_language() == "zh-hant");
         assert_eq!(spanish(&app), system_language() == "es");
+        assert_eq!(czech(&app), system_language() == "cs");
         app.session.execute("prefs.set", json!({"key":"general.language", "value":"ja"})).unwrap();
         assert!(japanese(&app));
         app.session.execute("prefs.set", json!({"key":"general.language", "value":"zh-hans"})).unwrap();
@@ -6092,7 +6909,9 @@ mod tests {
 
     #[test]
     fn every_translated_entry_keeps_the_english_shape() {
-        for (code, catalog) in [("zh-hans", SIMPLIFIED_CHINESE), ("zh-hant", TRADITIONAL_CHINESE), ("uk", UKRAINIAN), ("es", SPANISH), ("pt-br", PORTUGUESE)] {
+        for (code, catalog) in
+            [("zh-hans", SIMPLIFIED_CHINESE), ("zh-hant", TRADITIONAL_CHINESE), ("uk", UKRAINIAN), ("es", SPANISH), ("pt-br", PORTUGUESE), ("cs", CZECH)]
+        {
             for (command, en, translated) in catalog {
                 assert_eq!(en.contains("..."), translated.contains("..."), "{code} {command} / {en}: {translated}");
                 let brackets = |s: &str| s.chars().filter(|c| *c == '(' || *c == ')').count();
@@ -6118,13 +6937,17 @@ mod tests {
         // Untranslated keys and dynamic labels stay verbatim.
         assert_eq!(label(&app, "unknown.command", "Text"), "Text");
         assert_eq!(
-            entry(&app, &MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None }, "Undo Comp1".into()),
+            entry(
+                &app,
+                &MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] },
+                "Undo Comp1".into()
+            ),
             "无可撤销的操作"
         );
         assert_eq!(
             entry(
                 &app,
-                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None },
+                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None, alt_shortcuts: vec![] },
                 "Layer: File".into()
             ),
             "图层: File"
@@ -6158,13 +6981,17 @@ mod tests {
         // Untranslated keys and dynamic labels stay verbatim.
         assert_eq!(label(&app, "unknown.command", "Text"), "Text");
         assert_eq!(
-            entry(&app, &MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None }, "Undo Comp1".into()),
+            entry(
+                &app,
+                &MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] },
+                "Undo Comp1".into()
+            ),
             "沒有可復原的操作"
         );
         assert_eq!(
             entry(
                 &app,
-                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None },
+                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None, alt_shortcuts: vec![] },
                 "Layer: File".into()
             ),
             "圖層: File"
@@ -6207,7 +7034,8 @@ mod tests {
         assert_eq!(label(&app, "layer.addTextAnimator", "Tracking"), "Міжлітерний інтервал");
         assert_eq!(label(&app, "edit.purgeUndo", "Undo"), "Історія скасувань");
         assert_eq!(label(&app, "unknown.command", "Text"), "Text");
-        let panel = MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None };
+        let panel =
+            MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None, alt_shortcuts: vec![] };
         assert_eq!(entry(&app, &panel, "Layer: File".into()), "Шар: File");
         assert_eq!(
             submenu(&app, "Assign Shortcut to Workspace", "Assign Shortcut to “File Україна” Workspace".into()),
@@ -6222,8 +7050,8 @@ mod tests {
     fn ukrainian_undo_redo_keeps_history_labels_verbatim() {
         let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
         app.session.execute("prefs.set", json!({"key":"general.language", "value":"uk"})).unwrap();
-        let undo = MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None };
-        let redo = MenuEntry { label: "Redo".into(), command: "edit.redo".into(), params: json!({}), shortcut: None };
+        let undo = MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] };
+        let redo = MenuEntry { label: "Redo".into(), command: "edit.redo".into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] };
         assert_eq!(entry(&app, &undo, "Can't Undo".into()), "Немає дій для скасування");
         assert_eq!(entry(&app, &redo, "Can't Redo".into()), "Немає дій для повторення");
         app.session.history.undo.push(("File Україна".into(), app.session.project.clone()));
@@ -6259,13 +7087,17 @@ mod tests {
         // Untranslated keys and dynamic labels stay verbatim.
         assert_eq!(label(&app, "unknown.command", "Text"), "Text");
         assert_eq!(
-            entry(&app, &MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None }, "Undo Comp1".into()),
+            entry(
+                &app,
+                &MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] },
+                "Undo Comp1".into()
+            ),
             "No se puede deshacer"
         );
         assert_eq!(
             entry(
                 &app,
-                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None },
+                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None, alt_shortcuts: vec![] },
                 "Layer: File".into()
             ),
             "Capa: File"
@@ -6300,13 +7132,17 @@ mod tests {
         // Untranslated keys and dynamic labels stay verbatim.
         assert_eq!(label(&app, "unknown.command", "Text"), "Text");
         assert_eq!(
-            entry(&app, &MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None }, "Undo Comp1".into()),
+            entry(
+                &app,
+                &MenuEntry { label: "Undo".into(), command: "edit.undo".into(), params: json!({}), shortcut: None, alt_shortcuts: vec![] },
+                "Undo Comp1".into()
+            ),
             "Não há nada para desfazer"
         );
         assert_eq!(
             entry(
                 &app,
-                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None },
+                &MenuEntry { label: "Layer".into(), command: "window.panel".into(), params: json!({"panel":"layer"}), shortcut: None, alt_shortcuts: vec![] },
                 "Layer: File".into()
             ),
             "Camada: File"
