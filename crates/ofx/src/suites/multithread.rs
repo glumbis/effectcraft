@@ -49,11 +49,17 @@ extern "C" fn multi_thread(func: ThreadFn, n_threads: u32, arg: *mut c_void) -> 
             thread::scope(|s| {
                 // Plug-in-sized stacks (see PLUGIN_STACK); an index whose thread can't be started
                 // runs on this thread afterwards.
-                let spawned: Vec<_> =
-                    (1..n).map(|i| (i, thread::Builder::new().name("ofx-worker".into()).stack_size(PLUGIN_STACK).spawn_scoped(s, move || {
-                        ON_PLUGIN_STACK.with(|s| s.set(true));
-                        run(i)
-                    }))).collect();
+                let spawned: Vec<_> = (1..n)
+                    .map(|i| {
+                        (
+                            i,
+                            thread::Builder::new().name("ofx-worker".into()).stack_size(PLUGIN_STACK).spawn_scoped(s, move || {
+                                ON_PLUGIN_STACK.with(|s| s.set(true));
+                                run(i)
+                            }),
+                        )
+                    })
+                    .collect();
                 let mut ok = run(0);
                 for (i, h) in spawned {
                     ok &= match h {
