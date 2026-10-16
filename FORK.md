@@ -97,6 +97,7 @@ What the installer does:
 - Adds **EC Test**, a tiny test plug-in, in the `OFX` folder next to the app, so you can check that
   OpenFX works before you install any real plug-in.
 - Finds Python 3 and installs the py-aep library for your user (for `.aep` files).
+- Tells you that you can copy plug-ins into `%APPDATA%\EffectCraft\OFX` without administrator rights.
 
 It doesn't need administrator rights and doesn't list itself under Settings ▸ Apps.
 
@@ -110,8 +111,10 @@ first. Your settings, projects and plug-ins stay.
 **Uninstalling.** Run `Uninstall EffectCraft.bat` in `%LOCALAPPDATA%\Programs\EffectCraft-OFX`. It
 removes the app, the shortcuts and the EC Test plug-in. Your projects, your settings
 (`%APPDATA%\EffectCraft`), Python and py-aep stay. Plug-ins that vendors installed in
-`C:\Program Files\Common Files\OFX\Plugins` stay too, and so do plug-ins you added to the app's own
-`OFX` folder (only the bundled EC Test plug-in is removed from it).
+`C:\Program Files\Common Files\OFX\Plugins` stay too. So do plug-ins you added to the app's own `OFX`
+folder (only the bundled EC Test plug-in is removed from it; if other bundles remain, that folder is
+kept and the uninstaller prints its path) and everything in `%APPDATA%\EffectCraft\OFX`, which it
+never touches. Installing over an existing install also keeps them.
 
 ## Install on Linux
 
@@ -158,9 +161,11 @@ What the installer does:
 - Adds the **EC Test** test plug-in in the `OFX` folder inside the app folder.
 - Warns about missing system libraries (see above).
 - Offers to install py-aep for `.aep` files. Newer Debian, Ubuntu and Arch refuse `pip install --user`
-  for the system Python; in that case the installer puts py-aep in a private environment inside the
-  app folder and makes the two commands use it. If Python 3 isn't installed, it tells you what to
-  install.
+  for the system Python; in that case the installer puts py-aep in a private environment,
+  `~/.config/effectcraft/aep-python`, which EffectCraft finds by itself. If Python 3 isn't installed,
+  it tells you what to install.
+- Tells you where to put plug-ins without root: `~/.local/share/OFX/Plugins` or
+  `~/.config/effectcraft/OFX` (see [Where plug-ins go](#where-plug-ins-go)).
 
 You can also run `./effectcraft` straight from the unpacked folder without installing.
 
@@ -175,8 +180,8 @@ You can also run `./effectcraft` straight from the unpacked folder without insta
 
 It doesn't need FUSE. It does need the system libraries above, and it has no installer: for `.aep`
 files install py-aep yourself (see [Opening After Effects projects](#opening-after-effects-projects)).
-Put plug-ins in `/usr/OFX/Plugins`, or set `OFX_PLUGIN_PATH` (see [Where plug-ins
-go](#where-plug-ins-go)).
+Put plug-ins in `/usr/OFX/Plugins`, or, without root, in `~/.local/share/OFX/Plugins` or
+`~/.config/effectcraft/OFX` (see [Where plug-ins go](#where-plug-ins-go)).
 
 **Wayland.** On a native Wayland session, dragging files into the window doesn't work. Use File ▸
 Import ▸ File…, or start with `env -u WAYLAND_DISPLAY effectcraft-ofx` to run through XWayland.
@@ -190,9 +195,10 @@ settings and plug-ins stay. Option B: download the new AppImage and delete the o
 ~/.local/share/effectcraft-ofx/uninstall.sh
 ```
 
-This removes the app, the two commands, the menu entry and the icon. Your projects and settings
-(`~/.config/effectcraft`), Python and py-aep stay, and so do any plug-ins you added to the app's
-`OFX` folder.
+This removes the app, the two commands, the menu entry, the icon and the private py-aep environment
+(`~/.config/effectcraft/aep-python`, if the installer made one). Your projects and settings
+(`~/.config/effectcraft`), the system's Python and py-aep stay, and so do all your plug-ins: those in
+the app's `OFX` folder, in `~/.local/share/OFX/Plugins` and in `~/.config/effectcraft/OFX`.
 
 ## Install on macOS
 
@@ -222,14 +228,19 @@ that matches your Mac. Nothing else needs installing to run EffectCraft.
 
 The download also has `READ ME FIRST.txt` with these steps.
 
+**Plug-ins.** Vendors' installers put them in `/Library/OFX/Plugins`. To add one by hand without an
+administrator password, use `~/Library/OFX/Plugins` or `~/Library/Application Support/EffectCraft/OFX`
+(see [Where plug-ins go](#where-plug-ins-go)).
+
 **Command line.** The CLI is inside the app:
 `/Applications/EffectCraft.app/Contents/MacOS/effectcraft-cli`.
 
 **Updating.** Quit EffectCraft, replace the app in Applications with the new one, and run the
 `xattr` command again.
 
-**Uninstalling.** Drag EffectCraft.app to the Bin. Your settings and projects stay in
-`~/Library/Application Support/EffectCraft`.
+**Uninstalling.** Drag EffectCraft.app to the Bin. Your settings, projects, per-user plug-ins and the
+py-aep environment stay in `~/Library/Application Support/EffectCraft`; delete that folder too to
+remove everything.
 
 ## Using OpenFX plug-ins
 
@@ -271,21 +282,31 @@ hosts, tick **OFX** (or DaVinci Resolve, which installs the OFX version).
 An OpenFX plug-in is a folder called `Something.ofx.bundle`. Vendors' installers put it in the
 standard folder for your system, and EffectCraft looks there automatically:
 
-| System | Standard folder |
+| System | Standard folder (needs administrator rights, or `sudo`, to write to) |
 |---|---|
 | Windows | `C:\Program Files\Common Files\OFX\Plugins` |
 | macOS | `/Library/OFX/Plugins` |
-| Linux | `/usr/OFX/Plugins` |
+| Linux | `/usr/OFX/Plugins` (and `/usr/local/OFX/Plugins`) |
 
-EffectCraft also looks in:
+EffectCraft also looks in folders that **don't** need administrator rights:
 
 | Where | Notes |
 |---|---|
-| The `OFX` folder next to the app | Windows: `%LOCALAPPDATA%\Programs\EffectCraft-OFX\OFX`. Linux installer: `~/.local/share/effectcraft-ofx/OFX`. The EC Test plug-in lives here. You can copy `.ofx.bundle` folders in too. On macOS this folder is inside the app and isn't meant for your plug-ins; use `/Library/OFX/Plugins`. The AppImage's own folder is read-only. |
+| **The `OFX` folder in the [settings folder](#where-the-settings-folder-is)** (every system) | Windows `%APPDATA%\EffectCraft\OFX`, macOS `~/Library/Application Support/EffectCraft/OFX`, Linux `~/.config/effectcraft/OFX`. **This is the place for plug-ins you copy by hand.** The uninstallers and installers never touch it, so your plug-ins survive an update or a reinstall. Portable mode moves it along with the settings. |
+| macOS: `~/Library/OFX/Plugins` | The per-user version of `/Library/OFX/Plugins`. |
+| Linux: `~/.local/share/OFX/Plugins` | The per-user version of `/usr/OFX/Plugins`. If `XDG_DATA_HOME` is set to a full path, it's `$XDG_DATA_HOME/OFX/Plugins`. |
+| The `OFX` folder next to the app | Windows: `%LOCALAPPDATA%\Programs\EffectCraft-OFX\OFX`. Linux installer: `~/.local/share/effectcraft-ofx/OFX`. The EC Test plug-in lives here. On macOS this folder is inside the app, which you shouldn't change. The AppImage's own folder is read-only. |
 | Every folder in the `OFX_PLUGIN_PATH` environment variable | Separate several folders with `;` on Windows and `:` on Linux and macOS. See [Environment variables](#environment-variables). |
 
-All of these are searched including everything below them. A bundle looks like this, and **the
-platform folder must match your system**:
+**The easy way to open the per-user folder:** Effect ▸ **Open OpenFX Plug-in Folder**. It creates
+`OFX` in the settings folder if it isn't there and opens it. Copy the `.ofx.bundle` folder in and
+restart EffectCraft. (Effect ▸ **Open OpenFX Scan Report** opens `ofx_scan.txt`.)
+
+All of these are searched including everything below them, system folders first, then the per-user
+ones, the folder next to the app, and `OFX_PLUGIN_PATH`. A folder reached twice is searched once. If
+the same plug-in is installed in two places, one copy is used: the newest within one folder tree,
+otherwise the one in the folder searched first. The report's **Notes** list the copies it skipped.
+A bundle looks like this, and **the platform folder must match your system**:
 
 ```
 Something.ofx.bundle/
@@ -298,11 +319,9 @@ Something.ofx.bundle/
 A folder named `Win32`, or a bundle with only a `MacOS` folder on Windows, is not a build for your
 system and can't load.
 
-<!-- PENDING(versatility): per-user plug-in folders on Linux and macOS (no admin rights or sudo needed for plug-ins), so "Where plug-ins go" can name ~/.local/... and ~/Library/... folders for each. -->
-
 **Loading one by hand.** Effect ▸ **Load OpenFX Plug-in…**, then pick the `.ofx` file inside the
 platform folder. This only lasts until you quit. To keep a plug-in, put it in one of the folders
-above.
+above (the per-user `OFX` folder is the easiest).
 
 ### Fast starts: the scan cache
 
@@ -368,8 +387,6 @@ problem](#reporting-a-problem)). What changed in this release that may matter fo
 
 Topaz says to install only the newest bundle and to have its main app installed and signed in.
 
-<!-- PENDING(versatility): curve (parametric) parameters now work, and plug-ins that only offer half-float (16-bit float) images now load. Move them out of "What to expect" below once confirmed. -->
-
 ### What to expect
 
 - **Watermark or red X:** the plug-in is running as a trial. Activate the **OFX** licence with the
@@ -386,8 +403,12 @@ Topaz says to install only the newest bundle and to have its main app installed 
   Mocha) do nothing.
 - **Slow:** everything renders on the CPU. Work at Half or Quarter resolution while you edit and
   render at Full.
+- **Curves can't be edited.** Plug-ins that have curve parameters (a colour curve, say) load and
+  work, but EffectCraft has no curve editor yet. The curves don't appear in Effect Controls, and
+  they aren't saved with the project: they start from the plug-in's own default every time.
 - **Effects that need the GPU don't load:** a plug-in that only renders on the GPU is reported in
-  `ofx_scan.txt` as "needs GPU rendering".
+  `ofx_scan.txt` as "needs GPU rendering". Plug-ins that only work with 16-bit float ("half-float")
+  images do load.
 - **A plug-in is native code.** It runs inside EffectCraft with full access to your computer. Install
   only plug-ins you trust.
 
@@ -399,19 +420,30 @@ Topaz says to install only the newest bundle and to have its main app installed 
 3. Footage is looked for at its saved path and next to the project. Missing files become
    placeholders you can relink.
 
-**What it needs:** Python 3 and the py-aep library. EffectCraft finds Python by itself: on Windows
-it tries `py -3`, `python3`, then `python`; on Linux and macOS `python3`, then `python`. To make it
-use a particular Python, set the `EFFECTCRAFT_PYTHON` environment variable to its full path (see
-[Environment variables](#environment-variables)).
+**What it needs:** Python 3 and the py-aep library. EffectCraft finds Python by itself, trying these
+in order and using the first one that has py-aep:
+
+1. The Python named in the `EFFECTCRAFT_PYTHON` environment variable (a full path; see
+   [Environment variables](#environment-variables)). If it runs but lacks py-aep, you get that
+   error instead of another Python being tried.
+2. A private environment in the [settings folder](#where-the-settings-folder-is):
+   `aep-python\Scripts\python.exe` on Windows, `aep-python/bin/python3` on Linux and macOS. The Linux
+   installer and the macOS script make it where the system Python refuses `pip install --user`.
+3. Windows only: `py -3`.
+4. `python3`.
+5. macOS only: `/opt/homebrew/bin/python3`, then `/usr/local/bin/python3` (Homebrew's and
+   python.org's). An app opened from Finder gets a short `PATH` that doesn't include them, so
+   EffectCraft looks there itself.
+6. `python`.
+
+A Python that runs but has no py-aep is skipped in favour of the next one.
 
 | System | Set-up |
 |---|---|
-| **Windows** | `Install EffectCraft.bat` does it: it finds Python 3 (or offers to install it with winget) and installs py-aep. By hand: `py -m pip install py-aep`. |
-| **Linux** (installer) | `./install.sh` offers to install py-aep with `pip install --user`. If your distribution refuses, it makes a private environment in the app folder and the `effectcraft-ofx` command uses it. |
-| **Linux** (AppImage, or by hand) | `python3 -m pip install --user py-aep`. If that says "externally-managed-environment", use a virtual environment and point `EFFECTCRAFT_PYTHON` at it, or `pipx`. |
-| **macOS** | Double-click `Set up After Effects import.command` (after the `xattr` step in [Install on macOS](#install-on-macos)). It uses Apple's `/usr/bin/python3`, which comes with the Command Line Tools, and offers to install those if they're missing. The app is started by macOS with a short `PATH`, which is why it uses this Python. By hand: `/usr/bin/python3 -m pip install --user py-aep`. |
-
-<!-- PENDING(versatility): better Python detection on macOS (for example Homebrew or python.org installs), so the macOS row above can say what is found automatically. -->
+| **Windows** | `Install EffectCraft.bat` does it: it finds Python 3 (or offers to install it with winget) and installs py-aep for your user. By hand: `py -m pip install py-aep`. |
+| **Linux** (installer) | `./install.sh` offers to install py-aep with `pip install --user`. If your distribution refuses, it makes the private environment `~/.config/effectcraft/aep-python`, which EffectCraft finds by itself (no wrapper scripts, no variables to set). The uninstaller removes that environment. |
+| **Linux** (AppImage, or by hand) | `python3 -m pip install --user py-aep`. If that says "externally-managed-environment", make the private environment yourself: `python3 -m venv ~/.config/effectcraft/aep-python` and then `~/.config/effectcraft/aep-python/bin/pip install py-aep`. Or use `pipx`. |
+| **macOS** | Double-click `Set up After Effects import.command` (after the `xattr` step in [Install on macOS](#install-on-macos)). It makes the private environment `~/Library/Application Support/EffectCraft/aep-python` with the first working Python 3 of Apple's (which comes with the Command Line Tools; it offers to install those if they're missing), Homebrew's or python.org's, and falls back to `pip install --user`. By hand, in Terminal: `/usr/bin/python3 -m venv "$HOME/Library/Application Support/EffectCraft/aep-python"` and then `"$HOME/Library/Application Support/EffectCraft/aep-python/bin/pip" install py-aep`. |
 
 What carries over and what doesn't, and how to run the steps yourself, is in the [.aep import
 notes](https://github.com/glumbis/effectcraft/blob/openfx/tools/aep-import/README.md).
@@ -426,8 +458,9 @@ Work through these in order. Most "my plug-in doesn't work" reports end at step 
 
 Every start writes a plain-text report, **`ofx_scan.txt`**, in EffectCraft's [settings
 folder](#where-the-settings-folder-is) (on Windows, paste `%APPDATA%\EffectCraft` into File
-Explorer's address bar). When something fails, EffectCraft also shows a message at start-up that
-points to it. The report has these parts, in this order:
+Explorer's address bar), or open it with Effect ▸ **Open OpenFX Scan Report**. When something
+fails, EffectCraft also shows a message at start-up that points to it. The report has these parts,
+in this order:
 
 | Part | What it tells you |
 |---|---|
@@ -497,7 +530,8 @@ on Linux (installer), and `/Applications/EffectCraft.app/Contents/MacOS/effectcr
 #### 2. Keep only the newest copy of each plug-in
 
 Some vendors leave older versions installed beside the new one (alpha, beta and release folders).
-EffectCraft uses only the newest copy of a plug-in and lists the others under Notes, but old
+EffectCraft uses only one copy of a plug-in (within a folder, the newest; if the copies are in
+different folders, the one in the folder searched first) and lists the others under Notes, but old
 copies are still opened, and some have known problems. Delete the old `.ofx.bundle` folders and
 restart. If you use Topaz, keep only the newest bundle.
 
@@ -597,7 +631,7 @@ lists third-party effects in its report; apply the OFX version by hand from Effe
 | Message | What to do |
 |---|---|
 | `Python 3 was not found` | Install Python 3 from [python.org](https://www.python.org/downloads/), then install py-aep (see [Opening After Effects projects](#opening-after-effects-projects)). |
-| `py-aep is not installed` | py-aep isn't installed for the Python EffectCraft uses. Install it for that Python (`py -m pip install py-aep`), or set `EFFECTCRAFT_PYTHON` to the Python that has it. |
+| `py-aep is not installed for the Python found here` | No Python EffectCraft tried has py-aep (the message names them). Install it for one of them with the command the message shows, or run the installer / `Set up After Effects import.command` again. If you set `EFFECTCRAFT_PYTHON`, the message is about that Python. |
 | `the converter aep2effectcraft.py was not found` | The `aep-import` folder next to the app is missing. Reinstall from the download. |
 
 ## Reporting a problem
@@ -610,7 +644,7 @@ lists third-party effects in its report; apply the OFX version by hand from Effe
    like `0.10.0-ofx.1-…`. Help ▸ About shows only `0.10.0`, not the fork build number. On macOS,
    About is in the EffectCraft menu.
 4. **Attach these files** from the [settings folder](#where-the-settings-folder-is):
-   - `ofx_scan.txt` (for anything about plug-ins), and
+   - `ofx_scan.txt` (for anything about plug-ins; Effect ▸ Open OpenFX Scan Report opens it), and
    - `Logs/effectcraft.log` (for crashes and anything else).
 
    Open them in a text editor first. They contain file paths, which may include your user name;
@@ -648,6 +682,8 @@ The environment variable `EFFECTCRAFT_CONFIG_DIR` overrides both and names the f
 | `ofx_inflight.<number>.bin` | Exists while EffectCraft runs: a note of which plug-in action is in progress. Removed at a normal quit. If one is left behind, EffectCraft crashed, and the next start reads it. |
 | `ofx_render_crashes.txt` | Plug-ins that crashed EffectCraft while it was running them. One line each: the number of crashes in a row, a file stamp, the plug-in's id and the action. A plug-in with a count of 2 or more is skipped. |
 | `Logs/effectcraft.log` | The log of the current run. `effectcraft.1.log` and `effectcraft.2.log` are the two runs before. |
+| `OFX/` | Your per-user OpenFX plug-ins: copy `.ofx.bundle` folders here (no administrator rights). Searched at every start; installers and uninstallers never touch it. Effect ▸ Open OpenFX Plug-in Folder opens it. |
+| `aep-python/` | The private Python environment with py-aep for `.aep` import, made by the Linux installer and the macOS setup script. EffectCraft looks in it first (after `EFFECTCRAFT_PYTHON`). |
 | `Plug-ins/` | EffectCraft's own WebAssembly plug-ins. Not OpenFX. |
 
 ### Keys in `ofx_settings.json`
@@ -665,7 +701,7 @@ The environment variable `EFFECTCRAFT_CONFIG_DIR` overrides both and names the f
 | `EFFECTCRAFT_NO_OFX` | Set to `1` to start the app without scanning for OpenFX plug-ins. Only `1` counts. |
 | `EFFECTCRAFT_OFX_HOST_NAME` | The host name shown to plug-ins. Overrides `ofx_settings.json`. |
 | `EFFECTCRAFT_CONFIG_DIR` | Use this folder as the settings folder. |
-| `EFFECTCRAFT_PYTHON` | The Python used to open `.aep` files (a full path). |
+| `EFFECTCRAFT_PYTHON` | The Python used to open `.aep` files (a full path). Tried first, and if it runs but lacks py-aep no other Python is tried. See [Opening After Effects projects](#opening-after-effects-projects). |
 | `EFFECTCRAFT_AEP_SCRIPT` | The `.aep` converter script `aep2effectcraft.py`, if it isn't in the `aep-import` folder next to the app. You normally never need this. |
 
 **How to set one:**
@@ -680,14 +716,17 @@ The environment variable `EFFECTCRAFT_CONFIG_DIR` overrides both and names the f
 
 ### Commands
 
-These are for the command line (`effectcraft-cli exec <command> --empty`), scripts and agents. The
-only one in a menu is Effect ▸ Load OpenFX Plug-in….
+These are for the command line (`effectcraft-cli exec <command> --empty`), scripts and agents. Three
+also have entries in the Effect menu: Load OpenFX Plug-in…, Open OpenFX Plug-in Folder and Open
+OpenFX Scan Report.
 
 | Command | What it does |
 |---|---|
 | `effect.plugins.scanOfx` | Scans the plug-in folders and returns `{paths, loaded, errors, notes, transcript, cache, crashes}`. With `{"retry": true}` it first forgets the crash lists (plug-ins skipped for crashing while loading or rendering). With `{"cache": false}` it doesn't use the scan cache. |
 | `effect.plugins.rescanOfx` | Deletes the scan cache, so the next start loads and describes every plug-in again. It takes effect at the next start. |
 | `effect.plugins.loadOfx {"path": "…"}` | Loads an `.ofx` file, an `.ofx.bundle` folder, or every bundle in a folder. It always loads the plug-in fresh (it doesn't use the cache). |
+| `effect.plugins.openOfxUserFolder` | Creates the per-user plug-in folder (`OFX` in the settings folder) and opens it in the file manager. In the Effect menu as "Open OpenFX Plug-in Folder". |
+| `effect.plugins.openOfxReport` | Opens `ofx_scan.txt` with your default text application. In the Effect menu as "Open OpenFX Scan Report". |
 | `effect.plugins.ofxHostName` | Shows the host name in use, where it comes from, what `ofx_settings.json` holds, and whether a change is waiting for a restart. |
 | `effect.plugins.setOfxHostName {"name": "…"}` | Stores the host name in `ofx_settings.json` (an empty name resets it). It applies from the next start. |
 

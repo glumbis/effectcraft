@@ -42,16 +42,32 @@ arm64 it tries `Linux-aarch64` and `Linux-arm-64` (no fork download is built for
 Install the plug-in with its own installer. OFX plug-ins live in `.ofx.bundle` folders in standard
 locations, and EffectCraft looks in the same places as other hosts:
 
-| OS | Standard folder |
+| OS | Standard folder (needs administrator rights or root to write) |
 |---|---|
 | Windows | `C:\Program Files\Common Files\OFX\Plugins` (and `%CommonProgramFiles%\OFX\Plugins` when it differs) |
 | macOS | `/Library/OFX/Plugins` |
-| Linux | `/usr/OFX/Plugins` |
+| Linux | `/usr/OFX/Plugins` and `/usr/local/OFX/Plugins` |
+
+**Per-user folders** need no administrator rights, and an update or an uninstall of the app leaves
+them alone:
+
+| Folder | Where |
+|---|---|
+| `<config dir>/OFX` | Every OS. The config folder is where the app keeps its settings, so portable mode moves it with them. The recommended place for plug-ins copied by hand. |
+| `~/Library/OFX/Plugins` | macOS |
+| `${XDG_DATA_HOME:-~/.local/share}/OFX/Plugins` | Linux. A relative `XDG_DATA_HOME` is ignored, as the XDG specification says. |
 
 In addition, an `OFX` folder next to the executable and every folder listed in the
 `OFX_PLUGIN_PATH` environment variable are searched (separated by `;` on Windows, `:` elsewhere).
-Duplicate entries (compared case-insensitively) are searched once. Folders are scanned recursively
-(up to eight levels) for bundles; links and junctions are followed.
+The order is: the OS's standard folders, the per-user folders, `<config dir>/OFX`, the folder next
+to the executable, `OFX_PLUGIN_PATH`. A folder that is reached twice (spelled differently, or
+through a link) is searched once; folders are compared by their canonical path, case-folded on
+Windows and macOS. A folder that doesn't exist stays in the list, so `ofx_scan.txt` shows it as
+`missing`. The folders are scanned in that order, one `load_path` each, so if one plug-in
+identifier is installed in two of them, the copy in the folder searched first is kept (within one
+folder, the newest, see [How a scan works](#how-a-scan-works)). Folders are scanned recursively (up
+to eight levels) for bundles; links and junctions are followed. Effect ▸ Open OpenFX Plug-in Folder
+(`effect.plugins.openOfxUserFolder`) creates and opens `<config dir>/OFX`.
 
 The `OFX` folder next to the executable is where the fork's downloads keep the **EC Test** plug-in,
 so other OFX hosts never see it:
@@ -62,8 +78,6 @@ so other OFX hosts never see it:
 | Linux tar.gz | `OFX/` beside `effectcraft` (`~/.local/share/effectcraft-ofx/OFX` once installed) |
 | Linux AppImage | `usr/bin/OFX` inside the image (read-only) |
 | macOS | `EffectCraft.app/Contents/MacOS/OFX`, a symlink to `Contents/Resources/OFX`: `codesign` refuses data files in `Contents/MacOS`, and the lookup follows the link. Don't add files inside the signed app; use `/Library/OFX/Plugins` |
-
-<!-- PENDING(versatility): per-user plug-in folders on Linux and macOS (for example under ~/.local/share and ~/Library) go in the table above and in the paragraph before it. -->
 
 Nothing needs configuring: at start-up the desktop app scans these folders (the
 `effect.plugins.scanOfx` command) and registers everything it finds. Large suites register many
@@ -78,7 +92,8 @@ loaded ([The scan cache](#the-scan-cache)).
 The desktop app writes what the scan found to `ofx_scan.txt` in its config folder
 (`%APPDATA%\EffectCraft` on Windows, `~/Library/Application Support/EffectCraft` on macOS,
 `$XDG_CONFIG_HOME/effectcraft` or `~/.config/effectcraft` on Linux; `EFFECTCRAFT_CONFIG_DIR` and
-portable mode move it). The file is rewritten at every start. The release app has no console on
+portable mode move it). The file is rewritten at every start, and Effect ▸ Open OpenFX Scan Report
+opens it. The release app has no console on
 Windows, so this file is where load errors end up. When a plug-in crashed the previous session
 ("*id* crashed EffectCraft last time"), or a scan found problems (or nothing loaded but something
 was skipped), the app also shows a message at start-up that names the file. The CLI
@@ -206,7 +221,8 @@ category, parameters), the clips, the pixel depth, the render thread safety and 
 the effect's configuration, the parameter bindings, and the notes and transcript lines of the scan.
 
 * **Key.** An entry is keyed by the binary's canonical path plus its size and modification time. The
-  whole file is ignored (and rebuilt) when its format version, the EffectCraft version or the
+  whole file is ignored (and rebuilt) when its format version (currently 2: version 2 came with
+  parametric parameters, so plug-ins cached as failures before are scanned again), the EffectCraft version or the
   effective host name differ from the running process's: plug-ins describe themselves differently to
   different hosts, and a new EffectCraft may read more from a description.
 * **What is cached.** Only binaries with at least one plug-in that registered, and only when no
@@ -355,18 +371,30 @@ would know nothing about it. `inflight.rs` keeps a small in-flight record so tha
   neither `Output` nor a mask (noted), and a generator with none has no input.
 * **Parameters:** doubles and integers become sliders, booleans checkboxes, choices popups, RGBA
   colours, strings text fields; custom parameters carry opaque plug-in data and are hidden. Groups
-  and pages are folded into parameter names. Curve (parametric) parameters are not supported: a
-  plug-in that defines one gets `kOfxStatErrUnknown`.
+  and pages are folded into parameter names.
+* **Curve (parametric) parameters** (`OfxParamTypeParametric`) and the
+  `OfxParametricParameterSuite` v1 are served. Each curve keeps sorted control points on the
+  parameter; the plug-in adds its defaults to the descriptor's parameter while it describes itself,
+  and every instance starts as a copy. A curve with no points is the identity, as the header says.
+  The header leaves the interpolation to the host: `parametricParamGetValue` is piecewise linear and
+  holds the end values outside the control points. `time` and `addAnimationKey` are ignored
+  (`OfxParamHostPropSupportsParametricAnimation` stays 0); `ParametricDimension` (default 1) and
+  `ParametricRange` (default `[0, 1]`) are accepted. EffectCraft has no curve editor, so the curves
+  are **not shown in Effect Controls and not saved** with the project: they are made again from the
+  plug-in's own description whenever it is described, so the plug-in always starts from its defaults.
 * 2D and 3D doubles follow their OFX double type. Only position values (type XY or XY absolute)
   become an on-screen point: a 2D position a point, a 3D position a 3-value point. Every other 2D or
   3D double, including the plain default, becomes one slider per component, named `<name>_x`,
   `_y` and `_z`. A plug-in that wants a viewer point for a value must declare it as a position.
 * The effect's output may be larger than its input (glows, blurs, borders); EffectCraft pads the
   layer buffer by the plug-in's region of definition before rendering, measured on the real layer.
-* **Pixels** are float RGBA, premultiplied. The pixel depth used is `float` if the plug-in lists it,
-  else `short` (16-bit), else `byte`; byte and short plug-ins are converted. A plug-in whose list
-  has none of the three (half-float only, for example) is reported as "needs an unsupported pixel
-  depth". Clip components are RGBA, else RGB, else Alpha.
+* **Pixels** are float RGBA, premultiplied. The host offers `float`, `half`, `short` and `byte`
+  (`OfxBitDepthFloat`, `OfxBitDepthHalf`, `OfxBitDepthShort`, `OfxBitDepthByte`) and picks the first
+  the plug-in lists in the order float, short, half, byte, so a plug-in that worked before keeps its
+  depth. Half-float images are converted by hand to and from IEEE 754 binary16 (round to nearest,
+  ties to even; subnormals handled; overflow becomes infinity; NaN stays NaN; the sign of zero is
+  kept; values outside [0, 1] are kept as for float). A plug-in whose list has none of the four is
+  reported as "needs an unsupported pixel depth". Clip components are RGBA, else RGB, else Alpha.
 * **Parameter values** are applied to a new instance before `CreateInstance`, and the clip
   preferences are asked for again whenever a parameter named in
   `kOfxImageEffectPropClipPreferencesSlaveParam` changes, so plug-ins that read their parameters in
@@ -473,14 +501,12 @@ EffectCraft does not include, license or activate any third-party plug-in.
 * **Glows on transparent layers.** Some plug-ins (Sapphire's glows) add light without adding alpha,
   so on a layer with transparent areas the glow outside the opaque pixels disappears. On footage, or
   a precomp with a background, it shows as in other hosts.
-* **Curve (parametric) parameters and half-float images** are not supported (see the notes under
-  [How OFX maps onto EffectCraft](#how-ofx-maps-onto-effectcraft)).
-
-  <!-- PENDING(versatility): curve (parametric) parameters and half-float plug-ins are supported: remove this bullet, and the matching sentences under "How OFX maps onto EffectCraft", once confirmed. -->
-
+* **Curves have no editor.** Curve (parametric) parameters work for the plug-in but aren't shown in
+  Effect Controls and aren't saved; they always start from the plug-in's defaults.
 * **Platforms.** Desktop only: there is no OFX on the web build. **Windows x64** is tested with
   RSMB 7, Twixtor 8 and Sapphire 2026.5. **Linux x86_64** and **macOS** are built and run the host's
-  test suite in CI (Ubuntu 22.04 and an Apple Silicon runner; the OFX tests pass on both), but no
+  test suite in CI (Ubuntu 22.04 and an Apple Silicon runner; the OFX tests pass on both and must
+  pass before a release is built), but no
   commercial plug-in has been confirmed on them, and nobody has tried the macOS builds hands-on on a
   Mac. The Intel Mac build is cross-compiled on the Apple Silicon runner and gets a basic start-up
   check there.
@@ -508,14 +534,17 @@ EffectCraft does not include, license or activate any third-party plug-in.
 | `effect.plugins.scanOfx` | `{retry?, cache?}` | `{paths, loaded, errors, notes, transcript, cache, crashes}`: registers every plug-in in the search paths (folders that don't exist are skipped; one bad plug-in doesn't stop the rest). Binaries that did not change come from the [scan cache](#the-scan-cache) without being loaded, unless `cache` is `false`. `retry: true` empties both crash lists first (the load blocklist and the render strikes). `cache` is `{enabled, file, hits, scanned, lines, problems}`; `crashes` lists the plug-ins that crashed the app during the previous session. |
 | `effect.plugins.rescanOfx` | none | `{cleared, file, restartRequired, note}`: deletes `ofx_cache.json`, so the next start loads and describes every plug-in again. Registrations are made once per run, so it takes effect at the next start. |
 | `effect.plugins.loadOfx` | `{path}`: an `.ofx` binary, an `.ofx.bundle` folder or a folder (scanned recursively) | `{loaded: [{id, name, category, ofxId, context, bundle}], errors, notes, transcript}`. It always loads fresh (it doesn't use the scan cache). It fails, with the reasons from `errors` and `notes`, when nothing loaded and there is something to say. |
+| `effect.plugins.openOfxUserFolder` | none | `{path, opened}`: creates the per-user plug-in folder (`<config dir>/OFX`) if it is missing and opens it in the file manager (Explorer, `open`, `xdg-open`, started detached). |
+| `effect.plugins.openOfxReport` | none | `{path, opened}`: opens `ofx_scan.txt` with the operating system's default application. Fails, saying so, when there is no report yet. |
 | `effect.plugins.ofxHostName` | none | `{name, source, configured, environmentOverride, settingsFile, problem, restartRequired, next?, note?}`: the host name in use, where it comes from (`default`, `settings file` or `environment variable`), what `ofx_settings.json` holds, and whether a stored change waits for a restart. |
 | `effect.plugins.setOfxHostName` | `{name}`; an empty name goes back to `EffectCraft` | The same as `ofxHostName`. Stores the name in `ofx_settings.json` (through a temporary file, so a failure leaves the old file); it applies at the next start. Fails when there is no config folder or the name is unusable. |
 
-`loadOfx` is the only one in a menu (Effect ▸ Load OpenFX Plug-in…). Under file-access
-confinement (`--automation-read-root` and `--automation-write-root`, see [mcp.md](mcp.md)) the
-agent can't use `loadOfx`, `scanOfx`, `rescanOfx` or `setOfxHostName`: native, unsandboxed code,
-which plug-ins get loaded and what they are told about their host are not an agent's call.
-`ofxHostName` only reads.
+`loadOfx`, `openOfxUserFolder` and `openOfxReport` are in the Effect menu (Load OpenFX Plug-in…,
+Open OpenFX Plug-in Folder, Open OpenFX Scan Report). Under file-access confinement
+(`--automation-read-root` and `--automation-write-root`, see [mcp.md](mcp.md)) the agent can't use
+`loadOfx`, `scanOfx`, `rescanOfx`, `setOfxHostName`, `openOfxUserFolder` or `openOfxReport`: native,
+unsandboxed code, which plug-ins get loaded, what they are told about their host and starting
+another application are not an agent's call. `ofxHostName` only reads.
 
 ## How it fits together
 
@@ -535,7 +564,7 @@ which plug-ins get loaded and what they are told about their host are not an age
   `diag` (messages, unmet requests and the load transcript), `pool` (the plug-in thread pool) and
   `lock` (the reentrant lock of thread-unsafe libraries).
 * **Engine / hosts**: `Session::ofx_loader`, `ofx_search_paths`, `ofx_clear_blocklist`,
-  `ofx_host_name` and `ofx_rescan` are set by `effectcraft-host` with the `openfx` feature, which
+  `ofx_host_name`, `ofx_rescan` and `ofx_open` are set by `effectcraft-host` with the `openfx` feature, which
   also tells the crate where the config folder is (`set_state_dir`: the blocklist, the cache, the
   in-flight records and `ofx_settings.json` live there). The commands are in [Commands](#commands); the desktop app runs the scan at start-up and
   writes `ofx_scan.txt`.
@@ -543,15 +572,15 @@ which plug-ins get loaded and what they are told about their host are not an age
 ## Testing the host
 
 `examples/ofx/ec-test-ofx` is a small dependency-free OFX plug-in that exercises the host. It
-exports fifteen effects: Invert, Echo, Border, Mix, an effect with every parameter type (All Params),
+exports sixteen effects: Invert, Echo, Border, Mix, an effect with every parameter type (All Params),
 and ones that mimic situations real plug-ins create: **Support Lib** (describes itself the way the
 OFX C++ Support library does), **Create Time** (reads a parameter in `CreateInstance` and answers
 clip preferences from a slave parameter), **Context Fallback** (its Filter context fails, General
 works), **No Source** (the main input isn't called `Source`), **Serial** (render-thread-unsafe),
 **Probe** and **ProbeSingle** (count what the host does to them: instance sharing, sequences),
 **ProbeSlow** (a slow `CreateInstance`, like a model load), **Memory** (answers its first `Render`
-with `kOfxStatErrMemory`) and **Crash** (crashes in `Render` when `EC_TEST_OFX_CRASH` is `segv` or
-`abort`). The environment variable `EC_TEST_OFX_MODE` makes it misbehave for the tests:
+with `kOfxStatErrMemory`), **Parametric** (a two-curve parameter, read back at render) and **Crash**
+(crashes in `Render` when `EC_TEST_OFX_CRASH` is `segv` or `abort`). The environment variable `EC_TEST_OFX_MODE` makes it misbehave for the tests:
 `decline-host`, `no-plugins`, `load-fails`, `describe-fails`, `renamed` (every label gets a suffix,
 so its description differs) and `extras` (exports only `GpuOnly` and `NotAnImageEffect`, which
 cannot become effects); `EC_TEST_OFX_LOG` names a file the probes log sequence, destroy and unload

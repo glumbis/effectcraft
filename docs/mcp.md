@@ -17,8 +17,9 @@ Queue are checked against the files they write (the open project's, the queued o
 scan cache (`effect.plugins.rescanOfx`: it changes which native plug-ins load at the next start),
 changing the host name those plug-ins are told (`effect.plugins.setOfxHostName`; some plug-ins
 switch code paths for a host they recognise; `effect.plugins.ofxHostName` only reads and stays
-allowed), `$N` references
-to file paths in a batch, and the bridge's UI-driving tools (`ui_click`, `ui_key`, `ui_type`, `ui_drag`,
+allowed), opening the OpenFX scan report or plug-in folder in another application
+(`effect.plugins.openOfxReport`, `effect.plugins.openOfxUserFolder`), `$N` references to file paths
+in a batch, and the bridge's UI-driving tools (`ui_click`, `ui_key`, `ui_type`, `ui_drag`,
 `ui_set`, `script_ui`, `control`) are refused while confined. Without the flags nothing changes.
 
 The server provides the same core conventions as FilmCraft #28:
