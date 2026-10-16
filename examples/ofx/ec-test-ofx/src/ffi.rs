@@ -16,6 +16,7 @@ pub const OK: Status = 0;
 pub const FAILED: Status = 1;
 pub const ERR_MISSING_HOST_FEATURE: Status = 4;
 pub const ERR_UNSUPPORTED: Status = 5;
+pub const ERR_MEMORY: Status = 8;
 pub const REPLY_DEFAULT: Status = 14;
 
 #[repr(C)]

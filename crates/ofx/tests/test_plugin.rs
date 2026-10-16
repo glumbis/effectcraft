@@ -140,6 +140,8 @@ fn all_effects_register() {
         ("org.effectcraft.test.Probe", "filter"),
         ("org.effectcraft.test.ProbeSingle", "filter"),
         ("org.effectcraft.test.Crash", "filter"),
+        ("org.effectcraft.test.ProbeSlow", "filter"),
+        ("org.effectcraft.test.Memory", "filter"),
     ] {
         let e = r.loaded.iter().find(|e| e.ofx_id == ofx_id).unwrap_or_else(|| panic!("{ofx_id} missing from {:?}", r.loaded));
         assert_eq!(e.id, ofx_id.to_lowercase(), "effect id");

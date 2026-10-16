@@ -7,11 +7,9 @@
 //! this test binary (`common::Fixture`), running the `child_session` test. Set `EC_TEST_OFX_BUNDLE`
 //! to the built `ec-test-ofx.ofx.bundle`; without it the scenarios return.
 
-mod common;
-
 use std::path::PathBuf;
 
-use common::{Fixture, defaults};
+use crate::common::{Fixture, defaults};
 use effectcraft_effects::plugin::{PluginFrame, PluginParams, plugin};
 use effectcraft_ofx::load_path;
 use serde_json::{Value, json};
@@ -71,20 +69,20 @@ fn text(v: &Value, k: &str) -> String {
 
 /// The Crash effect dies in `Render` in a session of its own: the process ends badly.
 fn crash(f: &Fixture, how: &str) {
-    let out = f.run("child_session", &[("EC_RC_ACTION", "render"), ("EC_TEST_OFX_CRASH", how)]);
+    let out = f.run("render_crash::child_session", &[("EC_RC_ACTION", "render"), ("EC_TEST_OFX_CRASH", how)]);
     assert!(!out.status.success(), "the plug-in should have taken the process down ({how}): {}", String::from_utf8_lossy(&out.stdout));
     assert!(Fixture::result_of(&out).is_none(), "{}", String::from_utf8_lossy(&out.stdout));
 }
 
 fn report(f: &Fixture, action: &str) -> Value {
-    f.start("child_session", &[("EC_RC_ACTION", action)])
+    f.start("render_crash::child_session", &[("EC_RC_ACTION", action)])
 }
 
 fn two_crashes_and_the_plugin_is_skipped(how: &str) {
     let Some(f) = Fixture::new(&format!("crash-{how}")) else { return };
     // A clean start finds nothing to report.
     let v = report(&f, "report");
-    assert_eq!((text(&v, "crashes"), v["registered"].clone(), v["loaded"].clone()), (String::new(), json!(true), json!(13)), "{v}");
+    assert_eq!((text(&v, "crashes"), v["registered"].clone(), v["loaded"].clone()), (String::new(), json!(true), json!(15)), "{v}");
 
     // First crash: the next start names the plug-in and the action, one strike, still registered.
     crash(&f, how);
@@ -97,7 +95,7 @@ fn two_crashes_and_the_plugin_is_skipped(how: &str) {
         // The unhandled exception filter saw the exception and where it happened.
         assert!(lines.contains("exception 0xC0000005") && lines.contains("cachetest.ofx"), "{lines}");
     }
-    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(13)), "{v}");
+    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(15)), "{v}");
     assert_eq!(v["in_flight_files_before_quit"], 0, "the dead process's record is removed once read: {v}");
     assert!(v["strikes"].as_str().is_some_and(|s| s.starts_with("1\t") && s.contains("org.effectcraft.test.Crash")), "{v}");
     // The next start does not report it again.
@@ -108,7 +106,7 @@ fn two_crashes_and_the_plugin_is_skipped(how: &str) {
     let v = report(&f, "report");
     let lines = text(&v, "crashes");
     assert!(lines.contains("crashed EffectCraft 2 times in a row and is skipped from now on") && lines.contains("ofx_render_crashes.txt"), "{lines}");
-    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(false), json!(12)), "{v}");
+    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(false), json!(14)), "{v}");
     assert!(text(&v, "errors").contains("org.effectcraft.test.Crash: skipped: it crashed EffectCraft while rendering 2 times in a row"), "{v}");
     // Still skipped later, with nothing new to report.
     let v = report(&f, "report");
@@ -117,7 +115,7 @@ fn two_crashes_and_the_plugin_is_skipped(how: &str) {
 
     // "retry" brings it back.
     let v = report(&f, "retry");
-    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(13)), "{v}");
+    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(15)), "{v}");
     assert!(v["strikes"].is_null(), "{v}");
 }
 
@@ -137,7 +135,7 @@ fn a_plugin_that_aborts_while_rendering_is_named_and_skipped_after_two_crashes()
 fn a_clean_session_that_rendered_the_plugin_forgives_it() {
     let Some(f) = Fixture::new("crash-forgiven") else { return };
     crash(&f, "abort");
-    let v = f.start("child_session", &[("EC_RC_ACTION", "render-clean")]);
+    let v = f.start("render_crash::child_session", &[("EC_RC_ACTION", "render-clean")]);
     assert!(text(&v, "crashes").contains("strike 1 of 2"), "{v}");
     assert_eq!(v["registered"], true, "{v}");
     // While it ran, the session had a record file; quitting removed it and the strike.
@@ -161,5 +159,5 @@ fn an_updated_binary_is_tried_again() {
     assert_eq!(v["registered"], false, "{v}");
     f.touch();
     let v = report(&f, "report");
-    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(13)), "{v}");
+    assert_eq!((v["registered"].clone(), v["loaded"].clone()), (json!(true), json!(15)), "{v}");
 }

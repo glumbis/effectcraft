@@ -5,14 +5,12 @@
 //!
 //! Set `EC_TEST_OFX_BUNDLE` to the built `ec-test-ofx.ofx.bundle`; without it the test returns.
 
-mod common;
-
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use common::defaults;
+use crate::common::defaults;
 use effectcraft_effects::plugin::{EffectPlugin, PluginFrame, PluginHost, PluginImage, PluginParams, plugin};
 use effectcraft_ofx::load_path;
 

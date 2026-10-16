@@ -33,7 +33,7 @@ pub const EFFECT_MAGIC: u32 = 0x4F46_5845; // "OFXE"
 pub const NOMINAL_LAYER: f64 = 1000.0;
 
 /// The last frame reported for a clip when the host does not know the layer's real duration.
-const UNKNOWN_LAST_FRAME: f64 = 99999.0;
+pub(crate) const UNKNOWN_LAST_FRAME: f64 = 99999.0;
 
 /// The effect duration (frames) reported when the host does not know the layer's real duration.
 const UNKNOWN_DURATION: f64 = 100000.0;
@@ -738,6 +738,22 @@ pub struct Prefs {
     pub out_unpremult: bool,
 }
 
+/// A sequence of renders the instance has open (`BeginSequenceRender` was sent, `EndSequenceRender`
+/// was not).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seq {
+    /// The frame range announced to the plug-in.
+    pub range: (f64, f64),
+    pub scale: f64,
+    /// Whether the plug-in was told frames are rendered in order (`kOfxImageEffectPropSequentialRenderStatus`):
+    /// it declared that it needs or prefers that.
+    pub sequential: bool,
+    /// The last frame rendered in it (not meaningful before the first render).
+    pub last: f64,
+    /// How many frames were rendered in it.
+    pub renders: u32,
+}
+
 /// A live plug-in instance.
 pub struct Instance {
     pub obj: Box<EffectObj>,
@@ -746,6 +762,12 @@ pub struct Instance {
     pub prefs: Prefs,
     pub created: bool,
     pub rendered: bool,
+    /// The sequence of renders open on the instance, if any.
+    pub seq: Option<Seq>,
+    /// The task (see [`crate::lock::current_task`]) that has the instance checked out; 0 when idle.
+    pub holder: u64,
+    /// When the instance was last put back in the pool.
+    pub last_used: std::time::Instant,
 }
 
 unsafe impl Send for Instance {}
@@ -776,7 +798,8 @@ impl Instance {
         obj.props.put_doubles(IE_PROJECT_OFFSET, &[0.0, 0.0]);
         obj.props.put_double(IE_PROJECT_PAR, 1.0);
         obj.props.put_double(IE_EFFECT_DURATION, UNKNOWN_DURATION);
-        obj.props.put_int(IE_SEQUENTIAL_RENDER, 0);
+        // (The plug-in's declared `kOfxImageEffectInstancePropSequentialRender` stays as it came from
+        // the descriptor: whether it needs frames in order is its to say.)
         // An int (bool) property: this host never renders with OpenGL.
         obj.props.put_int(IE_OPENGL_ENABLED, 0);
         let comps: HashMap<String, Comps> = cfg.clips.iter().map(|c| (c.name.clone(), c.comps)).collect();
@@ -797,7 +820,7 @@ impl Instance {
             c.props.put_int(CLIP_CONNECTED, 1);
         });
         let prefs = Prefs { depth: cfg.depth, comps, out_unpremult: false };
-        Instance { obj, entry, cfg, prefs, created: false, rendered: false }
+        Instance { obj, entry, cfg, prefs, created: false, rendered: false, seq: None, holder: 0, last_used: std::time::Instant::now() }
     }
 
     pub fn handle(&self) -> *const c_void {
@@ -972,23 +995,57 @@ impl Instance {
         map
     }
 
-    fn sequence_args(&self, time: f64, scale: f64) -> PropSet {
+    fn sequence_args(&self, s: &Seq) -> PropSet {
         let inp = PropSet::new();
-        inp.put_doubles(IE_FRAME_RANGE, &[time, time]);
+        inp.put_doubles(IE_FRAME_RANGE, &[s.range.0, s.range.1]);
         inp.put_double(IE_FRAME_STEP, 1.0);
         inp.put_int(P_IS_INTERACTIVE, 0);
-        inp.put_doubles(IE_RENDER_SCALE, &[scale, scale]);
-        inp.put_int(IE_SEQUENTIAL_RENDER_STATUS, 0);
+        inp.put_doubles(IE_RENDER_SCALE, &[s.scale, s.scale]);
+        inp.put_int(IE_SEQUENTIAL_RENDER_STATUS, s.sequential as i32);
         inp.put_int(IE_INTERACTIVE_RENDER_STATUS, 0);
         inp
     }
 
-    pub fn begin_sequence(&self, time: f64, scale: f64) -> OfxStatus {
-        self.entry.call(ACT_BEGIN_SEQ, self.handle(), Some(&self.sequence_args(time, scale)), None)
+    /// Make sure a sequence is open for a render at frame `t`: the one that is open stays when `t`
+    /// is the frame after its last one (at the same render scale); otherwise it is ended and a new
+    /// one begins at `t`. The range announced runs from `t` to the end of the source
+    /// (`clip_range.1`, the real last frame when the host knows it, else the long fallback the clips
+    /// report), with step 1. A plug-in that declared `kOfxImageEffectInstancePropSequentialRender`
+    /// (1 or 2) is told that frames come in order.
+    pub fn ensure_sequence(&mut self, t: f64, scale: f64, clip_range: (f64, f64)) {
+        let continues = self.seq.as_ref().is_some_and(|s| s.renders > 0 && s.scale == scale && (t - (s.last + 1.0)).abs() < 1.0e-3 && t <= s.range.1 + 1.0e-3);
+        if continues {
+            return;
+        }
+        self.end_sequence_now();
+        let s = Seq { range: (t, clip_range.1.max(t)), scale, sequential: self.cfg.sequential_render != 0, last: t, renders: 0 };
+        self.entry.call(ACT_BEGIN_SEQ, self.handle(), Some(&self.sequence_args(&s)), None);
+        self.seq = Some(s);
     }
 
-    pub fn end_sequence(&self, time: f64, scale: f64) -> OfxStatus {
-        self.entry.call(ACT_END_SEQ, self.handle(), Some(&self.sequence_args(time, scale)), None)
+    /// The render at frame `t` finished: the sequence has one more frame.
+    pub fn note_rendered(&mut self, t: f64) {
+        if let Some(s) = &mut self.seq {
+            s.last = t;
+            s.renders = s.renders.saturating_add(1);
+        }
+    }
+
+    /// Whether the open sequence continues with a render at frame `t`.
+    pub fn continues_at(&self, t: f64) -> bool {
+        self.seq.as_ref().is_some_and(|s| s.renders > 0 && (t - (s.last + 1.0)).abs() < 1.0e-3)
+    }
+
+    /// End the sequence that is open, if there is one (`EndSequenceRender`).
+    pub fn end_sequence_now(&mut self) {
+        if let Some(s) = self.seq.take() {
+            self.entry.call(ACT_END_SEQ, self.handle(), Some(&self.sequence_args(&s)), None);
+        }
+    }
+
+    /// `kOfxActionPurgeCaches`: the plug-in should let go of what it caches.
+    pub fn purge_caches(&self) -> OfxStatus {
+        self.entry.call(ACT_PURGE_CACHES, self.handle(), None, None)
     }
 
     /// `kOfxImageEffectActionRender`.
@@ -998,7 +1055,7 @@ impl Instance {
         inp.put_str(IE_FIELD_TO_RENDER, FIELD_NONE);
         inp.put_ints(IE_RENDER_WINDOW, &[window.x1, window.y1, window.x2, window.y2]);
         inp.put_doubles(IE_RENDER_SCALE, &[scale, scale]);
-        inp.put_int(IE_SEQUENTIAL_RENDER_STATUS, 0);
+        inp.put_int(IE_SEQUENTIAL_RENDER_STATUS, self.seq.as_ref().is_some_and(|s| s.sequential) as i32);
         inp.put_int(IE_INTERACTIVE_RENDER_STATUS, 0);
         inp.put_int(IE_RENDER_QUALITY_DRAFT, 0);
         inp.put_int(IE_THUMBNAIL_RENDER, 0);
@@ -1010,6 +1067,8 @@ impl Instance {
 impl Drop for Instance {
     fn drop(&mut self) {
         if self.created {
+            // A sequence that is still open ends before the instance does.
+            self.end_sequence_now();
             self.entry.call(ACT_DESTROY_INSTANCE, self.handle(), None, None);
         }
     }

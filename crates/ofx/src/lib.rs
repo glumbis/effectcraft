@@ -134,13 +134,17 @@ pub fn rescan_command() -> Result<serde_json::Value, String> {
 /// pre-launches its preset browser on load).
 const HELPERS: &[&str] = &["preset-browser.exe"];
 
-/// Call when the app quits: stops the plug-in helper programs ([`HELPERS`]) this process started,
+/// Call when the app quits: sends `DestroyInstance` to the pooled plug-in instances and `Unload` to
+/// the loaded plug-ins, and stops the plug-in helper programs ([`HELPERS`]) this process started,
 /// which would otherwise keep running (and keep a CLI's output pipe open). Only direct child
 /// processes with those names are touched.
 pub fn shutdown() {
     // Plug-ins that rendered all session without a crash lose their strikes; the in-flight record is
     // removed (nothing after this is blamed on a plug-in).
     inflight::close(&effect::rendered_ids());
+    // Every pooled instance is destroyed and every loaded plug-in unloaded (each call guarded, the
+    // whole bounded in time); then the helper programs they started are stopped.
+    effect::shutdown_all();
     #[cfg(windows)]
     win::stop_children(HELPERS);
 }

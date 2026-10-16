@@ -38,6 +38,36 @@ fn with_held(f: impl FnOnce(&mut Vec<u64>)) {
     });
 }
 
+/// The identity of the task running on this thread: its oldest token (a task that holds no lock
+/// has one only inside [`enter_task`]). `None` outside any task.
+pub fn current_task() -> Option<u64> {
+    HELD.with(|h| h.try_borrow().ok().and_then(|h| h.first().copied()))
+}
+
+/// Ends the task [`enter_task`] started when dropped.
+pub struct Task(Option<u64>);
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            with_held(|h| h.retain(|t| *t != token));
+        }
+    }
+}
+
+/// Give the work this thread starts an identity ([`current_task`]) if it has none yet: a render that
+/// is the outermost of its task starts one, a nested render (on this thread, or on a thread working
+/// for it) belongs to the task that is there. Tasks tell a render that waits for an instance
+/// another task holds from one that would wait for itself.
+pub fn enter_task() -> Task {
+    if current_task().is_some() {
+        return Task(None);
+    }
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    with_held(|h| h.push(token));
+    Task(Some(token))
+}
+
 /// The tokens the task on this thread holds, for the threads that work for it ([`adopt`]).
 pub fn snapshot() -> Vec<u64> {
     HELD.with(|h| h.try_borrow().map(|h| h.clone()).unwrap_or_default())
@@ -221,6 +251,35 @@ mod tests {
         stranger.join().unwrap();
         // The workers' tokens went with their scopes.
         assert!(snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_task_is_known_to_the_threads_that_work_for_it() {
+        assert_eq!(current_task(), None);
+        let outer = enter_task();
+        let id = current_task().expect("inside a task");
+        // A nested task is the same task.
+        {
+            let _inner = enter_task();
+            assert_eq!(current_task(), Some(id));
+        }
+        assert_eq!(current_task(), Some(id));
+        // The lock a task takes does not change who it is, and a helper thread that adopts it is it.
+        let l = ReentrantLock::new();
+        let g = l.lock();
+        assert_eq!(current_task(), Some(id));
+        let tokens = snapshot();
+        let seen = std::thread::spawn(move || {
+            assert_eq!(current_task(), None);
+            let _a = adopt(&tokens);
+            current_task()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, Some(id));
+        drop(g);
+        drop(outer);
+        assert_eq!(current_task(), None);
     }
 
     #[test]

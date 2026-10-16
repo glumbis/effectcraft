@@ -1,4 +1,4 @@
-//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports thirteen effects:
+//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports fifteen effects:
 //!
 //! * `org.effectcraft.test.Invert`: filter, inverts the colours (double param `amount`);
 //! * `org.effectcraft.test.Echo`: filter, averages Source at `t` and `t - 1` (temporal access);
@@ -23,8 +23,17 @@
 //!   `kOfxImageEffectPluginPropSingleInstance`): declare `kOfxImageEffectInstancePropSequentialRender`
 //!   = 1, count what the host does to them and paint the counts into the first three pixels of the
 //!   bottom row, so a test can see instance sharing and sequence handling (see `probe_pixels`);
+//! * `org.effectcraft.test.ProbeSlow`: a probe that declares it keeps no state between frames
+//!   (SequentialRender 0), takes 300 ms to create an instance (a plug-in that loads a model) and
+//!   fetches its source at `t - 1` while it renders (so the host renders upstream effects);
+//! * `org.effectcraft.test.Memory`: answers its first Render with `kOfxStatErrMemory`; once the host
+//!   has sent `kOfxActionPurgeCaches` it renders, and it paints how many renders and purges it saw;
 //! * `org.effectcraft.test.Crash`: passes the image through, but crashes the process in Render when
 //!   the environment variable `EC_TEST_OFX_CRASH` is `segv` (a null write) or `abort`.
+//!
+//! With the environment variable `EC_TEST_OFX_LOG` set to a file, the probes append a line for
+//! each `BeginSequenceRender`, `EndSequenceRender`, `DestroyInstance` and every plug-in a line for
+//! `Unload` (what the host does at shutdown).
 //!
 //! With `EC_TEST_OFX_MODE=renamed` every label gets a suffix, so the description differs from the
 //! one made without it.
@@ -59,8 +68,10 @@ const SERIAL: usize = 11;
 const PROBE: usize = 12;
 const PROBE_SINGLE: usize = 13;
 const CRASH: usize = 14;
+const PROBE_SLOW: usize = 15;
+const MEMORY: usize = 16;
 
-const LABELS: [&CStr; 15] = [
+const LABELS: [&CStr; 17] = [
     c"EC Test Invert",
     c"EC Test Echo",
     c"EC Test Border",
@@ -76,6 +87,8 @@ const LABELS: [&CStr; 15] = [
     c"EC Test Probe",
     c"EC Test Probe Single",
     c"EC Test Crash",
+    c"EC Test Probe Slow",
+    c"EC Test Memory",
 ];
 
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(null_mut());
@@ -130,7 +143,7 @@ macro_rules! plug {
     };
 }
 
-static PLUGINS: [Plug; 13] = [
+static PLUGINS: [Plug; 15] = [
     plug!(c"org.effectcraft.test.Invert", INVERT),
     plug!(c"org.effectcraft.test.Echo", ECHO),
     plug!(c"org.effectcraft.test.Border", BORDER),
@@ -144,6 +157,8 @@ static PLUGINS: [Plug; 13] = [
     plug!(c"org.effectcraft.test.Probe", PROBE),
     plug!(c"org.effectcraft.test.ProbeSingle", PROBE_SINGLE),
     plug!(c"org.effectcraft.test.Crash", CRASH),
+    plug!(c"org.effectcraft.test.ProbeSlow", PROBE_SLOW),
+    plug!(c"org.effectcraft.test.Memory", MEMORY),
 ];
 
 /// What `EC_TEST_OFX_MODE=extras` exports instead of [`PLUGINS`].
@@ -191,10 +206,17 @@ unsafe fn dispatch(k: usize, action: &[u8], effect: Effect, in_args: Props, out_
             b"OfxImageEffectActionDescribeInContext" => describe_in_context(k, effect, in_args),
             b"OfxActionCreateInstance" if k == CREATE_TIME => create_time_create(effect),
             b"OfxActionDestroyInstance" if k == CREATE_TIME => create_time_destroy(effect),
-            b"OfxActionCreateInstance" if is_probe(k) => probe_create(effect),
-            b"OfxActionDestroyInstance" if is_probe(k) => probe_destroy(effect),
-            b"OfxImageEffectActionBeginSequenceRender" if is_probe(k) => probe_begin(effect, in_args),
-            b"OfxImageEffectActionEndSequenceRender" if is_probe(k) => probe_end(effect),
+            b"OfxActionCreateInstance" if is_probe(k) => probe_create(k, effect),
+            b"OfxActionDestroyInstance" if is_probe(k) => probe_destroy(k, effect),
+            b"OfxImageEffectActionBeginSequenceRender" if is_probe(k) => probe_begin(k, effect, in_args),
+            b"OfxImageEffectActionEndSequenceRender" if is_probe(k) => probe_end(k, effect),
+            b"OfxActionCreateInstance" if k == MEMORY => memory_create(effect),
+            b"OfxActionDestroyInstance" if k == MEMORY => memory_destroy(effect),
+            b"OfxActionPurgeCaches" if k == MEMORY => memory_purge(effect),
+            b"OfxActionUnload" => {
+                log_line(&format!("Unload {}", LABELS.get(k).map(|l| l.to_string_lossy()).unwrap_or_default()));
+                OK
+            }
             b"OfxImageEffectActionGetClipPreferences" if k == CREATE_TIME => create_time_prefs(effect, out_args),
             b"OfxImageEffectActionGetRegionOfDefinition" if k == BORDER => border_rod(effect, in_args, out_args),
             b"OfxImageEffectActionRender" => render(k, effect, in_args),
@@ -254,10 +276,11 @@ unsafe fn describe(k: usize, effect: Effect) -> Status {
         let safety = if k == SERIAL { c"OfxImageEffectRenderUnsafe" } else { c"OfxImageEffectRenderFullySafe" };
         s.set_str(p, c"OfxImageEffectPluginRenderThreadSafety", 0, safety);
         s.set_int(p, c"OfxImageEffectPropSupportsTiles", 0, 0);
-        s.set_int(p, c"OfxImageEffectPropTemporalClipAccess", 0, (k == ECHO || k == SERIAL) as c_int);
+        s.set_int(p, c"OfxImageEffectPropTemporalClipAccess", 0, (k == ECHO || k == SERIAL || k == PROBE_SLOW) as c_int);
         if is_probe(k) {
-            // The plug-in keeps state from frame to frame: frames in order, please.
-            s.set_int(p, c"OfxImageEffectInstancePropSequentialRender", 0, 1);
+            // The plug-in keeps state from frame to frame: frames in order, please (the slow probe says
+            // it does not).
+            s.set_int(p, c"OfxImageEffectInstancePropSequentialRender", 0, if k == PROBE_SLOW { 0 } else { 1 });
         }
         if k == PROBE_SINGLE {
             s.set_int(p, c"OfxImageEffectPluginPropSingleInstance", 0, 1);
@@ -331,7 +354,7 @@ unsafe fn describe_in_context(k: usize, effect: Effect, in_args: Props) -> Statu
             define_clip(effect, c"Image", false, false, false);
         } else {
             define_clip(effect, c"Output", false, false, k == SUPPORT_LIB);
-            define_clip(effect, c"Source", false, k == ECHO || k == SERIAL, k == SUPPORT_LIB);
+            define_clip(effect, c"Source", false, k == ECHO || k == SERIAL || k == PROBE_SLOW, k == SUPPORT_LIB);
             if k == MIX {
                 define_clip(effect, c"Matte", true, false, false);
             }
@@ -612,7 +635,16 @@ unsafe fn int_param(effect: Effect, name: &CStr, time: f64) -> i32 {
 // ---- probes ----------------------------------------------------------------------------------
 
 fn is_probe(k: usize) -> bool {
-    k == PROBE || k == PROBE_SINGLE
+    k == PROBE || k == PROBE_SINGLE || k == PROBE_SLOW
+}
+
+/// Which counters a probe kind uses.
+fn probe_slot(k: usize) -> usize {
+    match k {
+        PROBE => 0,
+        PROBE_SINGLE => 1,
+        _ => 2,
+    }
 }
 
 /// What a probe instance counts about what the host did to it.
@@ -627,35 +659,51 @@ struct ProbeData {
     begin_status: i32,
 }
 
-/// Instances ever created (the next serial number) and instances alive now.
-static PROBE_CREATES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static PROBE_LIVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Instances ever created (the next serial number) and instances alive now, per probe kind.
+static PROBE_CREATES: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+static PROBE_LIVE: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+
+/// Append a line to the file named by `EC_TEST_OFX_LOG`, if there is one.
+fn log_line(line: &str) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("EC_TEST_OFX_LOG")
+        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
 
 unsafe fn probe_data<'a>(effect: Effect) -> Option<&'a mut ProbeData> {
     unsafe { suites().get_ptr(effect_props(effect), c"OfxPropInstanceData").filter(|d| !d.is_null()).map(|d| &mut *(d as *mut ProbeData)) }
 }
 
-unsafe fn probe_create(effect: Effect) -> Status {
-    let serial = PROBE_CREATES.fetch_add(1, Ordering::SeqCst) + 1;
-    PROBE_LIVE.fetch_add(1, Ordering::SeqCst);
+unsafe fn probe_create(k: usize, effect: Effect) -> Status {
+    if k == PROBE_SLOW {
+        // A plug-in that loads a model per instance.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let slot = probe_slot(k);
+    let serial = PROBE_CREATES[slot].fetch_add(1, Ordering::SeqCst) + 1;
+    PROBE_LIVE[slot].fetch_add(1, Ordering::SeqCst);
     let data = Box::new(ProbeData { serial, begins: 0, ends: 0, in_sequence: 0, range: [0.0; 2], begin_status: -1 });
     unsafe { suites().set_ptr(effect_props(effect), c"OfxPropInstanceData", 0, Box::into_raw(data) as *mut c_void) };
     OK
 }
 
-unsafe fn probe_destroy(effect: Effect) -> Status {
+unsafe fn probe_destroy(k: usize, effect: Effect) -> Status {
     unsafe {
         let props = effect_props(effect);
         if let Some(data) = suites().get_ptr(props, c"OfxPropInstanceData").filter(|d| !d.is_null()) {
-            drop(Box::from_raw(data as *mut ProbeData));
+            let d = Box::from_raw(data as *mut ProbeData);
+            log_line(&format!("DestroyInstance {} #{}", LABELS[k].to_string_lossy(), d.serial));
             suites().set_ptr(props, c"OfxPropInstanceData", 0, null_mut());
-            PROBE_LIVE.fetch_sub(1, Ordering::SeqCst);
+            PROBE_LIVE[probe_slot(k)].fetch_sub(1, Ordering::SeqCst);
         }
     }
     OK
 }
 
-unsafe fn probe_begin(effect: Effect, in_args: Props) -> Status {
+unsafe fn probe_begin(k: usize, effect: Effect, in_args: Props) -> Status {
     let s = suites();
     unsafe {
         if let Some(d) = probe_data(effect) {
@@ -666,15 +714,17 @@ unsafe fn probe_begin(effect: Effect, in_args: Props) -> Status {
                 s.get_dbl(in_args, c"OfxImageEffectPropFrameRange", 1).unwrap_or(-1.0),
             ];
             d.begin_status = s.get_int(in_args, c"OfxImageEffectPropSequentialRenderStatus", 0).unwrap_or(-1);
+            log_line(&format!("BeginSequenceRender {} #{} {}..{}", LABELS[k].to_string_lossy(), d.serial, d.range[0], d.range[1]));
         }
     }
     OK
 }
 
-unsafe fn probe_end(effect: Effect) -> Status {
+unsafe fn probe_end(k: usize, effect: Effect) -> Status {
     unsafe {
         if let Some(d) = probe_data(effect) {
             d.ends += 1;
+            log_line(&format!("EndSequenceRender {} #{}", LABELS[k].to_string_lossy(), d.serial));
         }
     }
     OK
@@ -682,24 +732,80 @@ unsafe fn probe_end(effect: Effect) -> Status {
 
 /// A probe paints twelve numbers into the first three pixels of the output's bottom row:
 ///
-/// 1. `[serial, begins, renders since the last begin, instances alive]`,
+/// 1. `[serial, begins, renders since the last begin, instances of this kind alive]`,
 /// 2. `[the declared SequentialRender seen on the instance, ends, the render's SequentialRenderStatus, last frame of the last begin's range]`,
-/// 3. `[first frame of the last begin's range, the last begin's SequentialRenderStatus, instances ever created, 0]`.
-unsafe fn probe_render(effect: Effect, in_args: Props, out: &Img) -> Status {
+/// 3. `[first frame of the last begin's range, the last begin's SequentialRenderStatus, instances of this kind ever created, 0]`.
+unsafe fn probe_render(k: usize, effect: Effect, in_args: Props, out: &Img) -> Status {
     let s = suites();
     unsafe {
+        if k == PROBE_SLOW {
+            // Asks the host for the source one frame back, which makes it render what is upstream.
+            let time = s.get_dbl(in_args, c"OfxPropTime", 0).unwrap_or(0.0);
+            let _ = Img::fetch(clip(effect, c"Source"), time - 1.0);
+        }
         let Some(d) = probe_data(effect) else { return FAILED };
         d.in_sequence += 1;
+        let slot = probe_slot(k);
         let declared = s.get_int(effect_props(effect), c"OfxImageEffectInstancePropSequentialRender", 0).unwrap_or(-1);
         let status = s.get_int(in_args, c"OfxImageEffectPropSequentialRenderStatus", 0).unwrap_or(-1);
         let rows = [
-            [d.serial as f32, d.begins as f32, d.in_sequence as f32, PROBE_LIVE.load(Ordering::SeqCst) as f32],
+            [d.serial as f32, d.begins as f32, d.in_sequence as f32, PROBE_LIVE[slot].load(Ordering::SeqCst) as f32],
             [declared as f32, d.ends as f32, status as f32, d.range[1] as f32],
-            [d.range[0] as f32, d.begin_status as f32, PROBE_CREATES.load(Ordering::SeqCst) as f32, 0.0],
+            [d.range[0] as f32, d.begin_status as f32, PROBE_CREATES[slot].load(Ordering::SeqCst) as f32, 0.0],
         ];
         for (i, v) in rows.into_iter().enumerate() {
             out.set(out.bounds[0] + i as i32, out.bounds[1], v);
         }
+    }
+    OK
+}
+
+/// What the Memory effect's instance counts.
+struct MemoryData {
+    renders: u32,
+    purges: u32,
+}
+
+unsafe fn memory_data<'a>(effect: Effect) -> Option<&'a mut MemoryData> {
+    unsafe { suites().get_ptr(effect_props(effect), c"OfxPropInstanceData").filter(|d| !d.is_null()).map(|d| &mut *(d as *mut MemoryData)) }
+}
+
+unsafe fn memory_create(effect: Effect) -> Status {
+    let data = Box::new(MemoryData { renders: 0, purges: 0 });
+    unsafe { suites().set_ptr(effect_props(effect), c"OfxPropInstanceData", 0, Box::into_raw(data) as *mut c_void) };
+    OK
+}
+
+unsafe fn memory_destroy(effect: Effect) -> Status {
+    unsafe {
+        let props = effect_props(effect);
+        if let Some(data) = suites().get_ptr(props, c"OfxPropInstanceData").filter(|d| !d.is_null()) {
+            drop(Box::from_raw(data as *mut MemoryData));
+            suites().set_ptr(props, c"OfxPropInstanceData", 0, null_mut());
+        }
+    }
+    OK
+}
+
+unsafe fn memory_purge(effect: Effect) -> Status {
+    unsafe {
+        if let Some(d) = memory_data(effect) {
+            d.purges += 1;
+        }
+    }
+    OK
+}
+
+/// The Memory effect: out of memory until the host has asked it to purge its caches. Paints
+/// `[renders, purges, 0, 0]` into the first pixel of the output's bottom row.
+unsafe fn memory_render(effect: Effect, out: &Img) -> Status {
+    unsafe {
+        let Some(d) = memory_data(effect) else { return FAILED };
+        d.renders += 1;
+        if d.purges == 0 {
+            return ERR_MEMORY;
+        }
+        out.set(out.bounds[0], out.bounds[1], [d.renders as f32, d.purges as f32, 0.0, 0.0]);
     }
     OK
 }
@@ -747,7 +853,10 @@ unsafe fn render(k: usize, effect: Effect, in_args: Props) -> Status {
         let scale = [0, 1].map(|i| s.get_dbl(in_args, c"OfxImageEffectPropRenderScale", i).unwrap_or(1.0));
         let Some(out) = Img::fetch(clip(effect, c"Output"), time) else { return FAILED };
         if is_probe(k) {
-            return probe_render(effect, in_args, &out);
+            return probe_render(k, effect, in_args, &out);
+        }
+        if k == MEMORY {
+            return memory_render(effect, &out);
         }
         if k == CRASH {
             crash_if_asked();
