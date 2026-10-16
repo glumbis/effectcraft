@@ -71,6 +71,9 @@ if (-not (Test-Path $bundle)) { $bundle = Join-Path $src 'ec-test-ofx.ofx.bundle
 $ofx = Join-Path $dst 'OFX'
 if (Test-Path $bundle) {
     New-Item -ItemType Directory -Force $ofx | Out-Null
+    # An update replaces our own bundle (no stale files from an older one) and nothing else in OFX\:
+    # plug-ins the user copied there stay.
+    Remove-Item -LiteralPath (Join-Path $ofx 'ec-test-ofx.ofx.bundle') -Recurse -Force -ErrorAction SilentlyContinue
     Copy-Item $bundle $ofx -Recurse -Force
     Say '[ok] Test plug-in installed ("EC Test" effects)' 'Green'
 }
@@ -80,7 +83,8 @@ if ($cur -and (($cur -split ';') -contains $ofx)) {
     $rest = @($cur -split ';' | Where-Object { $_ -and $_ -ne $ofx })
     [Environment]::SetEnvironmentVariable('OFX_PLUGIN_PATH', $(if ($rest.Count) { $rest -join ';' } else { $null }), 'User')
 }
-Say '     Your own OpenFX plug-ins (RSMB, Twixtor, Sapphire...): install their OFX versions with their own installers.'
+Say '     Your own OpenFX plug-ins (RSMB, Twixtor, Sapphire...): install their OFX versions with their own installers,'
+Say '     or copy the .ofx.bundle folder into %APPDATA%\EffectCraft\OFX (no administrator rights; kept when EffectCraft is uninstalled).'
 
 # 4. Python + py-aep for .aep / .aepx import.
 function Find-Python {
