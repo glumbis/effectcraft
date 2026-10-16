@@ -114,8 +114,11 @@ fn search_paths_for(os: Os, env: &dyn Fn(&str) -> Option<std::ffi::OsString>, co
         Os::Linux => {
             v.push(PathBuf::from("/usr/OFX/Plugins"));
             v.push(PathBuf::from("/usr/local/OFX/Plugins"));
-            // The XDG data folder; a relative `XDG_DATA_HOME` is invalid and ignored (the XDG specification).
-            let data = env("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).or_else(|| home().map(|h| h.join(".local/share")));
+            // The XDG data folder; a relative `XDG_DATA_HOME` is invalid and ignored (the XDG
+            // specification). The path is a POSIX one, so absolute means it starts with `/`: the same
+            // as `Path::is_absolute` on Linux, and the same answer wherever this is tested.
+            let data =
+                env("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.to_string_lossy().starts_with('/')).or_else(|| home().map(|h| h.join(".local/share")));
             v.extend(data.map(|d| d.join("OFX/Plugins")));
         }
     }
