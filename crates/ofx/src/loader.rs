@@ -374,7 +374,9 @@ enum Winner {
 /// scans. The highest version wins; among equal versions the copy found first. Result: (binary
 /// index, offer index) of every loser, with the winner.
 fn pick_duplicates(offers: &[Vec<Offer>], claimed: &HashMap<String, (u32, u32)>) -> BTreeMap<(usize, usize), Winner> {
-    let mut by_id: BTreeMap<&str, Vec<(usize, usize, (u32, u32))>> = BTreeMap::new();
+    // (binary index, offer index, version) of every offer of an identifier, in scan order.
+    type Candidate = (usize, usize, (u32, u32));
+    let mut by_id: BTreeMap<&str, Vec<Candidate>> = BTreeMap::new();
     for (i, list) in offers.iter().enumerate() {
         for (j, o) in list.iter().enumerate() {
             by_id.entry(o.id.as_str()).or_default().push((i, j, o.version));
@@ -732,10 +734,7 @@ fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex
     // The effect's own pixels come in on `Source` (`SourceFrom` in a transition). A plug-in that
     // calls its main input something else gets its first required, non-mask clip instead of a
     // Layer parameter with nothing behind it.
-    let input_name = match main_input(&clip_infos, standard_input) {
-        Some(n) => n,
-        None => String::new(),
-    };
+    let input_name = main_input(&clip_infos, standard_input).unwrap_or_default();
     if !input_name.is_empty() && input_name != standard_input {
         notes.push(format!("it has no clip named {standard_input}; its first required clip, {input_name}, is used as the main input"));
     }
