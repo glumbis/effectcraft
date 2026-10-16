@@ -74,11 +74,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: Windows, os: windows-latest, key: windows, tolerate: false }
-          - { name: Linux, os: ubuntu-22.04, key: linux, tolerate: false }
-          # First time the OFX host runs on Apple Silicon: the test step is allowed to fail so the
-          # packaging below still runs; the failure shows as a warning on the run.
-          - { name: macOS Apple Silicon, os: macos-15, key: macos-arm64, tolerate: true }
+          - { name: Windows, os: windows-latest, key: windows }
+          - { name: Linux, os: ubuntu-22.04, key: linux }
+          - { name: macOS Apple Silicon, os: macos-15, key: macos-arm64 }
     defaults:
       run:
         shell: bash
@@ -103,16 +101,9 @@ jobs:
       - name: Build the test OFX plug-in and lay out its bundle
         run: bash tools/fork-installer/ci/build-test-bundle.sh
       - name: Test
-        id: test
-        continue-on-error: ${{ matrix.tolerate }}
         env:
           EC_TEST_OFX_BUNDLE: ${{ github.workspace }}/target/ofx-test/ec-test-ofx.ofx.bundle
         run: cargo test -p effectcraft-ofx -p effectcraft-effects -p effectcraft-plugin -p effectcraft-host --features effectcraft-host/openfx
-      - name: Tolerated test failure
-        if: steps.test.outcome == 'failure'
-        run: |
-          echo "::warning title=${{ matrix.name }} tests failed::The OFX tests failed on ${{ matrix.name }}; the job is allowed to pass (see the Test step)."
-          echo "### ${{ matrix.name }}: tests FAILED (tolerated)" >>"$GITHUB_STEP_SUMMARY"
 
   windows:
     name: Package Windows x64
