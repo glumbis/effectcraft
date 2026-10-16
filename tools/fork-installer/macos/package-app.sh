@@ -4,13 +4,16 @@
 #
 #   <out>/EffectCraft-OFX-<label>-macos-<arm64|x86_64>.zip
 #       EffectCraft-OFX-<label>-macos-<arch>/
-#           EffectCraft.app      Contents/MacOS/{EffectCraft, effectcraft-cli, OFX/, aep-import/}
+#           EffectCraft.app      Contents/MacOS/{EffectCraft, effectcraft-cli, OFX, aep-import}
 #           READ ME FIRST.txt    how to open an app that isn't notarized
 #           Set up After Effects import.command
 #           README.md, LICENSE-*
 #
-# OFX/ (the EC Test plug-in) and aep-import/ (the .aep converter) sit beside the executable because
-# that is where the app looks (crates/ofx/src/loader.rs, crates/host/src/aep.rs).
+# OFX/ (the EC Test plug-in) and aep-import/ (the .aep converter) are looked for beside the executable
+# (crates/ofx/src/loader.rs, crates/host/src/aep.rs), i.e. in Contents/MacOS. codesign refuses data
+# files there ("code object is not signed at all"), so the real folders live in Contents/Resources and
+# Contents/MacOS/OFX and Contents/MacOS/aep-import are symlinks to them. Both the loader and the
+# converter lookup follow symlinks, and the bundle still verifies with `codesign --verify --deep --strict`.
 #
 # Usage: package-app.sh --label <label> --arch <arm64|x86_64> [--out <dir>] [--bin-dir <dir>] [--bundle <dir>]
 #   --bin-dir  folder with the built `effectcraft` and `effectcraft-cli`
@@ -76,18 +79,20 @@ sed -e "s/@VERSION@/$LABEL/g" -e "s/@SHORT_VERSION@/$SHORT_VERSION/g" -e "s/@BUI
   "$ROOT/packaging/macos/Info.plist.in" >"$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 printf 'APPL????' >"$APP/Contents/PkgInfo"
-mkdir -p "$MACOS/OFX" "$MACOS/aep-import"
-cp -R "$BUNDLE" "$MACOS/OFX/"
-cp "$ROOT"/tools/aep-import/*.py "$ROOT/tools/aep-import/README.md" "$ROOT/tools/aep-import/requirements.txt" "$MACOS/aep-import/"
-# Data, not code: no executable bit, so codesign doesn't mistake the scripts for unsigned code in Contents/MacOS.
-find "$MACOS/aep-import" -type f -exec chmod 0644 {} +
+RES="$APP/Contents/Resources"
+mkdir -p "$RES/OFX" "$RES/aep-import"
+cp -R "$BUNDLE" "$RES/OFX/"
+cp "$ROOT"/tools/aep-import/*.py "$ROOT/tools/aep-import/README.md" "$ROOT/tools/aep-import/requirements.txt" "$RES/aep-import/"
+# Data, not code: no executable bit.
+find "$RES/aep-import" -type f -exec chmod 0644 {} +
+ln -s ../Resources/OFX "$MACOS/OFX"
+ln -s ../Resources/aep-import "$MACOS/aep-import"
 
 # Ad-hoc signature, inside out: nested code first, then the app. Apple Silicon refuses to run
 # unsigned code, so every Mach-O needs at least this.
 sign() { codesign --force --sign - --timestamp=none "$@"; }
-find "$MACOS/OFX" -type f -name '*.ofx' | while IFS= read -r f; do sign "$f"; done
+find "$RES/OFX" -type f -name '*.ofx' | while IFS= read -r f; do sign "$f"; done
 sign "$MACOS/effectcraft-cli"
-sign "$MACOS/EffectCraft"
 sign "$APP"
 if ! codesign --verify --deep --strict --verbose=2 "$APP"; then
   echo "::warning::codesign --verify --deep --strict failed for the ad-hoc signed app (see above)"
