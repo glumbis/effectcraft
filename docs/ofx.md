@@ -106,7 +106,9 @@ The file has these parts, in order:
 1. A title line, then **`Host name shown to plug-ins: <name> (<source>)`**, with the settings file's
    path, how to change the name, a pending change that waits for a restart and any problem with the
    settings file ([Host name](#host-name)).
-2. **Folders searched**: every search path, marked `found` or `missing`.
+2. **Folders searched**: every search path, marked `found` or `missing`. A folder that exists but
+   holds no plug-in reads `[found  ] <path>  (no plug-ins in it)`; it is not counted under Problems
+   and doesn't trigger the start-up message.
 3. **Plug-ins that crashed EffectCraft in the previous session**: only when there is one: the
    plug-in, the action, the time, the thread and, on Windows, the exception and module ([A plug-in
    that crashes while it runs](#a-plug-in-that-crashes-while-it-runs)).
@@ -543,9 +545,9 @@ EffectCraft does not include, license or activate any third-party plug-in.
 
 | Command | Parameters | Result |
 |---|---|---|
-| `effect.plugins.scanOfx` | `{retry?, cache?}` | `{paths, loaded, errors, notes, transcript, cache, crashes}`: registers every plug-in in the search paths (folders that don't exist are skipped; one bad plug-in doesn't stop the rest). Binaries that did not change come from the [scan cache](#the-scan-cache) without being loaded, unless `cache` is `false`. `retry: true` empties both crash lists first (the load blocklist and the render strikes). `cache` is `{enabled, file, hits, scanned, lines, problems}`; `crashes` lists the plug-ins that crashed the app during the previous session. |
+| `effect.plugins.scanOfx` | `{retry?, cache?}` | `{paths, loaded, errors, notes, transcript, cache, crashes, emptyFolders}`: registers every plug-in in the search paths (folders that don't exist are skipped; one bad plug-in doesn't stop the rest). `emptyFolders` lists the existing folders that held no plug-in; they are not errors. Binaries that did not change come from the [scan cache](#the-scan-cache) without being loaded, unless `cache` is `false`. `retry: true` empties both crash lists first (the load blocklist and the render strikes). `cache` is `{enabled, file, hits, scanned, lines, problems}`; `crashes` lists the plug-ins that crashed the app during the previous session. |
 | `effect.plugins.rescanOfx` | none | `{cleared, file, restartRequired, note}`: deletes `ofx_cache.json`, so the next start loads and describes every plug-in again. Registrations are made once per run, so it takes effect at the next start. |
-| `effect.plugins.loadOfx` | `{path}`: an `.ofx` binary, an `.ofx.bundle` folder or a folder (scanned recursively) | `{loaded: [{id, name, category, ofxId, context, bundle}], errors, notes, transcript}`. It always loads fresh (it doesn't use the scan cache). It fails, with the reasons from `errors` and `notes`, when nothing loaded and there is something to say. |
+| `effect.plugins.loadOfx` | `{path}`: an `.ofx` binary, an `.ofx.bundle` folder or a folder (scanned recursively) | `{loaded: [{id, name, category, ofxId, context, bundle}], errors, notes, transcript, emptyFolders}`. It always loads fresh (it doesn't use the scan cache). It fails, with the reasons from `errors` and `notes`, when nothing loaded and there is something to say. A folder with no plug-in in it is not an error (the message says "<path>: no OpenFX effects in it"). |
 | `effect.plugins.openOfxUserFolder` | none | `{path, opened}`: creates the per-user plug-in folder (`<config dir>/OFX`) if it is missing and opens it in the file manager (Explorer, `open`, `xdg-open`, started detached). |
 | `effect.plugins.openOfxReport` | none | `{path, opened}`: opens `ofx_scan.txt` with the operating system's default application. Fails, saying so, when there is no report yet. |
 | `effect.plugins.ofxHostName` | none | `{name, source, configured, environmentOverride, settingsFile, problem, restartRequired, next?, note?}`: the host name in use, where it comes from (`default`, `settings file` or `environment variable`), what `ofx_settings.json` holds, and whether a stored change waits for a restart. |

@@ -466,7 +466,7 @@ in this order:
 | Part | What it tells you |
 |---|---|
 | Host name shown to plug-ins | What EffectCraft calls itself when plug-ins ask. See [step 4](#4-try-a-different-host-name). |
-| Folders searched | Each folder, marked `found` or `missing`. |
+| Folders searched | Each folder, marked `found` or `missing`. A folder that exists but has nothing in it says `(no plug-ins in it)`; that isn't counted as a problem. |
 | Plug-ins that crashed EffectCraft in the previous session | Only there if one did: which plug-in and action, when, and on Windows the error code and the file it happened in. See [EffectCraft crashes](#effectcraft-crashes). |
 | Scan cache | Which plug-in files were registered from the [cache](#fast-starts-the-scan-cache) without being loaded, which were loaded now, and why. |
 | Effects registered | Every effect that loaded, with its category. "0" means nothing loaded. |
@@ -511,7 +511,7 @@ What the common messages mean:
 | `Load failed: ... declined to load` (Problems) | Often a licence check or a host check. Run the vendor's activation tool, then try [step 4](#4-try-a-different-host-name). |
 | `Describe failed: ...` (Problems) | The plug-in couldn't describe itself. Read what "the plug-in said" and "asked for something this host does not provide" at the end of the line, and [report it](#reporting-a-problem). |
 | `needs GPU rendering` | It only renders on the GPU, which EffectCraft doesn't use, so it is skipped and doesn't appear in Effects & Presets. No fix on your side. |
-| `no OpenFX plug-ins found` | The folder exists but has no plug-in bundle in it (an empty `OFX` folder, say). Harmless. |
+| `(no plug-ins in it)` after a folder under **Folders searched** | The folder exists but has no plug-in bundle in it (an empty `OFX` folder, say). That isn't a problem. |
 | `no supported context` / `needs an unsupported pixel depth` | It's a kind of OFX effect EffectCraft can't host yet. [Open an issue](https://github.com/glumbis/effectcraft/issues) with the report. |
 | `N duplicate plug-in(s) skipped, the newest copy is kept` (Notes) | You have several copies of one plug-in installed. The newest runs. See [step 2](#2-keep-only-the-newest-copy-of-each-plug-in). |
 | `skipped, it is not an OpenFX image effect` (Notes) | The file belongs to another kind of OFX plug-in, which EffectCraft doesn't run. |
@@ -727,7 +727,7 @@ OpenFX Scan Report.
 
 | Command | What it does |
 |---|---|
-| `effect.plugins.scanOfx` | Scans the plug-in folders and returns `{paths, loaded, errors, notes, transcript, cache, crashes}`. With `{"retry": true}` it first forgets the crash lists (plug-ins skipped for crashing while loading or rendering). With `{"cache": false}` it doesn't use the scan cache. |
+| `effect.plugins.scanOfx` | Scans the plug-in folders and returns `{paths, loaded, errors, notes, transcript, cache, crashes, emptyFolders}`. With `{"retry": true}` it first forgets the crash lists (plug-ins skipped for crashing while loading or rendering). With `{"cache": false}` it doesn't use the scan cache. |
 | `effect.plugins.rescanOfx` | Deletes the scan cache, so the next start loads and describes every plug-in again. It takes effect at the next start. |
 | `effect.plugins.loadOfx {"path": "…"}` | Loads an `.ofx` file, an `.ofx.bundle` folder, or every bundle in a folder. It always loads the plug-in fresh (it doesn't use the cache). |
 | `effect.plugins.openOfxUserFolder` | Creates the per-user plug-in folder (`OFX` in the settings folder) and opens it in the file manager. In the Effect menu as "Open OpenFX Plug-in Folder". |
