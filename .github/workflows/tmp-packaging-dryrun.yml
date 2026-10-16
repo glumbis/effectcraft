@@ -1,0 +1,73 @@
+# TEMPORARY (removed before the branch is finished): runs the new packaging scripts with fake binaries,
+# so layout, signing and install/uninstall problems show up in a minute instead of after a full build.
+name: tmp packaging dry run
+on:
+  push:
+    branches: ["ci/fork-packaging"]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fake binaries
+        run: |
+          mkdir -p target/release target/ofx-test/ec-test-ofx.ofx.bundle/Contents/Linux-x86-64
+          printf '#include <stdio.h>\nint main(int c, char **v){ puts("effectcraft 0.0.0 (dry run)"); return 0; }\n' >fake.c
+          cc fake.c -o target/release/effectcraft
+          cp target/release/effectcraft target/release/effectcraft-cli
+          printf 'int x;\n' >lib.c
+          cc -shared -fPIC lib.c -o target/ofx-test/ec-test-ofx.ofx.bundle/Contents/Linux-x86-64/ec-test-ofx.ofx
+      - name: Package
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends desktop-file-utils
+          bash tools/fork-installer/ci/package-linux.sh 0.0.0-dry dist
+      - name: Install and uninstall
+        run: |
+          set -euo pipefail
+          mkdir check && tar -xzf dist/EffectCraft-OFX-0.0.0-dry-linux-x86_64.tar.gz -C check
+          pkg=check/EffectCraft-OFX-0.0.0-dry-linux-x86_64
+          (cd check && find . | sort)
+          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
+          "$pkg/install.sh" --yes
+          find "$HOME" -type f -o -type l | sort
+          cat "$HOME/.local/share/applications/effectcraft-ofx.desktop"
+          desktop-file-validate "$HOME/.local/share/applications/effectcraft-ofx.desktop"
+          "$HOME/.local/bin/effectcraft-ofx" --version
+          python3 "$HOME/.local/share/effectcraft-ofx/aep-import/aep2effectcraft.py" --help | head -3
+          "$HOME/.local/share/effectcraft-ofx/uninstall.sh" --yes
+          find "$HOME" | sort
+      - name: AppImage
+        run: |
+          set -euo pipefail
+          a="$PWD/dist/EffectCraft-OFX-0.0.0-dry-linux-x86_64.AppImage"
+          ls -lh "$a"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$a" --version
+          mkdir x && cd x && APPIMAGE_EXTRACT_AND_RUN=1 "$a" --appimage-extract >/dev/null
+          find squashfs-root -maxdepth 4 | sort | head -60
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fake binaries
+        run: |
+          mkdir -p fakebin fakebundle/ec-test-ofx.ofx.bundle/Contents/MacOS
+          printf '#include <stdio.h>\nint main(int c, char **v){ puts("effectcraft 0.0.0 (dry run)"); return 0; }\n' >fake.c
+          cc fake.c -o fakebin/effectcraft
+          cp fakebin/effectcraft fakebin/effectcraft-cli
+          printf 'int x;\n' >lib.c
+          cc -dynamiclib lib.c -o fakebundle/ec-test-ofx.ofx.bundle/Contents/MacOS/ec-test-ofx.ofx
+      - name: Package
+        run: bash tools/fork-installer/macos/package-app.sh --label 0.0.0-dry --arch arm64 --bin-dir fakebin --bundle fakebundle/ec-test-ofx.ofx.bundle --out dist
+      - name: Check
+        run: |
+          set +e
+          mkdir check && ditto -x -k dist/EffectCraft-OFX-0.0.0-dry-macos-arm64.zip check
+          (cd check && find . | sort)
+          app=check/EffectCraft-OFX-0.0.0-dry-macos-arm64/EffectCraft.app
+          codesign --verify --deep --strict --verbose=2 "$app"; echo "verify exit $?"
+          codesign -dvvv "$app" 2>&1 | head -30
+          "$app/Contents/MacOS/EffectCraft" --version
+          spctl --assess --type execute --verbose=4 "$app"; echo "spctl exit $?"
+          xattr -w com.apple.quarantine "0081;00000000;Safari;" "$app" && "$app/Contents/MacOS/EffectCraft" --version; echo "quarantined run exit $?"
