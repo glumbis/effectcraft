@@ -79,6 +79,8 @@ printf 'APPL????' >"$APP/Contents/PkgInfo"
 mkdir -p "$MACOS/OFX" "$MACOS/aep-import"
 cp -R "$BUNDLE" "$MACOS/OFX/"
 cp "$ROOT"/tools/aep-import/*.py "$ROOT/tools/aep-import/README.md" "$ROOT/tools/aep-import/requirements.txt" "$MACOS/aep-import/"
+# Data, not code: no executable bit, so codesign doesn't mistake the scripts for unsigned code in Contents/MacOS.
+find "$MACOS/aep-import" -type f -exec chmod 0644 {} +
 
 # Ad-hoc signature, inside out: nested code first, then the app. Apple Silicon refuses to run
 # unsigned code, so every Mach-O needs at least this.
