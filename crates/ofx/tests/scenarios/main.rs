@@ -4,7 +4,8 @@
 //! need a start-up of their own run it as a child process of this binary (`common::Fixture`) and
 //! name the child test by its full path (`scan_cache::child_start`).
 //!
-//! Set `EC_TEST_OFX_BUNDLE` to the built `ec-test-ofx.ofx.bundle`; without it the scenarios return.
+//! Set `EC_TEST_OFX_BUNDLE` to the built `ec-test-ofx.ofx.bundle`; without it the scenarios return
+//! (`search_paths` needs no bundle: it only asks the host for its plug-in folders).
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -12,3 +13,4 @@ mod instances;
 mod reentrancy;
 mod render_crash;
 mod scan_cache;
+mod search_paths;

@@ -58,29 +58,79 @@ fn loaded_cache() -> &'static Mutex<HashMap<PathBuf, Vec<LoadedEffect>>> {
     L.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Standard OFX locations for this OS, an `OFX` folder next to the executable (where the
-/// fork's download keeps its test plug-in, so other OFX hosts don't see it) and every entry of
-/// `OFX_PLUGIN_PATH`.
+/// The operating systems whose plug-in folders [`search_paths_for`] knows (an enum rather than
+/// `cfg!` so that every OS's list can be tested on any machine).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Os {
+    Windows,
+    Mac,
+    Linux,
+}
+
+impl Os {
+    fn current() -> Os {
+        if cfg!(windows) {
+            Os::Windows
+        } else if cfg!(target_os = "macos") {
+            Os::Mac
+        } else {
+            Os::Linux
+        }
+    }
+}
+
+/// The folders OpenFX plug-ins are looked for in, in this order:
+///
+/// 1. the OS's standard folders (Windows `%CommonProgramFiles%\OFX\Plugins`, macOS
+///    `/Library/OFX/Plugins`, Linux `/usr/OFX/Plugins` and `/usr/local/OFX/Plugins`);
+/// 2. the per-user folders, which need no administrator rights (macOS `~/Library/OFX/Plugins`, Linux
+///    `${XDG_DATA_HOME:-~/.local/share}/OFX/Plugins`);
+/// 3. `OFX` in EffectCraft's config folder (everywhere; it is where the app keeps its settings, so
+///    portable mode moves it with them, and neither an update nor an uninstall of the app touches it);
+/// 4. an `OFX` folder next to the executable (where the fork's download keeps its test plug-in, so
+///    other OFX hosts do not see it);
+/// 5. every entry of `OFX_PLUGIN_PATH`.
+///
+/// A folder that is reached twice (the same one spelled differently, a symbolic link) is listed once.
+/// Folders that do not exist are listed too (the scan report says which are missing).
 pub fn default_search_paths() -> Vec<PathBuf> {
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+    search_paths_for(Os::current(), &|k| std::env::var_os(k), crate::blocklist::state_dir().as_deref(), exe_dir.as_deref())
+}
+
+fn search_paths_for(os: Os, env: &dyn Fn(&str) -> Option<std::ffi::OsString>, config_dir: Option<&Path>, exe_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = Vec::new();
-    #[cfg(windows)]
-    {
-        let common = std::env::var_os("CommonProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Common Files"));
-        v.push(common.join("OFX").join("Plugins"));
-        v.push(PathBuf::from(r"C:\Program Files\Common Files\OFX\Plugins"));
+    let home = || env("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    match os {
+        Os::Windows => {
+            let common = env("CommonProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Common Files"));
+            v.push(common.join("OFX").join("Plugins"));
+            v.push(PathBuf::from(r"C:\Program Files\Common Files\OFX\Plugins"));
+        }
+        Os::Mac => {
+            v.push(PathBuf::from("/Library/OFX/Plugins"));
+            v.extend(home().map(|h| h.join("Library/OFX/Plugins")));
+        }
+        Os::Linux => {
+            v.push(PathBuf::from("/usr/OFX/Plugins"));
+            v.push(PathBuf::from("/usr/local/OFX/Plugins"));
+            // The XDG data folder; a relative `XDG_DATA_HOME` is invalid and ignored (the XDG specification).
+            let data = env("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).or_else(|| home().map(|h| h.join(".local/share")));
+            v.extend(data.map(|d| d.join("OFX/Plugins")));
+        }
     }
-    #[cfg(target_os = "macos")]
-    v.push(PathBuf::from("/Library/OFX/Plugins"));
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    v.push(PathBuf::from("/usr/OFX/Plugins"));
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("OFX"))) {
-        v.push(dir);
-    }
-    if let Some(p) = std::env::var_os("OFX_PLUGIN_PATH") {
+    v.extend(config_dir.map(|c| c.join("OFX")));
+    v.extend(exe_dir.map(|d| d.join("OFX")));
+    if let Some(p) = env("OFX_PLUGIN_PATH") {
         v.extend(std::env::split_paths(&p).filter(|p| !p.as_os_str().is_empty()));
     }
+    // Windows and macOS file systems ignore case (by default); Linux does not.
+    let fold = os != Os::Linux;
     let mut seen = std::collections::HashSet::new();
-    v.retain(|p| seen.insert(p.to_string_lossy().to_lowercase()));
+    v.retain(|p| {
+        let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()).to_string_lossy().into_owned();
+        seen.insert(if fold { real.to_lowercase() } else { real })
+    });
     v
 }
 
@@ -1172,6 +1222,101 @@ mod tests {
 
     fn offer(id: &str, major: u32, minor: u32) -> Offer {
         Offer { id: id.into(), version: (major, minor) }
+    }
+
+    /// An environment of the given variables.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
+        let m: HashMap<String, std::ffi::OsString> = pairs.iter().map(|(k, v)| (k.to_string(), std::ffi::OsString::from(*v))).collect();
+        move |k| m.get(k).cloned()
+    }
+
+    fn paths(os: Os, env: &[(&str, &str)], config: Option<&str>, exe: Option<&str>) -> Vec<PathBuf> {
+        search_paths_for(os, &env_of(env), config.map(Path::new), exe.map(Path::new))
+    }
+
+    fn pb(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(PathBuf::from).collect()
+    }
+
+    /// Linux: the standard folders, the per-user data folder, the config folder's `OFX`, the one next
+    /// to the executable, then `OFX_PLUGIN_PATH`.
+    #[test]
+    fn linux_searches_the_system_user_and_config_folders() {
+        // `OFX_PLUGIN_PATH` is split with the separator of the system the test runs on.
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let plugin_path = format!("/opt/a{sep}/opt/b");
+        let env = [("HOME", "/home/u"), ("OFX_PLUGIN_PATH", plugin_path.as_str())];
+        let want = pb(&[
+            "/usr/OFX/Plugins",
+            "/usr/local/OFX/Plugins",
+            "/home/u/.local/share/OFX/Plugins",
+            "/home/u/.config/effectcraft/OFX",
+            "/opt/ec/OFX",
+            "/opt/a",
+            "/opt/b",
+        ]);
+        assert_eq!(paths(Os::Linux, &env, Some("/home/u/.config/effectcraft"), Some("/opt/ec")), want);
+        // XDG_DATA_HOME replaces ~/.local/share when it is absolute, and is ignored when it is not.
+        let xdg = |v: &'static str| paths(Os::Linux, &[("HOME", "/home/u"), ("XDG_DATA_HOME", v)], None, None);
+        assert_eq!(xdg("/data/xdg")[2], PathBuf::from("/data/xdg/OFX/Plugins"));
+        assert_eq!(xdg("relative/dir")[2], PathBuf::from("/home/u/.local/share/OFX/Plugins"));
+        assert_eq!(xdg("")[2], PathBuf::from("/home/u/.local/share/OFX/Plugins"));
+        // No home and no XDG folder: just the system folders; no config folder: no entry for it.
+        assert_eq!(paths(Os::Linux, &[], None, None), pb(&["/usr/OFX/Plugins", "/usr/local/OFX/Plugins"]));
+    }
+
+    #[test]
+    fn macos_searches_the_system_user_and_config_folders() {
+        let env = [("HOME", "/Users/u")];
+        let want = pb(&[
+            "/Library/OFX/Plugins",
+            "/Users/u/Library/OFX/Plugins",
+            "/Users/u/Library/Application Support/EffectCraft/OFX",
+            "/Applications/EffectCraft.app/Contents/MacOS/OFX",
+        ]);
+        let cfg = Some("/Users/u/Library/Application Support/EffectCraft");
+        assert_eq!(paths(Os::Mac, &env, cfg, Some("/Applications/EffectCraft.app/Contents/MacOS")), want);
+        assert_eq!(paths(Os::Mac, &[], None, None), pb(&["/Library/OFX/Plugins"]));
+    }
+
+    #[test]
+    fn windows_searches_common_files_and_the_config_folder() {
+        let env = [("CommonProgramFiles", r"D:\Common")];
+        let got = paths(Os::Windows, &env, Some(r"C:\Users\u\AppData\Roaming\EffectCraft"), Some(r"C:\Apps\EffectCraft"));
+        let want =
+            [r"D:\Common\OFX\Plugins", r"C:\Program Files\Common Files\OFX\Plugins", r"C:\Users\u\AppData\Roaming\EffectCraft\OFX", r"C:\Apps\EffectCraft\OFX"];
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        // Compared as text, with one separator: `\` is only a separator on Windows.
+        for (g, w) in got.iter().zip(want) {
+            assert_eq!(g.to_string_lossy().replace('/', "\\"), w, "{got:?}");
+        }
+    }
+
+    /// A folder reached twice is searched once: spelled differently, differing in case (on the systems
+    /// whose file systems ignore it), or given by `OFX_PLUGIN_PATH` as well as by default.
+    #[test]
+    fn a_folder_reached_twice_is_listed_once() {
+        let root = std::env::temp_dir().join(format!("effectcraft-ofx-paths-{}", std::process::id()));
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        // The same existing folder, three spellings.
+        let spellings = [real.clone(), real.join("."), root.join("real").join("..").join("real")];
+        let env_path = std::env::join_paths(&spellings).unwrap();
+        let got = search_paths_for(Os::Linux, &env_of(&[("OFX_PLUGIN_PATH", env_path.to_str().unwrap())]), None, None);
+        assert_eq!(got, [PathBuf::from("/usr/OFX/Plugins"), PathBuf::from("/usr/local/OFX/Plugins"), real.clone()]);
+        // The config folder's `OFX` is also on the path: once.
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(cfg.join("OFX")).unwrap();
+        let env_path = std::env::join_paths([cfg.join("OFX")]).unwrap();
+        let got = search_paths_for(Os::Linux, &env_of(&[("OFX_PLUGIN_PATH", env_path.to_str().unwrap())]), Some(&cfg), None);
+        assert_eq!(got, [PathBuf::from("/usr/OFX/Plugins"), PathBuf::from("/usr/local/OFX/Plugins"), cfg.join("OFX")]);
+        let _ = std::fs::remove_dir_all(&root);
+        // Case: Linux keeps both, Windows and macOS list one.
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let plugin_path = format!("/nowhere/Plug-Ins{sep}/nowhere/plug-ins");
+        let both = |os| search_paths_for(os, &env_of(&[("OFX_PLUGIN_PATH", plugin_path.as_str())]), None, None).len();
+        // Linux: two system folders and both spellings; macOS: one system folder and one spelling.
+        assert_eq!((both(Os::Linux), both(Os::Mac)), (4, 2));
     }
 
     fn depths(names: &[&str]) -> Vec<String> {

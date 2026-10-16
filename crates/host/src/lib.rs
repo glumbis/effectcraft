@@ -102,16 +102,17 @@ pub fn session() -> Session {
     // on the web build.
     #[cfg(all(feature = "openfx", not(target_arch = "wasm32")))]
     {
+        // A plug-in that crashed the app while loading is remembered here and skipped next time;
+        // `ofx_settings.json` (the host name plug-ins are told) lives here too, and so does the
+        // per-user plug-in folder `OFX`. It is set before the search paths are made: they include it.
+        if let Some(dir) = config_dir() {
+            effectcraft_ofx::set_state_dir(dir);
+        }
         s.ofx_loader = Some(effectcraft_ofx::loader);
         s.ofx_search_paths = effectcraft_ofx::default_search_paths();
         s.ofx_clear_blocklist = Some(effectcraft_ofx::blocklist::clear);
         s.ofx_rescan = Some(effectcraft_ofx::rescan_command);
         s.ofx_host_name = Some(effectcraft_ofx::host_name_command);
-        // A plug-in that crashed the app while loading is remembered here and skipped next time;
-        // `ofx_settings.json` (the host name plug-ins are told) lives here too.
-        if let Some(dir) = config_dir() {
-            effectcraft_ofx::set_state_dir(dir);
-        }
     }
     // After Effects projects are converted by an external Python program: only with the `aep`
     // feature, never on the web build.
