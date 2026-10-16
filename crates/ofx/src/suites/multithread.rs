@@ -91,13 +91,15 @@ extern "C" fn multi_thread_num_cpus(out: *mut u32) -> OfxStatus {
 }
 
 extern "C" fn multi_thread_index(out: *mut u32) -> OfxStatus {
-    guard(|| match (SPAWNED.with(Cell::get), out.is_null()) {
-        (Some(i), false) => {
-            // SAFETY: valid out-pointer.
-            unsafe { *out = i };
-            K_STAT_OK
+    guard(|| {
+        if out.is_null() {
+            return K_STAT_FAILED;
         }
-        _ => K_STAT_FAILED,
+        // ofxMultiThread.h: "If there are no threads currently spawned, then this function will
+        // set threadIndex to 0": the calling thread is index 0 outside `multiThread`.
+        // SAFETY: valid out-pointer.
+        unsafe { *out = SPAWNED.with(Cell::get).unwrap_or(0) };
+        K_STAT_OK
     })
 }
 
@@ -216,3 +218,48 @@ pub static SUITE: OfxMultiThreadSuiteV1 = OfxMultiThreadSuiteV1 {
     mutex_unlock,
     mutex_try_lock,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// ofxMultiThread.h: outside `multiThread` there are no spawned threads and the index is 0
+    /// (with `kOfxStatOK`), not a failure that leaves the plug-in's variable unwritten.
+    #[test]
+    fn the_thread_index_is_zero_off_spawned_threads() {
+        let mut idx = 77u32;
+        assert_eq!(multi_thread_index(&mut idx), K_STAT_OK);
+        assert_eq!(idx, 0);
+        assert_eq!(multi_thread_is_spawned_thread(), 0);
+        assert_eq!(multi_thread_index(std::ptr::null_mut()), K_STAT_FAILED);
+    }
+
+    static SEEN: [AtomicU32; 4] = [const { AtomicU32::new(u32::MAX) }; 4];
+
+    unsafe extern "C" fn record(index: u32, _max: u32, _arg: *mut c_void) {
+        let mut asked = u32::MAX;
+        let status = multi_thread_index(&mut asked);
+        let spawned = multi_thread_is_spawned_thread();
+        if status == K_STAT_OK
+            && spawned == 1
+            && asked == index
+            && let Some(slot) = SEEN.get(index as usize)
+        {
+            slot.store(asked, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn spawned_threads_know_their_index() {
+        for s in &SEEN {
+            s.store(u32::MAX, Ordering::SeqCst);
+        }
+        assert_eq!(multi_thread(record, 4, std::ptr::null_mut()), K_STAT_OK);
+        // As many workers as the host has CPUs (up to four asked for), each recording its own index.
+        let n = (cpus() as usize).min(4);
+        for (i, s) in SEEN.iter().enumerate().take(n) {
+            assert_eq!(s.load(Ordering::SeqCst), i as u32, "worker {i}");
+        }
+    }
+}

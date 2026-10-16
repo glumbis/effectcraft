@@ -9,10 +9,12 @@ use std::ffi::{c_char, c_int, c_void};
 use crate::ffi::*;
 use crate::props::{PVal, PropSet, as_double, as_int};
 
-/// Properties this host refuses so the plug-in falls back to its classic behaviour.
-fn refused(name: &str) -> bool {
-    name == PP_COLOUR_MANAGEMENT || name == IE_COLOUR_MANAGEMENT_STYLE
-}
+// A plug-in may set the OFX 1.5 colour-management properties (`OfxImageEffectPropColourManagementStyle`
+// on its descriptor, `OfxParamPropColourManagement` on a parameter) whatever the host supports;
+// answering an error made plug-ins that check every status (the Support library) give up
+// describing themselves. They are stored like any property and nothing reads them: the host does
+// not publish `OfxImageEffectPropColourManagementStyle` or the available configs, so a plug-in that
+// asks the host first falls back to its own colour handling.
 
 fn with_set(h: Handle, name: *const c_char, f: impl FnOnce(&PropSet, &str) -> OfxStatus) -> OfxStatus {
     guard(|| {
@@ -24,7 +26,7 @@ fn with_set(h: Handle, name: *const c_char, f: impl FnOnce(&PropSet, &str) -> Of
 }
 
 fn set_one(h: Handle, name: *const c_char, index: c_int, v: PVal) -> OfxStatus {
-    with_set(h, name, |ps, n| if refused(n) { K_STAT_ERR_UNSUPPORTED } else { ps.set_at(n, index, v) })
+    with_set(h, name, |ps, n| ps.set_at(n, index, v))
 }
 
 extern "C" fn prop_set_pointer(h: Handle, name: *const c_char, index: c_int, v: *mut c_void) -> OfxStatus {
@@ -47,9 +49,6 @@ fn set_many(h: Handle, name: *const c_char, count: c_int, mut get: impl FnMut(us
         return K_STAT_ERR_BAD_INDEX;
     }
     with_set(h, name, |ps, n| {
-        if refused(n) {
-            return K_STAT_ERR_UNSUPPORTED;
-        }
         ps.put(n, (0..count as usize).map(&mut get).collect());
         K_STAT_OK
     })
@@ -204,3 +203,23 @@ pub static SUITE: OfxPropertySuiteV1 = OfxPropertySuiteV1 {
     prop_reset,
     prop_get_dimension,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::props::PropSet;
+
+    /// A plug-in that sets the OFX 1.5 colour-management properties is not told it failed (the
+    /// Support library would give up describing it); the values are stored and nothing reads them.
+    #[test]
+    fn colour_management_properties_are_accepted() {
+        let ps = PropSet::new();
+        let h = ps.as_handle();
+        let set = |name: &std::ffi::CStr, value: &std::ffi::CStr| prop_set_string(h, name.as_ptr(), 0, value.as_ptr());
+        assert_eq!(set(c"OfxImageEffectPropColourManagementStyle", c"OfxImageEffectColourManagementNone"), K_STAT_OK);
+        assert_eq!(set(c"OfxParamPropColourManagement", c"OfxParamColourManagementNone"), K_STAT_OK);
+        let many = [c"a".as_ptr(), c"b".as_ptr()];
+        assert_eq!(prop_set_string_n(h, c"OfxImageEffectPropColourManagementStyle".as_ptr(), 2, many.as_ptr()), K_STAT_OK);
+        assert_eq!(ps.strs("OfxImageEffectPropColourManagementStyle"), ["a", "b"]);
+    }
+}

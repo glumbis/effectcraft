@@ -23,17 +23,19 @@ use crate::props::PropSet;
 use crate::suites::host_ptr;
 use crate::{LoadReport, LoadedEffect};
 
-/// The directory inside a bundle's `Contents` that holds this platform's binary.
+/// The directories inside a bundle's `Contents` that may hold this platform's binary, best first.
 #[cfg(all(windows, target_arch = "x86_64"))]
-const PLATFORM_DIR: &str = "Win64";
+const PLATFORM_DIRS: &[&str] = &["Win64"];
 #[cfg(all(windows, not(target_arch = "x86_64")))]
-const PLATFORM_DIR: &str = "Win32";
+const PLATFORM_DIRS: &[&str] = &["Win32"];
 #[cfg(target_os = "macos")]
-const PLATFORM_DIR: &str = "MacOS";
+const PLATFORM_DIRS: &[&str] = &["MacOS"];
 #[cfg(all(not(windows), not(target_os = "macos"), target_arch = "x86_64"))]
-const PLATFORM_DIR: &str = "Linux-x86-64";
+const PLATFORM_DIRS: &[&str] = &["Linux-x86-64"];
+// The OFX packaging reference only names Linux arm64 informally (`Linux-$(uname -m)`, i.e.
+// `Linux-aarch64`); bundles are also seen with `Linux-arm-64`. Both are tried.
 #[cfg(all(not(windows), not(target_os = "macos"), not(target_arch = "x86_64")))]
-const PLATFORM_DIR: &str = "Linux-aarch64";
+const PLATFORM_DIRS: &[&str] = &["Linux-aarch64", "Linux-arm-64"];
 
 const MAX_DEPTH: usize = 8;
 
@@ -106,14 +108,22 @@ fn is_ofx_file(p: &Path) -> bool {
 
 /// The binary inside a bundle.
 fn bundle_binary(bundle: &Path) -> Option<PathBuf> {
+    bundle_binary_in(bundle, PLATFORM_DIRS)
+}
+
+/// The binary inside a bundle: `<stem>.ofx` in the first of `dirs` (under `Contents`) that has
+/// one, else any `.ofx` file in the first that has one.
+fn bundle_binary_in(bundle: &Path, dirs: &[&str]) -> Option<PathBuf> {
     let name = bundle.file_name()?.to_str()?;
     let stem = name.get(..name.len().checked_sub(".ofx.bundle".len())?)?;
-    let dir = bundle.join("Contents").join(PLATFORM_DIR);
-    let exact = dir.join(format!("{stem}.ofx"));
-    if exact.is_file() {
-        return Some(exact);
-    }
-    std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.is_file() && is_ofx_file(p))
+    dirs.iter().find_map(|d| {
+        let dir = bundle.join("Contents").join(d);
+        let exact = dir.join(format!("{stem}.ofx"));
+        if exact.is_file() {
+            return Some(exact);
+        }
+        std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.is_file() && is_ofx_file(p))
+    })
 }
 
 /// The `.ofx.bundle` folder a bare binary belongs to: `X.ofx.bundle/Contents/<platform>/X.ofx`.
@@ -138,7 +148,7 @@ fn find_binaries(path: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>, er
     if is_bundle(path) {
         match bundle_binary(path) {
             Some(b) => out.push((b, path.to_string_lossy().into_owned())),
-            None => errors.push(format!("{}: no {PLATFORM_DIR} binary in this bundle", path.display())),
+            None => errors.push(format!("{}: no {} binary in this bundle", path.display(), PLATFORM_DIRS.join(" or "))),
         }
         return;
     }
@@ -571,6 +581,32 @@ fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bundle_binary_is_found_in_any_of_the_platform_directories() {
+        let root = std::env::temp_dir().join(format!("effectcraft-ofx-bundle-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("Foo.ofx.bundle");
+        let touch = |dir: &str, file: &str| {
+            let d = bundle.join("Contents").join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(file), b"x").unwrap();
+            d.join(file)
+        };
+        let arm = ["Linux-aarch64", "Linux-arm-64"];
+        assert_eq!(bundle_binary_in(&bundle, &arm), None);
+        // The informal name and the one some vendors ship are both accepted.
+        let alt = touch("Linux-arm-64", "Foo.ofx");
+        assert_eq!(bundle_binary_in(&bundle, &arm), Some(alt));
+        // The first directory wins when both exist; an exact name beats any other binary.
+        let first = touch("Linux-aarch64", "Other.ofx");
+        assert_eq!(bundle_binary_in(&bundle, &arm), Some(first));
+        let exact = touch("Linux-aarch64", "Foo.ofx");
+        assert_eq!(bundle_binary_in(&bundle, &arm), Some(exact));
+        // Another platform's directory is not this platform's binary.
+        assert_eq!(bundle_binary_in(&bundle, &["Win64"]), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn bundle_of_finds_the_bundle_folder_of_a_bundled_binary() {

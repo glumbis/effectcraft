@@ -659,7 +659,8 @@ impl Instance {
         obj.props.put_double(IE_PROJECT_PAR, 1.0);
         obj.props.put_double(IE_EFFECT_DURATION, UNKNOWN_DURATION);
         obj.props.put_int(IE_SEQUENTIAL_RENDER, 0);
-        obj.props.put_str(IE_OPENGL_ENABLED, "false");
+        // An int (bool) property: this host never renders with OpenGL.
+        obj.props.put_int(IE_OPENGL_ENABLED, 0);
         let comps: HashMap<String, Comps> = cfg.clips.iter().map(|c| (c.name.clone(), c.comps)).collect();
         obj.each_clip(|c| {
             let comp = comps.get(&c.name).copied().unwrap_or(Comps::Rgba);
@@ -924,6 +925,21 @@ mod tests {
         // Labels and the grouping are readable (empty) before the plug-in sets them.
         assert_eq!(d.props.str(P_LABEL).as_deref(), Some(""));
         assert_eq!(d.props.str(IE_GROUPING).as_deref(), Some(""));
+    }
+
+    unsafe extern "C" fn nop_entry(_action: *const std::ffi::c_char, _handle: *const c_void, _in: Handle, _out: Handle) -> OfxStatus {
+        K_STAT_REPLY_DEFAULT
+    }
+
+    /// `OfxImageEffectPropOpenGLEnabled` is an int (bool) property: a plug-in that reads it with
+    /// `propGetInt` gets 0, not a conversion error.
+    #[test]
+    fn instances_say_opengl_is_not_enabled_as_an_int() {
+        let desc = EffectObj::new_descriptor();
+        let entry = Arc::new(PluginEntry { main: nop_entry, ofx_id: "test".into(), lock: Arc::new(Mutex::new(())), diag: PluginDiag::new() });
+        let cfg = Arc::new(EffectCfg { context: CTX_FILTER.into(), clips: vec![], depth: Depth::Float, safety: Safety::InstanceSafe, slave_params: vec![] });
+        let inst = Instance::build(entry, cfg, &desc);
+        assert!(matches!(inst.obj.props.all(IE_OPENGL_ENABLED).as_slice(), [PVal::Int(0)]));
     }
 
     #[test]

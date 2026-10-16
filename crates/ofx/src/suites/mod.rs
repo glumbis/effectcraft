@@ -55,6 +55,7 @@ fn build_host_props() -> PropSet {
     p.put_int(IE_SUPPORTS_MULTI_RESOLUTION, 0);
     p.put_int(IE_SUPPORTS_TILES, 0);
     p.put_int(IE_TEMPORAL_CLIP_ACCESS, 1);
+    p.put_int(IE_SEQUENTIAL_RENDER, 0);
     p.put_strs(IE_SUPPORTED_COMPONENTS, &[COMP_RGBA, COMP_RGB, COMP_ALPHA]);
     p.put_strs(IE_SUPPORTED_CONTEXTS, &[CTX_FILTER, CTX_GENERAL, CTX_TRANSITION, CTX_GENERATOR]);
     p.put_strs(IE_SUPPORTED_PIXEL_DEPTHS, &[DEPTH_FLOAT, DEPTH_SHORT, DEPTH_BYTE]);
@@ -64,6 +65,17 @@ fn build_host_props() -> PropSet {
     p.put_int(IE_SETABLE_FIELDING, 0);
     p.put_str(IE_NATIVE_ORIGIN, IE_NATIVE_ORIGIN_BOTTOM_LEFT);
     p.put_str(IE_OPENGL_RENDER_SUPPORTED, "false");
+    // The other GPU APIs are not offered either (plug-ins read these without a fallback).
+    for name in [IE_CUDA_RENDER_SUPPORTED, IE_CUDA_STREAM_SUPPORTED, IE_METAL_RENDER_SUPPORTED, IE_OPENCL_RENDER_SUPPORTED, IE_OPENCL_SUPPORTED] {
+        p.put_str(name, "false");
+    }
+    // OFX 1.5: this host renders on the CPU (`kOfxImageEffectPropCPURenderSupported`).
+    p.put_str(IE_CPU_RENDER_SUPPORTED, "true");
+    p.put_int(IE_RENDER_QUALITY_DRAFT, 0);
+    // The operating system's handle of the main window: not available to this crate, so a null
+    // pointer (the property exists, as in a host without a window).
+    p.put_ptr(P_HOST_OS_HANDLE, 0);
+    p.put_int(PH_SUPPORTS_PARAMETRIC_ANIMATION, 0);
     p.put_int(PH_SUPPORTS_CUSTOM_ANIMATION, 0);
     p.put_int(PH_SUPPORTS_STRING_ANIMATION, 0);
     p.put_int(PH_SUPPORTS_BOOLEAN_ANIMATION, 1);
@@ -113,4 +125,36 @@ extern "C" fn fetch_suite(_host: Handle, name: *const c_char, version: c_int) ->
         }
     })
     .unwrap_or(std::ptr::null())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Everything the OFX C++ Support library and other wrappers read of the host without a
+    /// fallback is there, with the types the headers give it (an `OfxStatErrUnknown` for one of
+    /// these is a missing host feature to a plug-in that checks).
+    #[test]
+    fn the_host_describes_its_gpu_and_misc_capabilities() {
+        let p = build_host_props();
+        assert_eq!(p.kind(), crate::diag::PropKind::Host);
+        for name in [
+            IE_OPENGL_RENDER_SUPPORTED,
+            IE_CUDA_RENDER_SUPPORTED,
+            IE_CUDA_STREAM_SUPPORTED,
+            IE_METAL_RENDER_SUPPORTED,
+            IE_OPENCL_RENDER_SUPPORTED,
+            IE_OPENCL_SUPPORTED,
+        ] {
+            assert_eq!(p.str(name).as_deref(), Some("false"), "{name}");
+        }
+        assert_eq!(p.str(IE_CPU_RENDER_SUPPORTED).as_deref(), Some("true"));
+        assert_eq!(p.int(IE_RENDER_QUALITY_DRAFT), Some(0));
+        assert_eq!(p.int(IE_SEQUENTIAL_RENDER), Some(0));
+        assert_eq!(p.int(PH_SUPPORTS_PARAMETRIC_ANIMATION), Some(0));
+        // The window handle is a pointer property, null here.
+        assert_eq!(p.ptr(P_HOST_OS_HANDLE), Some(0));
+        // Colour management is not offered: a plug-in that asks the host first keeps its own.
+        assert!(!p.has(IE_COLOUR_MANAGEMENT_STYLE));
+    }
 }
