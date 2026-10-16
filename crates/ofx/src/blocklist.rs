@@ -61,6 +61,8 @@ pub(crate) fn state_dir() -> Option<PathBuf> {
 /// Empty the blocklist (and forget leftover markers of dead processes): every binary is tried
 /// again.
 pub fn clear() {
+    // Plug-ins skipped for crashing while rendering come back too.
+    crate::inflight::clear_strikes();
     let Some(dir) = state_dir() else { return };
     clear_in(&dir);
     // A marker left by a previous run must not be blocklisted by the next load either.

@@ -2,17 +2,16 @@
 //!
 //! Registering effects is permanent for a process, so every start-up in these scenarios is a
 //! process of its own: this test binary runs itself with the `child_start` test selected and the
-//! `EC_SCAN_CACHE_*` variables naming a config folder (the state folder: scan cache, settings) and a
-//! folder with a copy of the test bundle. The child scans, optionally renders one effect, and prints
+//! `EC_FIXTURE_*` variables naming a config folder (the state folder: scan cache, settings) and a
+//! folder with a copy of the test bundle (`common::Fixture`). The child scans, optionally renders one effect, and prints
 //! a `RESULT {json}` line the scenario reads. Set `EC_TEST_OFX_BUNDLE` to the built
 //! `ec-test-ofx.ofx.bundle`; without it the scenarios return.
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
-use common::{defaults, test_binary};
+use common::{Fixture, defaults};
 use effectcraft_effects::plugin::{PluginFrame, PluginParams, plugin};
 use effectcraft_ofx::{library_loads, load_path_with};
 use serde_json::{Value, json};
@@ -24,8 +23,8 @@ const EFFECTS: usize = 13;
 /// does nothing here.
 #[test]
 fn child_start() {
-    let Some(cfg) = std::env::var_os("EC_SCAN_CACHE_CFG") else { return };
-    let plugins = PathBuf::from(std::env::var_os("EC_SCAN_CACHE_PLUGINS").expect("EC_SCAN_CACHE_PLUGINS"));
+    let Some(cfg) = std::env::var_os("EC_FIXTURE_CFG") else { return };
+    let plugins = PathBuf::from(std::env::var_os("EC_FIXTURE_PLUGINS").expect("EC_FIXTURE_PLUGINS"));
     effectcraft_ofx::set_state_dir(PathBuf::from(cfg));
     let use_cache = std::env::var_os("EC_SCAN_CACHE_EXPLICIT").is_none();
     let report = load_path_with(&plugins, use_cache);
@@ -59,63 +58,6 @@ fn child_start() {
     println!("RESULT {result}");
 }
 
-/// A config folder and a plug-in folder holding a copy of the test bundle's binary.
-struct Fixture {
-    root: PathBuf,
-    cfg: PathBuf,
-    plugins: PathBuf,
-    bin: PathBuf,
-}
-
-impl Fixture {
-    fn new(name: &str) -> Option<Fixture> {
-        let Some(src) = test_binary() else {
-            println!("note: EC_TEST_OFX_BUNDLE is not set; skipping the scan cache tests");
-            return None;
-        };
-        let root = std::env::temp_dir().join(format!("effectcraft-ofx-scan-cache-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let platform = src.parent().and_then(Path::file_name).map(|n| n.to_owned()).unwrap_or_default();
-        let dir = root.join("plugins").join("cachetest.ofx.bundle").join("Contents").join(&platform);
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("cachetest.ofx");
-        std::fs::copy(&src, &bin).unwrap();
-        Some(Fixture { cfg: root.join("config"), plugins: root.join("plugins"), root, bin })
-    }
-
-    /// One start-up in a process of its own; `env` adds variables to it.
-    fn start(&self, env: &[(&str, &str)]) -> Value {
-        let out = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child_start", "--nocapture", "--test-threads=1"])
-            .env("EC_SCAN_CACHE_CFG", &self.cfg)
-            .env("EC_SCAN_CACHE_PLUGINS", &self.plugins)
-            .env_remove("EFFECTCRAFT_OFX_HOST_NAME")
-            .env_remove("EC_TEST_OFX_MODE")
-            .envs(env.iter().copied())
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success(), "the child failed ({}):\n{stdout}\n{}", out.status, String::from_utf8_lossy(&out.stderr));
-        let line = stdout.lines().find_map(|l| l.split_once("RESULT ").map(|(_, json)| json)).unwrap_or_else(|| panic!("no RESULT line in:\n{stdout}"));
-        serde_json::from_str(line).unwrap()
-    }
-
-    fn cache_text(&self) -> String {
-        std::fs::read_to_string(self.cfg.join("ofx_cache.json")).unwrap_or_default()
-    }
-
-    fn touch(&self) {
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
-        std::fs::File::options().write(true).open(&self.bin).unwrap().set_modified(later).unwrap();
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
 fn n(v: &Value, k: &str) -> u64 {
     v[k].as_u64().unwrap_or_else(|| panic!("{k} in {v}"))
 }
@@ -131,7 +73,7 @@ const INVERT: &str = "org.effectcraft.test.invert";
 #[test]
 fn a_warm_start_registers_from_the_cache_without_loading_any_library() {
     let Some(f) = Fixture::new("warm") else { return };
-    let cold = f.start(&[("EC_SCAN_CACHE_RENDER", INVERT)]);
+    let cold = f.start("child_start", &[("EC_SCAN_CACHE_RENDER", INVERT)]);
     assert!(cold["errors"].as_array().is_some_and(Vec::is_empty), "{cold}");
     assert_eq!((n(&cold, "loaded") as usize, n(&cold, "hits"), n(&cold, "scanned")), (EFFECTS, 0, 1), "{cold}");
     assert_eq!(n(&cold, "loads_after_scan"), 1, "a cold start loads the one binary");
@@ -143,7 +85,7 @@ fn a_warm_start_registers_from_the_cache_without_loading_any_library() {
         &text[..text.len().min(300)]
     );
 
-    let warm = f.start(&[("EC_SCAN_CACHE_RENDER", INVERT)]);
+    let warm = f.start("child_start", &[("EC_SCAN_CACHE_RENDER", INVERT)]);
     assert!(warm["errors"].as_array().is_some_and(Vec::is_empty), "{warm}");
     // The same effects, without a library load: one binary came from the cache.
     assert_eq!((n(&warm, "loaded") as usize, n(&warm, "hits"), n(&warm, "scanned")), (EFFECTS, 1, 0), "{warm}");
@@ -158,9 +100,9 @@ fn a_warm_start_registers_from_the_cache_without_loading_any_library() {
         assert!((got - want).abs() < 1e-4, "{px:?}");
     }
     // A cached start that uses nothing never loads anything, and an explicit load ignores the cache.
-    let idle = f.start(&[]);
+    let idle = f.start("child_start", &[]);
     assert_eq!((n(&idle, "hits"), n(&idle, "loads_after_render")), (1, 0), "{idle}");
-    let explicit = f.start(&[("EC_SCAN_CACHE_EXPLICIT", "1")]);
+    let explicit = f.start("child_start", &[("EC_SCAN_CACHE_EXPLICIT", "1")]);
     assert_eq!((n(&explicit, "hits"), n(&explicit, "scanned"), n(&explicit, "loads_after_scan")), (0, 1, 1), "{explicit}");
     assert!(lines(&explicit, "lines").contains("explicit load"), "{explicit}");
 }
@@ -170,50 +112,50 @@ fn a_warm_start_registers_from_the_cache_without_loading_any_library() {
 #[test]
 fn a_changed_binary_host_name_or_cache_file_is_scanned_again() {
     let Some(f) = Fixture::new("invalidate") else { return };
-    let _ = f.start(&[]);
-    assert_eq!(n(&f.start(&[]), "hits"), 1);
+    let _ = f.start("child_start", &[]);
+    assert_eq!(n(&f.start("child_start", &[]), "hits"), 1);
 
     // The binary was replaced (same size, new modification time).
     f.touch();
-    let v = f.start(&[]);
+    let v = f.start("child_start", &[]);
     assert_eq!((n(&v, "hits"), n(&v, "scanned"), n(&v, "loaded") as usize), (0, 1, EFFECTS), "{v}");
     assert!(lines(&v, "lines").contains("modification time"), "{v}");
-    assert_eq!(n(&f.start(&[]), "hits"), 1, "the rescan refreshed the entry");
+    assert_eq!(n(&f.start("child_start", &[]), "hits"), 1, "the rescan refreshed the entry");
 
     // Another host name: plug-ins describe themselves differently to different hosts.
-    let v = f.start(&[("EFFECTCRAFT_OFX_HOST_NAME", "SomeHost")]);
+    let v = f.start("child_start", &[("EFFECTCRAFT_OFX_HOST_NAME", "SomeHost")]);
     assert_eq!((n(&v, "hits"), n(&v, "scanned")), (0, 1), "{v}");
     assert!(lines(&v, "problems").contains("host name") && lines(&v, "problems").contains("SomeHost"), "{v}");
     // ... and back: the file now says SomeHost.
-    let v = f.start(&[]);
+    let v = f.start("child_start", &[]);
     assert_eq!((n(&v, "hits"), n(&v, "scanned")), (0, 1), "{v}");
     assert!(lines(&v, "problems").contains("written for the host name \"SomeHost\""), "{v}");
-    assert_eq!(n(&f.start(&[]), "hits"), 1);
+    assert_eq!(n(&f.start("child_start", &[]), "hits"), 1);
 
     // A corrupt file is reported, ignored and rebuilt.
     std::fs::write(f.cfg.join("ofx_cache.json"), b"{\"format\": 1, \"binaries\": [not json").unwrap();
-    let v = f.start(&[]);
+    let v = f.start("child_start", &[]);
     assert_eq!((n(&v, "hits"), n(&v, "scanned"), n(&v, "loaded") as usize), (0, 1, EFFECTS), "{v}");
     assert!(lines(&v, "problems").contains("not valid JSON"), "{v}");
     assert!(v["errors"].as_array().is_some_and(Vec::is_empty), "{v}");
-    assert_eq!(n(&f.start(&[]), "hits"), 1, "the file was rebuilt");
+    assert_eq!(n(&f.start("child_start", &[]), "hits"), 1, "the file was rebuilt");
     // An empty file and a file full of garbage bytes too.
     for junk in [&b""[..], &[0xff, 0xfe, 0x00, 0x01][..]] {
         std::fs::write(f.cfg.join("ofx_cache.json"), junk).unwrap();
-        let v = f.start(&[]);
+        let v = f.start("child_start", &[]);
         assert_eq!((n(&v, "hits"), n(&v, "loaded") as usize), (0, EFFECTS), "{v}");
-        assert_eq!(n(&f.start(&[]), "hits"), 1);
+        assert_eq!(n(&f.start("child_start", &[]), "hits"), 1);
     }
 
     // "scan_cache": false turns it off: everything is loaded, and the file is left alone.
     let before = f.cache_text();
     std::fs::write(f.cfg.join("ofx_settings.json"), b"{\"scan_cache\": false}").unwrap();
-    let v = f.start(&[]);
+    let v = f.start("child_start", &[]);
     assert_eq!((v["enabled"].clone(), n(&v, "hits"), n(&v, "loads_after_scan")), (json!(false), 0, 1), "{v}");
     assert_eq!(n(&v, "loaded") as usize, EFFECTS);
     assert_eq!(f.cache_text(), before);
     std::fs::write(f.cfg.join("ofx_settings.json"), b"{\"scan_cache\": true}").unwrap();
-    assert_eq!(n(&f.start(&[]), "hits"), 1);
+    assert_eq!(n(&f.start("child_start", &[]), "hits"), 1);
 }
 
 /// A cached plug-in that cannot be loaded when it is first used, or no longer describes itself as
@@ -222,7 +164,7 @@ fn a_changed_binary_host_name_or_cache_file_is_scanned_again() {
 #[test]
 fn a_lazy_load_that_fails_is_a_render_error_and_marks_the_entry_stale() {
     let Some(f) = Fixture::new("stale") else { return };
-    let _ = f.start(&[]);
+    let _ = f.start("child_start", &[]);
     for (mode, needle) in [
         // Describe fails now (a licence that ran out, a missing runtime).
         ("describe-fails", "Describe failed"),
@@ -233,7 +175,7 @@ fn a_lazy_load_that_fails_is_a_render_error_and_marks_the_entry_stale() {
         // The library no longer lists plug-ins.
         ("no-plugins", "exports no OpenFX plug-ins"),
     ] {
-        let v = f.start(&[("EC_TEST_OFX_MODE", mode), ("EC_SCAN_CACHE_RENDER", INVERT)]);
+        let v = f.start("child_start", &[("EC_TEST_OFX_MODE", mode), ("EC_SCAN_CACHE_RENDER", INVERT)]);
         // Registered from the cache without loading (the plug-in's mode is not even looked at) ...
         assert_eq!((n(&v, "hits"), n(&v, "loads_after_scan"), n(&v, "loaded") as usize), (1, 0, EFFECTS), "{mode}: {v}");
         // ... and the render fails with a reason.
@@ -242,7 +184,7 @@ fn a_lazy_load_that_fails_is_a_render_error_and_marks_the_entry_stale() {
         assert!(e.contains("could not be loaded") && e.contains(needle), "{mode}: {e}");
         assert!(f.cache_text().contains("\"stale\""), "{mode}: the entry should be marked out of date");
         // The next start scans the binary again (and says why); the plug-in works again.
-        let v = f.start(&[("EC_SCAN_CACHE_RENDER", INVERT)]);
+        let v = f.start("child_start", &[("EC_SCAN_CACHE_RENDER", INVERT)]);
         assert_eq!((n(&v, "hits"), n(&v, "scanned")), (0, 1), "{mode}: {v}");
         assert!(lines(&v, "lines").contains("marked out of date"), "{mode}: {v}");
         assert_eq!(v["render"]["ok"], true, "{mode}: {v}");

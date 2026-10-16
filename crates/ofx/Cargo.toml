@@ -27,6 +27,16 @@ effectcraft-keyframe = { workspace = true }
 effectcraft-project = { workspace = true }
 serde_json = { workspace = true }
 
-# Stopping helper programs plug-ins leave behind (`shutdown`).
+# Stopping helper programs plug-ins leave behind (`shutdown`), and the crash filter that records
+# which plug-in action a crash happened in (`inflight`).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }

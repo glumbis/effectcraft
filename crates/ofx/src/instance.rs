@@ -116,6 +116,25 @@ pub struct PluginEntry {
     /// What the host learned about the plug-in: its messages and the requests it made that this
     /// host could not meet (see [`crate::diag`]).
     pub diag: Arc<PluginDiag>,
+    /// [`crate::inflight::binary_stamp`] of the plug-in's binary: which file version the crash
+    /// record is about.
+    pub stamp: u64,
+    /// Set once a render of the plug-in has completed (a session that did this without crashing
+    /// clears the plug-in's crash strikes).
+    pub rendered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PluginEntry {
+    pub fn new(main: EntryPoint, ofx_id: String, lock: Arc<Mutex<()>>, diag: Arc<PluginDiag>, stamp: u64) -> PluginEntry {
+        PluginEntry { main, ofx_id, lock, diag, stamp, rendered: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+    }
+}
+
+/// Whether an action is recorded in the in-flight record ([`crate::inflight`]): everything except
+/// the load sequence, which the load blocklist covers, and `Unload`, whose crash at quit is not
+/// blamed on the plug-in.
+fn is_recorded(action: &str) -> bool {
+    !matches!(action, ACT_LOAD | ACT_DESCRIBE | ACT_DESCRIBE_IN_CONTEXT | ACT_UNLOAD)
 }
 
 impl PluginEntry {
@@ -149,16 +168,25 @@ impl PluginEntry {
         // Raw pointers aren't Send; they cross to the render thread as addresses.
         let (h, i, o) = (handle as usize, i as usize, o as usize);
         let ctx = CallCtx { diag: self.diag.clone(), plugin: self.ofx_id.as_str().into(), action: action.into() };
+        let (record, stamp, is_render, rendered) = (is_recorded(action), self.stamp, action == ACT_RENDER, self.rendered.clone());
         // `move`: the call may run on a pooled worker thread, which outlives this frame.
         let run = move || {
             // The suites attribute messages and unmet requests to this plug-in and action (set on
             // the thread the plug-in code runs on, which may not be this one).
             let _scope = ctx.enter();
+            // If the process dies in here, the next start knows which plug-in and action it was
+            // (a write to a file that is already open: microseconds).
+            let _flight = record.then(|| crate::inflight::begin(&ctx.plugin, &ctx.action, stamp));
             // SAFETY: `main` is the plug-in's entry point, called with the argument shapes the
             // specification fixes; the handles are alive for the duration of the call (the
             // caller waits for it, also when it runs on another thread).
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { main(a.as_ptr(), h as *const c_void, i as *mut c_void, o as *mut c_void) }))
-                .unwrap_or(K_STAT_ERR_FATAL)
+            let status =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { main(a.as_ptr(), h as *const c_void, i as *mut c_void, o as *mut c_void) }))
+                    .unwrap_or(K_STAT_ERR_FATAL);
+            if is_render {
+                rendered.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            status
         };
         // Plug-ins are built for the stacks their platforms give threads (glibc: 8 MiB, macOS: 8 MiB
         // on the main thread and 512 KiB elsewhere, but their own code assumes plenty), and renders
@@ -1015,7 +1043,7 @@ mod tests {
     #[test]
     fn instances_say_opengl_is_not_enabled_as_an_int() {
         let desc = EffectObj::new_descriptor();
-        let entry = Arc::new(PluginEntry { main: nop_entry, ofx_id: "test".into(), lock: Arc::new(Mutex::new(())), diag: PluginDiag::new() });
+        let entry = Arc::new(PluginEntry::new(nop_entry, "test".into(), Arc::new(Mutex::new(())), PluginDiag::new(), 0));
         let cfg = Arc::new(EffectCfg {
             context: CTX_FILTER.into(),
             clips: vec![],

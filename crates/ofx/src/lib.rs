@@ -31,6 +31,7 @@ pub mod clips;
 pub mod diag;
 pub mod effect;
 pub mod ffi;
+pub mod inflight;
 pub mod instance;
 pub mod loader;
 pub mod params;
@@ -48,9 +49,12 @@ pub use settings::host_name_command;
 /// start-up scan and the commands agree on it. Until this is called the blocklist is disabled and
 /// the host name is the default or the environment variable's.
 pub fn set_state_dir(dir: PathBuf) {
-    blocklist::set_state_dir(dir);
+    blocklist::set_state_dir(dir.clone());
     cache::reset();
     let _ = settings::identity();
+    // What a previous session left behind (a plug-in that crashed while rendering), and the record
+    // of this one.
+    inflight::set_dir(dir);
 }
 
 /// One OFX plug-in that was registered as an effect.
@@ -90,7 +94,7 @@ pub struct LoadReport {
 
 /// Engine hook: [`load_path_with`] as `{"loaded": [{id, name, category, ofxId, context, bundle}],
 /// "errors": [...], "notes": [...], "transcript": [...], "cache": {enabled, file, hits, scanned,
-/// lines, problems}}`. `use_cache`: binaries that did not change register from the scan cache
+/// lines, problems}, "crashes": [...]}` (`crashes`: the plug-ins that crashed the previous session). `use_cache`: binaries that did not change register from the scan cache
 /// without being loaded (the start-up scan); `false` loads everything (an explicit load). Always
 /// `Ok`: a path with nothing to load is an empty `loaded` and `errors` that say why (the engine
 /// turns that into an error for a single `loadOfx`, and a scan wants the notes and the transcript
@@ -102,7 +106,14 @@ pub fn loader(path: &str, use_cache: bool) -> Result<serde_json::Value, String> 
         .iter()
         .map(|e| serde_json::json!({"id": e.id, "name": e.name, "category": e.category, "ofxId": e.ofx_id, "context": e.context, "bundle": e.bundle}))
         .collect();
-    Ok(serde_json::json!({"loaded": loaded, "errors": report.errors, "notes": report.notes, "transcript": report.transcript, "cache": report.cache}))
+    Ok(serde_json::json!({
+        "loaded": loaded,
+        "errors": report.errors,
+        "notes": report.notes,
+        "transcript": report.transcript,
+        "cache": report.cache,
+        "crashes": inflight::recovered_lines()
+    }))
 }
 
 /// Engine hook behind `effect.plugins.rescanOfx`: delete the scan cache, so that the next start
@@ -126,6 +137,9 @@ const HELPERS: &[&str] = &["preset-browser.exe"];
 /// which would otherwise keep running (and keep a CLI's output pipe open). Only direct child
 /// processes with those names are touched.
 pub fn shutdown() {
+    // Plug-ins that rendered all session without a crash lose their strikes; the in-flight record is
+    // removed (nothing after this is blamed on a plug-in).
+    inflight::close(&effect::rendered_ids());
     #[cfg(windows)]
     win::stop_children(HELPERS);
 }

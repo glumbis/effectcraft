@@ -574,13 +574,14 @@ fn describe_binary(p: Probed, report: &mut LoadReport, cache: &mut cache::Run) {
     let mut records: Vec<PluginRecord> = Vec::new();
     // A binary with a plug-in skipped as a duplicate is not cached: that plug-in was never described.
     let mut cacheable = true;
+    let (mut withheld, crash_stamp) = (0usize, crate::inflight::binary_stamp(&bin));
     for l in &plugins {
         if let Some(why) = &l.skip {
             tr.push(format!("  {} v{}.{}: skipped, {why}", l.id, l.version.0, l.version.1));
             cacheable = false;
             continue;
         }
-        match describe_plugin(l.ptr, &bin, &bundle, lock.clone(), &mut tr) {
+        match describe_plugin(l.ptr, &bin, &bundle, lock.clone(), crash_stamp, &mut tr) {
             Outcome::Registered(reg) => {
                 registered_ids().lock().unwrap_or_else(PoisonError::into_inner).insert(l.id.clone(), l.version);
                 report.notes.extend(reg.notes.iter().map(|n| format!("{label}: {n}")));
@@ -595,10 +596,15 @@ fn describe_binary(p: Probed, report: &mut LoadReport, cache: &mut cache::Run) {
                 report.errors.push(format!("{label}: {error}"));
                 records.push(PluginRecord::Failed { id: l.id.clone(), version: l.version, error });
             }
+            Outcome::Withheld(reg, why) => {
+                report.errors.push(format!("{label}: {}: {why}", l.id));
+                withheld += 1;
+                records.push(PluginRecord::Registered { reg });
+            }
         }
     }
     report.loaded.extend(here.iter().cloned());
-    if cacheable && !here.is_empty() {
+    if cacheable && (!here.is_empty() || withheld > 0) {
         match cache::file_stamp(&bin) {
             Some((size, mtime)) => cache.store(BinaryEntry {
                 path: key.to_string_lossy().into_owned(),
@@ -629,12 +635,18 @@ fn register_cached(c: Cached, report: &mut LoadReport) {
     let mut tr = vec![label.clone(), "  from the scan cache: the library is not loaded until one of its effects is first used".to_string()];
     tr.extend(entry.transcript.iter().cloned());
     let mut here: Vec<LoadedEffect> = Vec::new();
+    let crash_stamp = crate::inflight::binary_stamp(&bin);
     for (rec, skip) in entry.plugins.iter().zip(&skips) {
         if let Some(why) = skip {
             tr.push(format!("  {} v{}.{}: skipped, {why}", rec.id(), rec.version().0, rec.version().1));
             continue;
         }
         match rec {
+            PluginRecord::Registered { reg } if crate::inflight::skip_reason(&reg.ofx_id, crash_stamp).is_some() => {
+                let why = crate::inflight::skip_reason(&reg.ofx_id, crash_stamp).unwrap_or_default();
+                tr.push(format!("  {} v{}.{}: not registered: {why}", reg.ofx_id, reg.version.0, reg.version.1));
+                report.errors.push(format!("{label}: {}: {why}", reg.ofx_id));
+            }
             PluginRecord::Registered { reg } => match OfxEffect::register(OfxEffect::lazy((**reg).clone(), lazy.clone(), source.clone())) {
                 Ok(()) => {
                     registered_ids().lock().unwrap_or_else(PoisonError::into_inner).insert(reg.ofx_id.clone(), reg.version);
@@ -749,6 +761,10 @@ enum Outcome {
     Skipped(String),
     /// Could not be made into an effect: the error says why.
     Failed(String),
+    /// Described, but not registered because it crashed EffectCraft while rendering twice in a row
+    /// (the reason is the error for the report). The cache still keeps the description, so the
+    /// plug-in returns as soon as its strikes are gone.
+    Withheld(Box<Registration>, String),
 }
 
 fn short_context(ctx: &str) -> &'static str {
@@ -861,10 +877,11 @@ enum Step {
 }
 
 /// Load, describe and register one plug-in; its transcript lines go to `tr`.
-fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, tr: &mut Vec<String>) -> Outcome {
+fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<()>>, crash_stamp: u64, tr: &mut Vec<String>) -> Outcome {
     /// The result once the effect is registered (a plug-in loaded here is loaded eagerly: it was just described).
     enum Done {
         Registered(Registration),
+        Withheld(Registration, String),
         Skip(String),
         Fail(String),
     }
@@ -873,10 +890,15 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     let done = match describe_core(ptr, bin, bundle, lock, &diag, &mut block) {
         Step::Registered(d) => {
             let Described { reg, entry, desc } = *d;
-            let effect = OfxEffect::eager(reg.clone(), Live { entry, desc }, bin.to_string_lossy().into_owned());
-            match OfxEffect::register(effect) {
-                Ok(()) => Done::Registered(reg),
-                Err(e) => Done::Fail(e),
+            // Crashed while rendering twice in a row: described (for the cache) but not registered.
+            if let Some(why) = crate::inflight::skip_reason(&reg.ofx_id, crash_stamp) {
+                Done::Withheld(reg, why)
+            } else {
+                let effect = OfxEffect::eager(reg.clone(), Live { entry, desc }, bin.to_string_lossy().into_owned());
+                match OfxEffect::register(effect) {
+                    Ok(()) => Done::Registered(reg),
+                    Err(e) => Done::Fail(e),
+                }
             }
         }
         Step::Skip(note) => Done::Skip(note),
@@ -892,6 +914,11 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
             block.finish(tr, &diag, &outcome, true);
             reg.notes = std::mem::take(&mut reg.notes).into_iter().map(prefixed).collect();
             Outcome::Registered(Box::new(reg))
+        }
+        Done::Withheld(mut reg, why) => {
+            block.finish(tr, &diag, &format!("not registered: {why}"), false);
+            reg.notes = std::mem::take(&mut reg.notes).into_iter().map(prefixed).collect();
+            Outcome::Withheld(Box::new(reg), why)
         }
         Done::Skip(note) => {
             block.finish(tr, &diag, &format!("skipped: {note}"), false);
@@ -932,7 +959,7 @@ fn describe_core(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex<
     if set.is_err() {
         return Step::Fail("setHost panicked".into());
     }
-    let entry = Arc::new(PluginEntry { main, ofx_id: ofx_id.clone(), lock, diag: diag.clone() });
+    let entry = Arc::new(PluginEntry::new(main, ofx_id.clone(), lock, diag.clone(), crate::inflight::binary_stamp(bin)));
     let host = crate::suites::host_name();
 
     let (st, mark) = run_action(&entry, block, "Load", ACT_LOAD, std::ptr::null(), None);

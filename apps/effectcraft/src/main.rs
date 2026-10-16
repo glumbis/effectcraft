@@ -92,6 +92,16 @@ fn ofx_scan_report(search_paths: &[std::path::PathBuf], result: &Result<serde_js
             return t;
         }
     };
+    let crashes = r["crashes"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if !crashes.is_empty() {
+        let _ = writeln!(t, "\nPlug-ins that crashed EffectCraft in the previous session: {}", crashes.len());
+        for c in crashes {
+            let _ = writeln!(t, "  {}", c.as_str().unwrap_or(""));
+        }
+        t.push_str(
+            "  EffectCraft records which plug-in action is running (ofx_inflight.<pid>.bin in the config folder) and reads it at the next start.\n  A plug-in is skipped after 2 crashes in a row; ofx_render_crashes.txt in the config folder lists the strikes.\n",
+        );
+    }
     ofx_scan_cache_section(&mut t, &r["cache"]);
     let loaded = r["loaded"].as_array().map(Vec::as_slice).unwrap_or_default();
     let _ = writeln!(t, "\nEffects registered: {}", loaded.len());
@@ -173,6 +183,13 @@ fn ofx_scan_toast(result: &Result<serde_json::Value, String>, report: &std::path
         Ok(r) => r,
         Err(e) => return Some(format!("OpenFX plug-ins could not be scanned: {e}")),
     };
+    // A plug-in that crashed the last session comes first: it is what the user most needs to know.
+    let crashes = r["crashes"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if let Some(first) = crashes.first() {
+        let who = first.as_str().and_then(|s| s.split_once(": ")).map_or("an OpenFX plug-in", |(id, _)| id);
+        let more = if crashes.len() > 1 { format!(" and {} more", crashes.len() - 1) } else { String::new() };
+        return Some(format!("{who}{more} crashed EffectCraft last time. Details: {}", report.display()));
+    }
     let loaded = r["loaded"].as_array().map_or(0, Vec::len);
     let errors = r["errors"].as_array().map_or(0, Vec::len);
     let notes = r["notes"].as_array().map_or(0, Vec::len);
@@ -715,6 +732,33 @@ mod tests {
         // An older result without the member says nothing about the cache.
         let none = Ok(json!({"loaded": [], "errors": []}));
         assert!(!super::ofx_scan_report(&[], &none, &host).contains("Scan cache"));
+    }
+
+    /// A plug-in that crashed the last session is named in the report and the toast, even when
+    /// everything loaded.
+    #[test]
+    fn ofx_scan_report_and_toast_name_the_plugins_that_crashed() {
+        use serde_json::json;
+        use std::path::Path;
+        let host = Ok(
+            json!({"name": "EffectCraft", "source": "default", "settingsFile": "C:/cfg/ofx_settings.json", "configured": null, "problem": null, "restartRequired": false}),
+        );
+        let one = Ok(json!({
+            "loaded": [{"name": "Blur", "category": "X", "id": "org.x.blur", "bundle": "x.ofx.bundle"}],
+            "errors": [],
+            "crashes": ["org.x.Blur: EffectCraft stopped while this plug-in was running OfxImageEffectActionRender (started 2026-10-16 19:03:11 UTC, thread 3); strike 1 of 2"]
+        }));
+        let t = super::ofx_scan_report(&[], &one, &host);
+        assert!(t.contains("crashed EffectCraft in the previous session: 1") && t.contains("  org.x.Blur: EffectCraft stopped while"), "{t}");
+        assert!(t.contains("ofx_render_crashes.txt"), "{t}");
+        let toast = super::ofx_scan_toast(&one, Path::new("r.txt")).unwrap();
+        assert!(toast.starts_with("org.x.Blur crashed EffectCraft last time") && toast.contains("r.txt"), "{toast}");
+        let two = Ok(json!({"loaded": [], "errors": [], "crashes": ["a: x", "b: y"]}));
+        assert!(super::ofx_scan_toast(&two, Path::new("r.txt")).is_some_and(|m| m.starts_with("a and 1 more crashed EffectCraft last time")));
+        // No crashes, nothing wrong: no toast and no section.
+        let none = Ok(json!({"loaded": [{"name": "Blur", "category": "X", "id": "a", "bundle": "b"}], "errors": [], "crashes": []}));
+        assert_eq!(super::ofx_scan_toast(&none, Path::new("r.txt")), None);
+        assert!(!super::ofx_scan_report(&[], &none, &host).contains("previous session"));
     }
 
     /// The window's wgpu instance skips indirect-call validation (Intel Metal, #1153).

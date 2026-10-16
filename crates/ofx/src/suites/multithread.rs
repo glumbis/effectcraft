@@ -34,9 +34,12 @@ extern "C" fn multi_thread(func: ThreadFn, n_threads: u32, arg: *mut c_void) -> 
         // The workers belong to the action that called us (messages and unmet requests they
         // make are attributed to the plug-in).
         let ctx = crate::diag::current();
+        // A crash on a worker is the crash of the action that started it (see `inflight`).
+        let slot = crate::inflight::current_slot();
         let run = |index: u32| {
             let a = &arg;
             let _scope = ctx.as_ref().map(crate::diag::CallCtx::enter);
+            let _slot = crate::inflight::adopt_slot(slot);
             SPAWNED.with(|s| s.set(Some(index)));
             // The plug-in's code must not unwind into Rust; a panic here would be a bug in it.
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

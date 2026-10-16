@@ -62,6 +62,18 @@ fn measure_geometry(scale: f64, layer_size: [f64; 2]) -> Geometry {
     }
 }
 
+/// Every effect registered by this crate in this process.
+fn effects() -> &'static Mutex<Vec<std::sync::Weak<OfxEffect>>> {
+    static E: OnceLock<Mutex<Vec<std::sync::Weak<OfxEffect>>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The OFX identifiers of the plug-ins that have rendered in this process.
+pub(crate) fn rendered_ids() -> Vec<String> {
+    let all = effects().lock().unwrap_or_else(PoisonError::into_inner);
+    all.iter().filter_map(std::sync::Weak::upgrade).filter(|e| e.has_rendered()).map(|e| e.reg.ofx_id.clone()).collect()
+}
+
 /// A loaded plug-in: its entry point and the described effect that instances copy.
 pub(crate) struct Live {
     pub entry: Arc<PluginEntry>,
@@ -112,9 +124,19 @@ impl OfxEffect {
         OfxEffect::build(reg, source, OnceLock::new(), Some(binary))
     }
 
-    /// Register the effect with the effect registry.
+    /// Register the effect with the effect registry (and remember it, for [`rendered_ids`]).
     pub(crate) fn register(effect: OfxEffect) -> Result<(), String> {
-        register_plugin(Arc::new(effect)).map(|_| ())
+        let effect = Arc::new(effect);
+        register_plugin(effect.clone())?;
+        let mut all = effects().lock().unwrap_or_else(PoisonError::into_inner);
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(&effect));
+        Ok(())
+    }
+
+    /// Whether a render of this effect's plug-in has completed in this process.
+    fn has_rendered(&self) -> bool {
+        matches!(self.live.get(), Some(Ok(live)) if live.entry.rendered.load(Ordering::Relaxed))
     }
 
     /// The loaded plug-in, loading it first if it came from the scan cache and has not been used
