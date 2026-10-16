@@ -131,6 +131,7 @@ fn all_effects_register() {
         ("org.effectcraft.test.Border", "filter"),
         ("org.effectcraft.test.Mix", "general"),
         ("org.effectcraft.test.AllParams", "filter"),
+        ("org.effectcraft.test.SupportLib", "filter"),
     ] {
         let e = r.loaded.iter().find(|e| e.ofx_id == ofx_id).unwrap_or_else(|| panic!("{ofx_id} missing from {:?}", r.loaded));
         assert_eq!(e.id, ofx_id.to_lowercase(), "effect id");
@@ -162,6 +163,33 @@ fn param_kinds() {
     assert!(matches!(kind("string"), PluginParamKind::Text { ref default } if default == "hello"));
     assert!(matches!(kind("custom"), PluginParamKind::Hidden { ref default } if default == "opaque-data"));
     // It is a pass-through: rendering with the defaults must not change the image.
+    let px: Vec<Px> = (0..12).map(|i| [i as f32 / 12.0, 0.5, 0.25, 1.0]).collect();
+    let (.., out) = run(&*p, 4, 3, &px, &[], &FakeHost::default());
+    assert!(out.iter().zip(&px).all(|(a, b)| close(*a, *b)));
+}
+
+/// Regression for "Support-library plug-ins fail Describe with OFX status 4": the plug-in extends
+/// every list the way the OFX C++ Support library does (`propSetString(name, value,
+/// propGetDimension(name))`), which needs the host's descriptor to start with *empty* lists rather
+/// than absent properties. If the host answered `kOfxStatErrUnknown` to the dimension query the
+/// plug-in would return `kOfxStatErrMissingHostFeature` and not load at all.
+#[test]
+fn support_library_pattern_describes() {
+    let Some(p) = effect("org.effectcraft.test.SupportLib") else { return };
+    assert_eq!(p.manifest().name, "EC Test Support Lib");
+    // Choice options appended at the dimension (a seeded, empty list on the parameter).
+    assert!(
+        matches!(find(&*p, "mode").kind, PluginParamKind::Popup { ref options, default: 1 } if options == &["Fast", "Balanced", "Best"]),
+        "{:?}",
+        find(&*p, "mode").kind
+    );
+    // `kOfxPluginPropParamPageOrder` (appended on the effect descriptor) lists page B first, so its
+    // parameter precedes page A's, and page children appended on each page land in the page's group.
+    let ids: Vec<&str> = p.manifest().params.iter().map(|q| q.id.as_str()).collect();
+    assert_eq!(ids, ["pb", "pa", "mode"], "page order");
+    let group = |id: &str| p.manifest().params.iter().find(|q| q.id == id).map(|q| q.group.clone()).unwrap_or_default();
+    assert_eq!((group("pa"), group("pb"), group("mode")), ("Page A".into(), "Page B".into(), "Page A".into()));
+    // It renders (pass-through of the source).
     let px: Vec<Px> = (0..12).map(|i| [i as f32 / 12.0, 0.5, 0.25, 1.0]).collect();
     let (.., out) = run(&*p, 4, 3, &px, &[], &FakeHost::default());
     assert!(out.iter().zip(&px).all(|(a, b)| close(*a, *b)));

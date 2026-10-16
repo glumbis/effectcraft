@@ -515,6 +515,13 @@ pub const IE_COLOUR_MANAGEMENT_STYLE: &str = "OfxImageEffectPropColourManagement
 pub const IE_THUMBNAIL_RENDER: &str = "OfxImageEffectPropThumbnailRender";
 pub const IE_NO_SPATIAL_AWARENESS: &str = "OfxImageEffectPropNoSpatialAwareness";
 pub const IE_PARAM_PAGE_ORDER: &str = "OfxPluginPropParamPageOrder";
+pub const IE_FIELD_RENDER_TWICE_ALWAYS: &str = "OfxImageEffectPluginPropFieldRenderTwiceAlways";
+pub const IE_CUDA_RENDER_SUPPORTED: &str = "OfxImageEffectPropCudaRenderSupported";
+pub const IE_CUDA_STREAM_SUPPORTED: &str = "OfxImageEffectPropCudaStreamSupported";
+pub const IE_METAL_RENDER_SUPPORTED: &str = "OfxImageEffectPropMetalRenderSupported";
+pub const IE_OPENCL_RENDER_SUPPORTED: &str = "OfxImageEffectPropOpenCLRenderSupported";
+pub const IE_OPENCL_SUPPORTED: &str = "OfxImageEffectPropOpenCLSupported";
+pub const IE_CPU_RENDER_SUPPORTED: &str = "OfxImageEffectPropCPURenderSupported";
 
 // Clip / image properties.
 pub const CLIP_CONNECTED: &str = "OfxImageClipPropConnected";
@@ -611,6 +618,8 @@ pub const PH_SUPPORTS_CUSTOM_INTERACT: &str = "OfxParamHostPropSupportsCustomInt
 pub const PH_MAX_PARAMETERS: &str = "OfxParamHostPropMaxParameters";
 pub const PH_MAX_PAGES: &str = "OfxParamHostPropMaxPages";
 pub const PH_PAGE_ROW_COLUMN_COUNT: &str = "OfxParamHostPropPageRowColumnCount";
+pub const PH_SUPPORTS_PARAMETRIC_ANIMATION: &str = "OfxParamHostPropSupportsParametricAnimation";
+pub const P_HOST_OS_HANDLE: &str = "OfxPropHostOSHandle";
 
 // Messages.
 pub const MSG_FATAL: &str = "OfxMessageFatal";

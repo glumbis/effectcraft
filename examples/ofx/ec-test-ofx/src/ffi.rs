@@ -14,6 +14,7 @@ pub type Clip = *mut c_void;
 
 pub const OK: Status = 0;
 pub const FAILED: Status = 1;
+pub const ERR_MISSING_HOST_FEATURE: Status = 4;
 pub const ERR_UNSUPPORTED: Status = 5;
 pub const REPLY_DEFAULT: Status = 14;
 
@@ -58,14 +59,14 @@ pub struct PropertySuite {
     pub get_int: unsafe extern "C" fn(Props, *const c_char, c_int, *mut c_int) -> Status,
     _get_n: [*const c_void; 4],
     _reset: *const c_void,
-    _get_dimension: *const c_void,
+    pub get_dimension: unsafe extern "C" fn(Props, *const c_char, *mut c_int) -> Status,
 }
 
 #[repr(C)]
 pub struct ParameterSuite {
     pub define: unsafe extern "C" fn(ParamSet, *const c_char, *const c_char, *mut Props) -> Status,
     pub get_handle: unsafe extern "C" fn(ParamSet, *const c_char, *mut Param, *mut Props) -> Status,
-    _set_get_property_set: *const c_void,
+    pub set_get_property_set: unsafe extern "C" fn(ParamSet, *mut Props) -> Status,
     _get_property_set: *const c_void,
     _get_value: *const c_void,
     pub get_value_at_time: unsafe extern "C" fn(Param, c_double, ...) -> Status,

@@ -1,4 +1,4 @@
-//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports five effects:
+//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports six effects:
 //!
 //! * `org.effectcraft.test.Invert`: filter, inverts the colours (double param `amount`);
 //! * `org.effectcraft.test.Echo`: filter, averages Source at `t` and `t - 1` (temporal access);
@@ -6,7 +6,10 @@
 //!   pixels and paints the new area opaque red;
 //! * `org.effectcraft.test.Mix`: general context, clips Source / Matte / Output, the Matte clip's
 //!   alpha multiplies the Source;
-//! * `org.effectcraft.test.AllParams`: declares every parameter type, passes the image through.
+//! * `org.effectcraft.test.AllParams`: declares every parameter type, passes the image through;
+//! * `org.effectcraft.test.SupportLib`: describes itself the way the OFX C++ Support library does
+//!   (every list is appended to at the index `propGetDimension` returned, and a failing
+//!   `propGetDimension` fails Describe), passes the image through.
 //!
 //! Float RGBA only. Rows are addressed through `OfxImagePropRowBytes` (which may be negative).
 
@@ -25,8 +28,9 @@ const ECHO: usize = 1;
 const BORDER: usize = 2;
 const MIX: usize = 3;
 const ALL_PARAMS: usize = 4;
+const SUPPORT_LIB: usize = 5;
 
-const LABELS: [&CStr; 5] = [c"EC Test Invert", c"EC Test Echo", c"EC Test Border", c"EC Test Mix", c"EC Test All Params"];
+const LABELS: [&CStr; 6] = [c"EC Test Invert", c"EC Test Echo", c"EC Test Border", c"EC Test Mix", c"EC Test All Params", c"EC Test Support Lib"];
 
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(null_mut());
 static SUITES: OnceLock<Suites> = OnceLock::new();
@@ -59,12 +63,13 @@ macro_rules! plug {
     };
 }
 
-static PLUGINS: [Plug; 5] = [
+static PLUGINS: [Plug; 6] = [
     plug!(c"org.effectcraft.test.Invert", INVERT),
     plug!(c"org.effectcraft.test.Echo", ECHO),
     plug!(c"org.effectcraft.test.Border", BORDER),
     plug!(c"org.effectcraft.test.Mix", MIX),
     plug!(c"org.effectcraft.test.AllParams", ALL_PARAMS),
+    plug!(c"org.effectcraft.test.SupportLib", SUPPORT_LIB),
 ];
 
 #[unsafe(no_mangle)]
@@ -110,8 +115,21 @@ unsafe fn describe(k: usize, effect: Effect) -> Status {
         (s.fx.get_property_set)(effect, &mut p);
         s.set_str(p, c"OfxPropLabel", 0, LABELS[k]);
         s.set_str(p, c"OfxImageEffectPluginPropGrouping", 0, c"EC Test");
-        s.set_str(p, c"OfxImageEffectPropSupportedContexts", 0, if k == MIX { c"OfxImageEffectContextGeneral" } else { c"OfxImageEffectContextFilter" });
-        s.set_str(p, c"OfxImageEffectPropSupportedPixelDepths", 0, c"OfxBitDepthFloat");
+        if k == SUPPORT_LIB {
+            // The Support library's way: append at the current dimension. These lists start empty
+            // on a conforming host, so the dimension query must succeed (with 0).
+            let appended = append_str(p, c"OfxImageEffectPropSupportedContexts", c"OfxImageEffectContextFilter")
+                .and_then(|()| append_str(p, c"OfxImageEffectPropSupportedContexts", c"OfxImageEffectContextGeneral"))
+                .and_then(|()| append_str(p, c"OfxImageEffectPropSupportedPixelDepths", c"OfxBitDepthFloat"))
+                .and_then(|()| append_str(p, c"OfxImageEffectPropSupportedPixelDepths", c"OfxBitDepthShort"))
+                .and_then(|()| append_str(p, c"OfxImageEffectPropClipPreferencesSlaveParam", c"mode"));
+            if let Err(status) = appended {
+                return status;
+            }
+        } else {
+            s.set_str(p, c"OfxImageEffectPropSupportedContexts", 0, if k == MIX { c"OfxImageEffectContextGeneral" } else { c"OfxImageEffectContextFilter" });
+            s.set_str(p, c"OfxImageEffectPropSupportedPixelDepths", 0, c"OfxBitDepthFloat");
+        }
         s.set_str(p, c"OfxImageEffectPluginRenderThreadSafety", 0, c"OfxImageEffectRenderFullySafe");
         s.set_int(p, c"OfxImageEffectPropSupportsTiles", 0, 0);
         s.set_int(p, c"OfxImageEffectPropTemporalClipAccess", 0, (k == ECHO) as c_int);
@@ -119,12 +137,35 @@ unsafe fn describe(k: usize, effect: Effect) -> Status {
     OK
 }
 
-unsafe fn define_clip(effect: Effect, name: &CStr, optional: bool, temporal: bool) {
+/// What the OFX C++ Support library does for every list property it extends
+/// (`propSetString(name, value, propGetDimension(name))`): a failing dimension query or set is
+/// thrown as an exception, which the library turns into `kOfxStatErrMissingHostFeature`.
+unsafe fn append_str(props: Props, key: &CStr, value: &CStr) -> Result<(), Status> {
+    let s = suites();
+    let mut n: c_int = -1;
+    unsafe {
+        if (s.prop.get_dimension)(props, key.as_ptr(), &mut n) != OK || n < 0 {
+            return Err(ERR_MISSING_HOST_FEATURE);
+        }
+        if (s.prop.set_string)(props, key.as_ptr(), n, value.as_ptr()) != OK {
+            return Err(ERR_MISSING_HOST_FEATURE);
+        }
+    }
+    Ok(())
+}
+
+unsafe fn define_clip(effect: Effect, name: &CStr, optional: bool, temporal: bool, support_lib: bool) {
     let s = suites();
     unsafe {
         let mut p = null_mut();
         (s.fx.clip_define)(effect, name.as_ptr(), &mut p);
-        s.set_str(p, c"OfxImageEffectPropSupportedComponents", 0, c"OfxImageComponentRGBA");
+        if support_lib {
+            // RGBA first, then RGB: the second append lands at index 1.
+            let _ = append_str(p, c"OfxImageEffectPropSupportedComponents", c"OfxImageComponentRGBA")
+                .and_then(|()| append_str(p, c"OfxImageEffectPropSupportedComponents", c"OfxImageComponentRGB"));
+        } else {
+            s.set_str(p, c"OfxImageEffectPropSupportedComponents", 0, c"OfxImageComponentRGBA");
+        }
         s.set_int(p, c"OfxImageClipPropOptional", 0, optional as c_int);
         s.set_int(p, c"OfxImageEffectPropTemporalClipAccess", 0, temporal as c_int);
     }
@@ -144,10 +185,10 @@ unsafe fn define_param(set: ParamSet, kind: &CStr, name: &CStr, label: &CStr) ->
 unsafe fn describe_in_context(k: usize, effect: Effect) -> Status {
     let s = suites();
     unsafe {
-        define_clip(effect, c"Output", false, false);
-        define_clip(effect, c"Source", false, k == ECHO);
+        define_clip(effect, c"Output", false, false, k == SUPPORT_LIB);
+        define_clip(effect, c"Source", false, k == ECHO, k == SUPPORT_LIB);
         if k == MIX {
-            define_clip(effect, c"Matte", true, false);
+            define_clip(effect, c"Matte", true, false, false);
         }
         let mut set = null_mut();
         (s.fx.get_param_set)(effect, &mut set);
@@ -167,10 +208,43 @@ unsafe fn describe_in_context(k: usize, effect: Effect) -> Status {
                 s.set_int(p, c"OfxParamPropMax", 0, 256);
             }
             ALL_PARAMS => describe_all_params(set),
+            SUPPORT_LIB => {
+                if let Err(status) = describe_support_lib_params(set) {
+                    return status;
+                }
+            }
             _ => {}
         }
     }
     OK
+}
+
+/// A choice whose options are appended, and two pages whose order is set through
+/// `kOfxPluginPropParamPageOrder` (appended at the dimension, on the param set's property set).
+unsafe fn describe_support_lib_params(set: ParamSet) -> Result<(), Status> {
+    let s = suites();
+    unsafe {
+        let mode = define_param(set, c"OfxParamTypeChoice", c"mode", c"Mode");
+        for o in [c"Fast", c"Balanced", c"Best"] {
+            append_str(mode, c"OfxParamPropChoiceOption", o)?;
+        }
+        s.set_int(mode, c"OfxParamPropDefault", 0, 1);
+        define_param(set, c"OfxParamTypeDouble", c"pa", c"Param A");
+        define_param(set, c"OfxParamTypeDouble", c"pb", c"Param B");
+        let page_a = define_param(set, c"OfxParamTypePage", c"pageA", c"Page A");
+        append_str(page_a, c"OfxParamPropPageChild", c"pa")?;
+        append_str(page_a, c"OfxParamPropPageChild", c"mode")?;
+        let page_b = define_param(set, c"OfxParamTypePage", c"pageB", c"Page B");
+        append_str(page_b, c"OfxParamPropPageChild", c"pb")?;
+        let mut set_props = null_mut();
+        if (s.param.set_get_property_set)(set, &mut set_props) != OK {
+            return Err(ERR_MISSING_HOST_FEATURE);
+        }
+        // Page B is listed first.
+        append_str(set_props, c"OfxPluginPropParamPageOrder", c"pageB")?;
+        append_str(set_props, c"OfxPluginPropParamPageOrder", c"pageA")?;
+    }
+    Ok(())
 }
 
 /// One parameter of every OFX type, plus a group (with a child) and a page listing them all.
@@ -370,10 +444,9 @@ unsafe fn render(k: usize, effect: Effect, in_args: Props) -> Status {
                 // The source's region of definition in pixels; everything outside it is red.
                 let mut r = RectD::default();
                 (s.fx.clip_get_region_of_definition)(src_clip, time, &mut r);
-                let rect = [(r.x1 * scale[0]).floor() as i32, (r.y1 * scale[1]).floor() as i32, (r.x2 * scale[0]).ceil() as i32, (r.y2 * scale[1]).ceil() as i32];
-                Box::new(move |x, y| {
-                    if x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3] { at(&src, x, y) } else { [1.0, 0.0, 0.0, 1.0] }
-                })
+                let rect =
+                    [(r.x1 * scale[0]).floor() as i32, (r.y1 * scale[1]).floor() as i32, (r.x2 * scale[0]).ceil() as i32, (r.y2 * scale[1]).ceil() as i32];
+                Box::new(move |x, y| if x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3] { at(&src, x, y) } else { [1.0, 0.0, 0.0, 1.0] })
             }
             MIX => {
                 let matte_clip = clip(effect, c"Matte");

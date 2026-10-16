@@ -10,7 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_void};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use crate::ffi::{K_STAT_ERR_BAD_HANDLE, K_STAT_ERR_BAD_INDEX, K_STAT_ERR_UNKNOWN, K_STAT_OK, OfxStatus, cstring};
+use crate::ffi::{
+    IE_CLIP_PREFS_SLAVE_PARAM, IE_PARAM_PAGE_ORDER, IE_SUPPORTED_COMPONENTS, IE_SUPPORTED_CONTEXTS, IE_SUPPORTED_PIXEL_DEPTHS, K_STAT_ERR_BAD_HANDLE,
+    K_STAT_ERR_BAD_INDEX, K_STAT_ERR_UNKNOWN, K_STAT_OK, OfxStatus, P_VERSION, PP_CHOICE_ENUM, PP_CHOICE_OPTION, PP_DIMENSION_LABEL, PP_PAGE_CHILD, cstring,
+};
 
 /// The marker at the start of every [`PropSet`], used to reject handles that are not ours.
 pub const PROPSET_MAGIC: u32 = 0x4F46_5850; // "OFXP"
@@ -58,6 +61,28 @@ impl std::fmt::Debug for PropSet {
 fn warned() -> &'static Mutex<HashSet<String>> {
     static W: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     W.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Properties that are lists a plug-in extends (`propSetX(name, v, propGetDimension(name))`). A
+/// set that was never seeded with one still answers "empty" for them rather than "unknown": the
+/// OFX C++ Support library treats a failing `propGetDimension` as a missing host feature and gives
+/// up describing the plug-in. Descriptors are seeded properly ([`crate::instance`]), this is the
+/// safety net for every other property set (and every list this host forgot).
+const KNOWN_LISTS: &[&str] = &[
+    IE_SUPPORTED_CONTEXTS,
+    IE_SUPPORTED_PIXEL_DEPTHS,
+    IE_SUPPORTED_COMPONENTS,
+    IE_CLIP_PREFS_SLAVE_PARAM,
+    IE_PARAM_PAGE_ORDER,
+    PP_CHOICE_OPTION,
+    PP_CHOICE_ENUM,
+    PP_PAGE_CHILD,
+    PP_DIMENSION_LABEL,
+    P_VERSION,
+];
+
+fn is_known_list(name: &str) -> bool {
+    KNOWN_LISTS.contains(&name)
 }
 
 /// Log a property the plug-in asked for that this host does not provide (once per name).
@@ -199,8 +224,7 @@ impl PropSet {
         let map = self.lock();
         let Some(slot) = map.get(name) else {
             drop(map);
-            note_unknown(name);
-            return Err(K_STAT_ERR_UNKNOWN);
+            return Err(unset_status(name));
         };
         usize::try_from(index).ok().and_then(|i| slot.get(i)).cloned().ok_or(K_STAT_ERR_BAD_INDEX)
     }
@@ -210,8 +234,7 @@ impl PropSet {
         let map = self.lock();
         let Some(slot) = map.get(name) else {
             drop(map);
-            note_unknown(name);
-            return Err(K_STAT_ERR_UNKNOWN);
+            return Err(unset_status(name));
         };
         match usize::try_from(index).ok().and_then(|i| slot.get(i)) {
             Some(PVal::Str(s)) => Ok(s.as_ptr()),
@@ -223,6 +246,8 @@ impl PropSet {
     pub fn dimension(&self, name: &str) -> Result<i32, OfxStatus> {
         match self.lock().get(name) {
             Some(v) => Ok(v.len() as i32),
+            // A known list nobody has set yet is empty.
+            None if is_known_list(name) => Ok(0),
             None => {
                 note_unknown(name);
                 Err(K_STAT_ERR_UNKNOWN)
@@ -232,6 +257,17 @@ impl PropSet {
 
     pub fn reset(&self, name: &str) -> OfxStatus {
         if self.lock().remove(name).is_some() { K_STAT_OK } else { K_STAT_ERR_UNKNOWN }
+    }
+}
+
+/// The status for reading a property that is not set: a known list is empty (its first element
+/// is out of range), anything else is unknown (and logged).
+fn unset_status(name: &str) -> OfxStatus {
+    if is_known_list(name) {
+        K_STAT_ERR_BAD_INDEX
+    } else {
+        note_unknown(name);
+        K_STAT_ERR_UNKNOWN
     }
 }
 
@@ -255,5 +291,35 @@ pub fn as_string(v: &PVal) -> Option<String> {
     match v {
         PVal::Str(s) => Some(s.to_string_lossy().into_owned()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_lists_that_were_never_set_are_empty() {
+        let p = PropSet::new();
+        for name in KNOWN_LISTS {
+            assert_eq!(p.dimension(name), Ok(0), "{name}");
+            // Reading element 0 of an empty list is out of range, not unknown.
+            assert_eq!(p.get_at(name, 0).err(), Some(K_STAT_ERR_BAD_INDEX), "{name}");
+            assert_eq!(p.get_str_ptr(name, 0).err(), Some(K_STAT_ERR_BAD_INDEX), "{name}");
+        }
+        // Appending at the dimension works, as the Support library does it.
+        let n = p.dimension(IE_SUPPORTED_CONTEXTS).unwrap_or(-1);
+        assert_eq!(p.set_at(IE_SUPPORTED_CONTEXTS, n, PVal::text("a")), K_STAT_OK);
+        let n = p.dimension(IE_SUPPORTED_CONTEXTS).unwrap_or(-1);
+        assert_eq!(p.set_at(IE_SUPPORTED_CONTEXTS, n, PVal::text("b")), K_STAT_OK);
+        assert_eq!(p.strs(IE_SUPPORTED_CONTEXTS), ["a", "b"]);
+    }
+
+    #[test]
+    fn other_unset_properties_are_still_unknown() {
+        let p = PropSet::new();
+        assert_eq!(p.dimension("OfxPropNoSuchThing"), Err(K_STAT_ERR_UNKNOWN));
+        assert_eq!(p.get_at("OfxPropNoSuchThing", 0).err(), Some(K_STAT_ERR_UNKNOWN));
+        assert_eq!(p.get_str_ptr("OfxPropNoSuchThing", 0).err(), Some(K_STAT_ERR_UNKNOWN));
     }
 }

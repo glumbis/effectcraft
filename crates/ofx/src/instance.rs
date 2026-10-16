@@ -121,10 +121,8 @@ impl PluginEntry {
             // SAFETY: `main` is the plug-in's entry point, called with the argument shapes the
             // specification fixes; the handles are alive for the duration of the call (the
             // caller waits for it, also when it runs on another thread).
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                main(a.as_ptr(), h as *const c_void, i as *mut c_void, o as *mut c_void)
-            }))
-            .unwrap_or(K_STAT_ERR_FATAL)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { main(a.as_ptr(), h as *const c_void, i as *mut c_void, o as *mut c_void) }))
+                .unwrap_or(K_STAT_ERR_FATAL)
         };
         // Linux plug-ins are built for glibc's 8 MiB thread stacks, and renders run on the
         // renderer's worker threads (2 MiB): a heavy render (Twixtor's optical flow) overflowed
@@ -193,6 +191,7 @@ impl EffectObj {
             message: Mutex::new(String::new()),
         });
         o.props.put_str(P_TYPE, TYPE_IMAGE_EFFECT);
+        seed_descriptor_props(&o.props);
         o
     }
 
@@ -256,6 +255,39 @@ impl EffectObj {
 
     pub fn message(&self) -> String {
         self.message.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+/// Give an effect descriptor the properties (and defaults) the specification says it has before
+/// the plug-in's `Describe` runs, as other hosts do (the OpenFX reference host's
+/// `effectDescriptorStuff`). The list properties start *empty*, not absent: the OFX C++ Support
+/// library extends them with `propSetString(name, value, propGetDimension(name))`, and it turns a
+/// failing `propGetDimension` into `kOfxStatErrMissingHostFeature`, which fails Describe for
+/// every plug-in built on it.
+fn seed_descriptor_props(p: &PropSet) {
+    for name in [P_LABEL, P_SHORT_LABEL, P_LONG_LABEL, P_VERSION_LABEL, P_PLUGIN_DESCRIPTION, IE_GROUPING, P_PLUGIN_FILE_PATH] {
+        p.put_str(name, "");
+    }
+    for name in [P_VERSION, IE_SUPPORTED_CONTEXTS, IE_SUPPORTED_PIXEL_DEPTHS, IE_CLIP_PREFS_SLAVE_PARAM, IE_PARAM_PAGE_ORDER] {
+        p.put(name, vec![]);
+    }
+    p.put_str(IE_RENDER_THREAD_SAFETY, IE_RENDER_INSTANCE_SAFE);
+    p.put_ptr(IE_OVERLAY_INTERACT_V1, 0);
+    for (name, v) in [
+        (IE_SINGLE_INSTANCE, 0),
+        (IE_HOST_FRAME_THREADING, 1),
+        (IE_SUPPORTS_MULTI_RESOLUTION, 1),
+        (IE_SUPPORTS_TILES, 1),
+        (IE_TEMPORAL_CLIP_ACCESS, 0),
+        (IE_FIELD_RENDER_TWICE_ALWAYS, 1),
+        (IE_MULTIPLE_CLIP_DEPTHS, 0),
+        (IE_MULTIPLE_CLIP_PARS, 0),
+        (IE_SEQUENTIAL_RENDER, 0),
+    ] {
+        p.put_int(name, v);
+    }
+    for name in [IE_OPENGL_RENDER_SUPPORTED, IE_CUDA_RENDER_SUPPORTED, IE_CUDA_STREAM_SUPPORTED, IE_METAL_RENDER_SUPPORTED, IE_OPENCL_RENDER_SUPPORTED] {
+        p.put_str(name, "false");
     }
 }
 
@@ -843,6 +875,27 @@ fn same_values(a: &[PVal], b: &[PVal]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Support library asks for the dimension of each list before appending to it: the
+    /// descriptor must have them (empty), with the specification's defaults beside them.
+    #[test]
+    fn descriptors_start_with_the_specified_properties() {
+        let d = EffectObj::new_descriptor();
+        for name in [IE_SUPPORTED_CONTEXTS, IE_SUPPORTED_PIXEL_DEPTHS, IE_CLIP_PREFS_SLAVE_PARAM, IE_PARAM_PAGE_ORDER, P_VERSION] {
+            assert_eq!(d.props.dimension(name), Ok(0), "{name}");
+        }
+        assert_eq!(d.props.str(P_TYPE).as_deref(), Some(TYPE_IMAGE_EFFECT));
+        assert_eq!(d.props.str(IE_RENDER_THREAD_SAFETY).as_deref(), Some(IE_RENDER_INSTANCE_SAFE));
+        assert_eq!(d.props.str(IE_OPENGL_RENDER_SUPPORTED).as_deref(), Some("false"));
+        assert_eq!(
+            (d.props.int(IE_SUPPORTS_TILES), d.props.int(IE_SUPPORTS_MULTI_RESOLUTION), d.props.int(IE_TEMPORAL_CLIP_ACCESS)),
+            (Some(1), Some(1), Some(0))
+        );
+        assert_eq!(d.props.int(IE_FIELD_RENDER_TWICE_ALWAYS), Some(1));
+        // Labels and the grouping are readable (empty) before the plug-in sets them.
+        assert_eq!(d.props.str(P_LABEL).as_deref(), Some(""));
+        assert_eq!(d.props.str(IE_GROUPING).as_deref(), Some(""));
+    }
 
     #[test]
     fn spans_become_frame_ranges() {
