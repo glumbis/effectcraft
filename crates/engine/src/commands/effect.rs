@@ -99,6 +99,32 @@ fn plugins_load_ofx(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(r)
 }
 
+fn has_ofx_host_name(s: &Session) -> std::result::Result<(), String> {
+    if s.ofx_host_name.is_some() { Ok(()) } else { Err("OpenFX plug-ins are not available in this build".into()) }
+}
+
+/// `effect.plugins.ofxHostName`: the name OpenFX plug-ins are told the host has (some only run in
+/// hosts they know), where it came from, what the settings file holds and whether a change waits
+/// for a restart ([`Session::ofx_host_name`]).
+fn plugins_ofx_host_name(s: &mut Session, _: &Value) -> Result<Value> {
+    let hook = s.ofx_host_name.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
+    hook(None).map_err(EngineError::Other)
+}
+
+/// `effect.plugins.setOfxHostName {name}`: store the host name OpenFX plug-ins are told (an empty
+/// name goes back to the default). Plug-ins are told once, when they load, so it applies from the
+/// next start.
+fn plugins_set_ofx_host_name(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "effect.plugins.setOfxHostName";
+    let hook = s.ofx_host_name.ok_or_else(|| EngineError::Other("OpenFX plug-ins are not available in this build".into()))?;
+    let name = str_p(p, "name").ok_or_else(|| bad(c, "missing `name` (an empty name resets it to the default)"))?;
+    let r = hook(Some(name)).map_err(EngineError::Other)?;
+    if r["restartRequired"] == true {
+        s.toast("The OpenFX host name changes the next time EffectCraft starts".to_string());
+    }
+    Ok(r)
+}
+
 /// `effect.plugins.scanOfx`: load every plug-in in the host's OpenFX search paths
 /// ([`Session::ofx_search_paths`]). Missing folders are skipped; one bad plug-in doesn't stop
 /// the rest. Plug-ins that crashed the app while loading last time are skipped (the host keeps a
@@ -747,6 +773,21 @@ pub fn specs() -> Vec<CommandSpec> {
             "{path (.ofx binary | .ofx.bundle folder | a folder, scanned recursively)} → {loaded: [{id, name, category, ofxId, context, bundle}], errors, notes, transcript}: errors say what stopped a plug-in, notes what was skipped on purpose (declined this host, duplicate, not an image effect), transcript what each plug-in answered while loading",
             has_ofx,
             plugins_load_ofx
+        ),
+        crate::query!(
+            "effect.plugins.ofxHostName",
+            "OpenFX Host Name",
+            "{} → {name, source, configured, environmentOverride, settingsFile, problem, restartRequired, next?}: the host name OpenFX plug-ins are told (kOfxPropName), where it comes from (default, settings file or environment variable), what ofx_settings.json holds and whether a stored change still waits for a restart",
+            plugins_ofx_host_name
+        ),
+        cmd!(
+            "effect.plugins.setOfxHostName",
+            "Set OpenFX Host Name",
+            [],
+            None,
+            "{name (an empty name goes back to \"EffectCraft\")} → as effect.plugins.ofxHostName: stored in ofx_settings.json in the config folder and applied the next time EffectCraft starts (the environment variable EFFECTCRAFT_OFX_HOST_NAME overrides it)",
+            has_ofx_host_name,
+            plugins_set_ofx_host_name
         ),
         cmd!(
             "effect.plugins.scanOfx",

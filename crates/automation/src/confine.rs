@@ -43,6 +43,9 @@ const REFUSED: &[&str] = &[
     // Native OpenFX plug-ins are unsandboxed code: an agent never chooses which one runs.
     "effect.plugins.loadOfx",
     "effect.plugins.scanOfx",
+    // It only writes a settings file in the config folder, but it changes what native plug-ins are
+    // told about the host (some switch to other code paths): not an agent's call under confinement.
+    "effect.plugins.setOfxHostName",
 ];
 
 /// Commands that read files named by these parameters.

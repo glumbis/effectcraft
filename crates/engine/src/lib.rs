@@ -480,6 +480,9 @@ pub struct Session {
     /// Forgets the OpenFX crash blocklist (plug-ins skipped because they crashed the app while
     /// loading): `effect.plugins.scanOfx {"retry": true}`.
     pub ofx_clear_blocklist: Option<fn()>,
+    /// The OpenFX host name setting (hosts built with the `openfx` feature):
+    /// `effect.plugins.ofxHostName`, `effect.plugins.setOfxHostName`.
+    pub ofx_host_name: Option<OfxHostName>,
     /// Converts an After Effects project (`.aep` / `.aepx`) into an After Effects-style script that
     /// rebuilds it (hosts built with the `aep` feature): `file.importAep`.
     pub aep_converter: Option<AepConverter>,
@@ -560,6 +563,10 @@ pub type PluginLoader = fn(&[u8], &str) -> std::result::Result<Value, String>;
 /// (`{loaded: [{id, name, category, ofxId, context, bundle}], errors: [..]}`).
 pub type OfxLoader = fn(&str) -> std::result::Result<Value, String>;
 
+/// Reads (`None`) or changes (`Some(name)`; empty resets) the host name OpenFX plug-ins are told,
+/// and reports it as JSON (`effect.plugins.ofxHostName`, `effect.plugins.setOfxHostName`).
+pub type OfxHostName = fn(Option<&str>) -> std::result::Result<Value, String>;
+
 /// Converts an After Effects project file (`.aep` or `.aepx`) into the JavaScript (After Effects
 /// scripting object model) that rebuilds it.
 pub type AepConverter = fn(&str) -> std::result::Result<String, String>;
@@ -615,6 +622,7 @@ impl Default for Session {
             ofx_loader: None,
             ofx_search_paths: vec![],
             ofx_clear_blocklist: None,
+            ofx_host_name: None,
             aep_converter: None,
             script_ui: scriptui::ScriptUi::default(),
             sys_memory: None,

@@ -17,8 +17,8 @@
 //! mapping to EffectCraft parameters), [`clips`] (clips, images and pixel conversion),
 //! [`instance`] (effect handles, geometry, per-render context, actions), [`effect`] (the
 //! `EffectPlugin` implementation), [`suites`] (the host suites), [`loader`] (bundle discovery
-//! and registration), [`blocklist`] (skips plug-ins that crashed the app while loading) and
-//! [`diag`] (what the host learns about a plug-in while it runs: its messages, the properties and
+//! and registration), [`blocklist`] (skips plug-ins that crashed the app while loading),
+//! [`settings`] (the host name plug-ins are told, configurable) and [`diag`] (what the host learns about a plug-in while it runs: its messages, the properties and
 //! suites it asked for that this host lacks; the load transcript is built from it).
 
 // Native code: nothing to host on the web build.
@@ -34,12 +34,22 @@ pub mod instance;
 pub mod loader;
 pub mod params;
 pub mod props;
+pub mod settings;
 pub mod suites;
 
 use std::path::PathBuf;
 
-pub use blocklist::set_state_dir;
 pub use loader::{default_search_paths, load_path};
+pub use settings::host_name_command;
+
+/// Set the directory that holds the crash blocklist and `ofx_settings.json` (the host's config
+/// directory) and decide the host name plug-ins will be told ([`settings`]) right away, so the
+/// start-up scan and the commands agree on it. Until this is called the blocklist is disabled and
+/// the host name is the default or the environment variable's.
+pub fn set_state_dir(dir: PathBuf) {
+    blocklist::set_state_dir(dir);
+    let _ = settings::identity();
+}
 
 /// One OFX plug-in that was registered as an effect.
 #[derive(Clone, Debug, PartialEq, Eq)]

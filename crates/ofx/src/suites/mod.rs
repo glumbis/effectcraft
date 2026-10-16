@@ -29,10 +29,11 @@ struct HostBlock {
 unsafe impl Send for HostBlock {}
 unsafe impl Sync for HostBlock {}
 
-/// The name plug-ins see in `kOfxPropName`: "EffectCraft", or `EFFECTCRAFT_OFX_HOST_NAME`
-/// (some plug-ins only enable themselves for hosts they know).
+/// The name plug-ins see in `kOfxPropName`: "EffectCraft" unless the user changed it (the
+/// environment variable `EFFECTCRAFT_OFX_HOST_NAME` or `ofx_settings.json`, see
+/// [`crate::settings`]); some plug-ins only enable themselves for hosts they know.
 pub fn host_name() -> String {
-    std::env::var("EFFECTCRAFT_OFX_HOST_NAME").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "EffectCraft".to_string())
+    crate::settings::identity().name.clone()
 }
 
 /// The host as plug-ins are told about it, for the load transcript: name, version, API version.

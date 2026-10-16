@@ -54,11 +54,33 @@ fn is_project_file(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("ecproj") || ext.eq_ignore_ascii_case("ecprojx"))
 }
 
-/// The start-up OpenFX scan as plain text for `<config>/ofx_scan.txt`: the folders searched, the
-/// effects registered and every problem. `result` is `effect.plugins.scanOfx`'s.
-fn ofx_scan_report(search_paths: &[std::path::PathBuf], result: &Result<serde_json::Value, String>) -> String {
+/// The start-up OpenFX scan as plain text for `<config>/ofx_scan.txt`: the host name plug-ins were
+/// told, the folders searched, the effects registered, every problem, the plug-ins skipped on
+/// purpose and the load transcript (what each plug-in answered, said and asked for). `result` is
+/// `effect.plugins.scanOfx`'s, `host` is `effect.plugins.ofxHostName`'s.
+fn ofx_scan_report(search_paths: &[std::path::PathBuf], result: &Result<serde_json::Value, String>, host: &Result<serde_json::Value, String>) -> String {
     use std::fmt::Write as _;
-    let mut t = String::from("EffectCraft OpenFX plug-in scan (written at every start-up)\n\nFolders searched:\n");
+    let mut t = String::from("EffectCraft OpenFX plug-in scan (written at every start-up)\n\n");
+    match host {
+        Ok(h) => {
+            let _ = writeln!(t, "Host name shown to plug-ins: {} ({})", h["name"].as_str().unwrap_or("?"), h["source"].as_str().unwrap_or("?"));
+            let _ = writeln!(
+                t,
+                "  Some plug-ins only run in hosts they know. To change the name set \"host_name\" in {} (or run effect.plugins.setOfxHostName), then restart;\n  the environment variable EFFECTCRAFT_OFX_HOST_NAME overrides the file.",
+                h["settingsFile"].as_str().unwrap_or("ofx_settings.json in the config folder")
+            );
+            if let Some(configured) = h["configured"].as_str().filter(|_| h["restartRequired"] == true) {
+                let _ = writeln!(t, "  The settings file says \"{configured}\", which takes effect at the next start.");
+            }
+            if let Some(p) = h["problem"].as_str() {
+                let _ = writeln!(t, "  Problem: {p}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(t, "Host name shown to plug-ins: unknown ({e})");
+        }
+    }
+    t.push_str("\nFolders searched:\n");
     for p in search_paths {
         let state = if p.is_dir() { "found  " } else { "missing" };
         let _ = writeln!(t, "  [{state}] {}", p.display());
@@ -302,7 +324,8 @@ fn main() -> eframe::Result {
                     // The release app has no console on Windows, so stderr alone goes nowhere:
                     // the scan is also written to <config>/ofx_scan.txt and summarised in a toast.
                     let report = dir.join("ofx_scan.txt");
-                    let text = ofx_scan_report(&session.ofx_search_paths, &result);
+                    let host = session.execute("effect.plugins.ofxHostName", json!({})).map_err(|e| e.to_string());
+                    let text = ofx_scan_report(&session.ofx_search_paths, &result, &host);
                     eprint!("{text}");
                     let _ = std::fs::write(&report, &text);
                     if let Some(msg) = ofx_scan_toast(&result, &report) {
@@ -593,11 +616,23 @@ mod tests {
         use serde_json::json;
         use std::path::{Path, PathBuf};
         let ok = Ok(json!({"loaded": [{"name": "Invert", "category": "EC Test", "id": "org.x.invert", "bundle": "x.ofx.bundle"}], "errors": []}));
-        let t = super::ofx_scan_report(&[PathBuf::from("/definitely/not/here")], &ok);
+        let host = Ok(
+            json!({"name": "EffectCraft", "source": "default", "settingsFile": "C:/cfg/ofx_settings.json", "configured": null, "problem": null, "restartRequired": false}),
+        );
+        let t = super::ofx_scan_report(&[PathBuf::from("/definitely/not/here")], &ok, &host);
         assert!(t.contains("[missing] /definitely/not/here") && t.contains("Invert [EC Test]") && t.contains("Problems: 0"));
+        assert!(t.contains("Host name shown to plug-ins: EffectCraft (default)") && t.contains("C:/cfg/ofx_settings.json"), "{t}");
+        // A pending change and a broken settings file are said too; a failed query does not stop the report.
+        let pending = Ok(
+            json!({"name": "EffectCraft", "source": "default", "configured": "Fusion", "restartRequired": true, "problem": "ofx_settings.json is not valid JSON"}),
+        );
+        let t = super::ofx_scan_report(&[], &ok, &pending);
+        assert!(t.contains("settings file says \"Fusion\"") && t.contains("Problem: ofx_settings.json is not valid JSON"), "{t}");
+        let t = super::ofx_scan_report(&[], &ok, &Err("no".into()));
+        assert!(t.contains("Host name shown to plug-ins: unknown (no)") && t.contains("Problems: 0"), "{t}");
         assert_eq!(super::ofx_scan_toast(&ok, Path::new("r.txt")), None);
         let bad = Ok(json!({"loaded": [], "errors": ["a.ofx: cannot load the library"]}));
-        let t = super::ofx_scan_report(&[], &bad);
+        let t = super::ofx_scan_report(&[], &bad, &host);
         assert!(t.contains("a.ofx: cannot load the library") && t.contains("No OpenFX effects were found"));
         assert!(super::ofx_scan_toast(&bad, Path::new("r.txt")).is_some_and(|m| m.contains("r.txt")));
         // Notes and the transcript are part of the report; a scan that only skipped plug-ins still says so.
@@ -607,7 +642,7 @@ mod tests {
             "notes": ["b.ofx: declined this host: OfxSetHost returned kOfxStatFailed (1)"],
             "transcript": ["b.ofx\n  OfxSetHost -> kOfxStatFailed (1)"]
         }));
-        let t = super::ofx_scan_report(&[], &skipped);
+        let t = super::ofx_scan_report(&[], &skipped, &host);
         assert!(t.contains("Notes (plug-ins skipped on purpose): 1") && t.contains("declined this host"), "{t}");
         assert!(t.contains("Load transcript") && t.contains("OfxSetHost -> kOfxStatFailed (1)"), "{t}");
         assert!(t.contains("none became an effect") && !t.contains("No OpenFX effects were found"), "{t}");
