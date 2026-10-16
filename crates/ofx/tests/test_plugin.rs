@@ -132,6 +132,7 @@ fn all_effects_register() {
         ("org.effectcraft.test.Mix", "general"),
         ("org.effectcraft.test.AllParams", "filter"),
         ("org.effectcraft.test.SupportLib", "filter"),
+        ("org.effectcraft.test.CreateTime", "filter"),
     ] {
         let e = r.loaded.iter().find(|e| e.ofx_id == ofx_id).unwrap_or_else(|| panic!("{ofx_id} missing from {:?}", r.loaded));
         assert_eq!(e.id, ofx_id.to_lowercase(), "effect id");
@@ -193,6 +194,30 @@ fn support_library_pattern_describes() {
     let px: Vec<Px> = (0..12).map(|i| [i as f32 / 12.0, 0.5, 0.25, 1.0]).collect();
     let (.., out) = run(&*p, 4, 3, &px, &[], &FakeHost::default());
     assert!(out.iter().zip(&px).all(|(a, b)| close(*a, *b)));
+}
+
+/// A plug-in reads its parameters in `CreateInstance` and keeps what it finds (a model, a mode);
+/// the host has to apply the values before that action, and ask for the clip preferences again
+/// when a parameter named in `kOfxImageEffectPropClipPreferencesSlaveParam` changes. The test
+/// plug-in multiplies by the `level` it read when it was created and answers "unpremultiplied"
+/// below 0.5 from the *current* `level`.
+#[test]
+fn parameter_values_reach_the_plugin_before_it_creates_its_instance() {
+    let Some(p) = effect("org.effectcraft.test.CreateTime") else { return };
+    let src = vec![[0.8, 0.6, 0.4, 1.0]; 4];
+    // Created with level 0.25: the output is the source times 0.25, and the clip preferences
+    // (read with level 0.25 too) say straight alpha, so the host premultiplies the colour.
+    let (.., out) = run(&*p, 2, 2, &src, &[("level", &[0.25])], &FakeHost::default());
+    for g in &out {
+        assert!(close(*g, [0.05, 0.0375, 0.025, 0.25]), "created with the default instead of the value? got {g:?}");
+    }
+    // The same applied effect again (the pooled instance keeps its created level 0.25) with a new
+    // value of the slave parameter: the clip preferences are asked for again and now say
+    // premultiplied, so nothing more is multiplied in.
+    let (.., out) = run(&*p, 2, 2, &src, &[("level", &[0.9])], &FakeHost::default());
+    for g in &out {
+        assert!(close(*g, [0.2, 0.15, 0.1, 0.25]), "stale clip preferences? got {g:?}");
+    }
 }
 
 #[test]

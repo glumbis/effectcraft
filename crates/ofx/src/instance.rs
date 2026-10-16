@@ -752,8 +752,11 @@ impl Instance {
         self.obj.set_render(None);
     }
 
-    /// Apply new parameter values; returns the names whose value changed.
-    pub fn apply_values(&self, values: &HashMap<String, Vec<PVal>>) -> Vec<String> {
+    /// Apply new parameter values; returns the names whose value changed. A changed parameter the
+    /// plug-in listed in `kOfxImageEffectPropClipPreferencesSlaveParam` changes what
+    /// `GetClipPreferences` answers, so the preferences are asked for again (an instance that is
+    /// not created yet is asked when it is created).
+    pub fn apply_values(&mut self, values: &HashMap<String, Vec<PVal>>) -> Vec<String> {
         let mut changed = Vec::new();
         for (name, v) in values {
             let Some(p) = self.obj.param(name) else { continue };
@@ -763,6 +766,9 @@ impl Instance {
             }
         }
         changed.sort();
+        if self.created && changed.iter().any(|n| self.cfg.slave_params.contains(n)) {
+            self.refresh_prefs();
+        }
         changed
     }
 

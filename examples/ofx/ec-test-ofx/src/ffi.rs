@@ -68,7 +68,8 @@ pub struct ParameterSuite {
     pub get_handle: unsafe extern "C" fn(ParamSet, *const c_char, *mut Param, *mut Props) -> Status,
     pub set_get_property_set: unsafe extern "C" fn(ParamSet, *mut Props) -> Status,
     _get_property_set: *const c_void,
-    _get_value: *const c_void,
+    /// `paramGetValue(handle, ...)`: a real C variadic, as plug-ins call it.
+    pub get_value: unsafe extern "C" fn(Param, ...) -> Status,
     pub get_value_at_time: unsafe extern "C" fn(Param, c_double, ...) -> Status,
     _rest: [*const c_void; 12],
 }
@@ -135,6 +136,9 @@ impl Suites {
     pub unsafe fn get_dbl(&self, p: Props, key: &CStr, i: c_int) -> Option<f64> {
         let mut v = 0.0;
         (unsafe { (self.prop.get_double)(p, key.as_ptr(), i, &mut v) } == OK).then_some(v)
+    }
+    pub unsafe fn set_ptr(&self, p: Props, key: &CStr, i: c_int, v: *mut c_void) {
+        unsafe { (self.prop.set_pointer)(p, key.as_ptr(), i, v) };
     }
     pub unsafe fn get_ptr(&self, p: Props, key: &CStr) -> Option<*mut c_void> {
         let mut v = std::ptr::null_mut();

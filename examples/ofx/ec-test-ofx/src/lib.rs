@@ -1,4 +1,4 @@
-//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports six effects:
+//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports seven effects:
 //!
 //! * `org.effectcraft.test.Invert`: filter, inverts the colours (double param `amount`);
 //! * `org.effectcraft.test.Echo`: filter, averages Source at `t` and `t - 1` (temporal access);
@@ -9,7 +9,10 @@
 //! * `org.effectcraft.test.AllParams`: declares every parameter type, passes the image through;
 //! * `org.effectcraft.test.SupportLib`: describes itself the way the OFX C++ Support library does
 //!   (every list is appended to at the index `propGetDimension` returned, and a failing
-//!   `propGetDimension` fails Describe), passes the image through.
+//!   `propGetDimension` fails Describe), passes the image through;
+//! * `org.effectcraft.test.CreateTime`: reads its `level` parameter in CreateInstance (and keeps it
+//!   as instance data), multiplies the source by that created value, and answers
+//!   GetClipPreferences from the *current* `level` (a slave parameter): "unpremultiplied" below 0.5.
 //!
 //! Float RGBA only. Rows are addressed through `OfxImagePropRowBytes` (which may be negative).
 
@@ -29,8 +32,10 @@ const BORDER: usize = 2;
 const MIX: usize = 3;
 const ALL_PARAMS: usize = 4;
 const SUPPORT_LIB: usize = 5;
+const CREATE_TIME: usize = 6;
 
-const LABELS: [&CStr; 6] = [c"EC Test Invert", c"EC Test Echo", c"EC Test Border", c"EC Test Mix", c"EC Test All Params", c"EC Test Support Lib"];
+const LABELS: [&CStr; 7] =
+    [c"EC Test Invert", c"EC Test Echo", c"EC Test Border", c"EC Test Mix", c"EC Test All Params", c"EC Test Support Lib", c"EC Test Create Time"];
 
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(null_mut());
 /// Set when the host has called `OfxSetHost` (the header orders it before `OfxGetNumberOfPlugins`).
@@ -81,13 +86,14 @@ macro_rules! plug {
     };
 }
 
-static PLUGINS: [Plug; 6] = [
+static PLUGINS: [Plug; 7] = [
     plug!(c"org.effectcraft.test.Invert", INVERT),
     plug!(c"org.effectcraft.test.Echo", ECHO),
     plug!(c"org.effectcraft.test.Border", BORDER),
     plug!(c"org.effectcraft.test.Mix", MIX),
     plug!(c"org.effectcraft.test.AllParams", ALL_PARAMS),
     plug!(c"org.effectcraft.test.SupportLib", SUPPORT_LIB),
+    plug!(c"org.effectcraft.test.CreateTime", CREATE_TIME),
 ];
 
 #[unsafe(no_mangle)]
@@ -125,6 +131,9 @@ unsafe fn dispatch(k: usize, action: &[u8], effect: Effect, in_args: Props, out_
             },
             b"OfxActionDescribe" => describe(k, effect),
             b"OfxImageEffectActionDescribeInContext" => describe_in_context(k, effect),
+            b"OfxActionCreateInstance" if k == CREATE_TIME => create_time_create(effect),
+            b"OfxActionDestroyInstance" if k == CREATE_TIME => create_time_destroy(effect),
+            b"OfxImageEffectActionGetClipPreferences" if k == CREATE_TIME => create_time_prefs(effect, out_args),
             b"OfxImageEffectActionGetRegionOfDefinition" if k == BORDER => border_rod(effect, in_args, out_args),
             b"OfxImageEffectActionRender" => render(k, effect, in_args),
             _ => REPLY_DEFAULT,
@@ -169,6 +178,10 @@ unsafe fn describe(k: usize, effect: Effect) -> Status {
         s.set_str(p, c"OfxImageEffectPluginRenderThreadSafety", 0, c"OfxImageEffectRenderFullySafe");
         s.set_int(p, c"OfxImageEffectPropSupportsTiles", 0, 0);
         s.set_int(p, c"OfxImageEffectPropTemporalClipAccess", 0, (k == ECHO) as c_int);
+        if k == CREATE_TIME {
+            // The clip preferences depend on `level`: the host asks again when it changes.
+            s.set_str(p, c"OfxImageEffectPropClipPreferencesSlaveParam", 0, c"level");
+        }
     }
     OK
 }
@@ -244,6 +257,12 @@ unsafe fn describe_in_context(k: usize, effect: Effect) -> Status {
                 s.set_int(p, c"OfxParamPropMax", 0, 256);
             }
             ALL_PARAMS => describe_all_params(set),
+            CREATE_TIME => {
+                let p = define_param(set, c"OfxParamTypeDouble", c"level", c"Level");
+                s.set_dbl(p, c"OfxParamPropDefault", 0, 1.0);
+                s.set_dbl(p, c"OfxParamPropMin", 0, 0.0);
+                s.set_dbl(p, c"OfxParamPropMax", 0, 1.0);
+            }
             SUPPORT_LIB => {
                 if let Err(status) = describe_support_lib_params(set) {
                     return status;
@@ -413,6 +432,63 @@ unsafe fn param(effect: Effect, name: &CStr) -> Param {
     p
 }
 
+/// The double parameter `name` as `paramGetValue` (no time) reports it right now: a real C
+/// variadic call with the out-pointer as the only variadic argument.
+unsafe fn double_param_now(effect: Effect, name: &CStr) -> f64 {
+    let (p, mut v) = (unsafe { param(effect, name) }, 0.0f64);
+    unsafe { (suites().param.get_value)(p, &mut v as *mut f64) };
+    v
+}
+
+/// The effect instance's own property set.
+unsafe fn effect_props(effect: Effect) -> Props {
+    let mut p = null_mut();
+    unsafe { (suites().fx.get_property_set)(effect, &mut p) };
+    p
+}
+
+/// CreateInstance: remember what `level` is *now*, as plug-ins keep the model or mode they were
+/// created with. The host has to have applied the parameter values before this action.
+unsafe fn create_time_create(effect: Effect) -> Status {
+    unsafe {
+        let level = double_param_now(effect, c"level");
+        suites().set_ptr(effect_props(effect), c"OfxPropInstanceData", 0, Box::into_raw(Box::new(level)) as *mut c_void);
+    }
+    OK
+}
+
+unsafe fn create_time_destroy(effect: Effect) -> Status {
+    unsafe {
+        let props = effect_props(effect);
+        if let Some(data) = suites().get_ptr(props, c"OfxPropInstanceData").filter(|d| !d.is_null()) {
+            drop(Box::from_raw(data as *mut f64));
+            suites().set_ptr(props, c"OfxPropInstanceData", 0, null_mut());
+        }
+    }
+    OK
+}
+
+/// The `level` the instance was created with (1 when there is no instance data).
+unsafe fn created_level(effect: Effect) -> f64 {
+    unsafe {
+        match suites().get_ptr(effect_props(effect), c"OfxPropInstanceData") {
+            Some(data) if !data.is_null() => *(data as *const f64),
+            _ => 1.0,
+        }
+    }
+}
+
+/// GetClipPreferences: from the current `level`, a slave parameter: below 0.5 the output is
+/// straight (unpremultiplied) alpha, which the host premultiplies after the render.
+unsafe fn create_time_prefs(effect: Effect, out_args: Props) -> Status {
+    unsafe {
+        let level = double_param_now(effect, c"level");
+        let value = if level < 0.5 { c"OfxImageAlphaUnPremultiplied" } else { c"OfxImageAlphaPremultiplied" };
+        suites().set_str(out_args, c"OfxImageEffectPropPreMultiplication", 0, value);
+    }
+    OK
+}
+
 unsafe fn double_param(effect: Effect, name: &CStr, time: f64) -> f64 {
     let (p, mut v) = (unsafe { param(effect, name) }, 0.0f64);
     unsafe { (suites().param.get_value_at_time)(p, time, &mut v as *mut f64) };
@@ -491,6 +567,11 @@ unsafe fn render(k: usize, effect: Effect, in_args: Props) -> Status {
                     let a = if matte.is_some() { at(&matte, x, y)[3] } else { 1.0 };
                     at(&src, x, y).map(|v| v * a)
                 })
+            }
+            CREATE_TIME => {
+                // What the plug-in read when it was created, not what the parameter says now.
+                let created = created_level(effect) as f32;
+                Box::new(move |x, y| at(&src, x, y).map(|v| v * created))
             }
             _ => Box::new(move |x, y| at(&src, x, y)),
         };

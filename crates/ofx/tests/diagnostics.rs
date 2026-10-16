@@ -125,7 +125,7 @@ fn a_describe_that_fails_names_the_missing_host_feature() {
 fn a_clean_load_has_a_compact_transcript() {
     let Some(r) = load_with_mode("clean", "") else { return };
     assert!(r.errors.is_empty() && r.notes.is_empty(), "{r:?}");
-    assert_eq!(r.loaded.len(), 6);
+    assert_eq!(r.loaded.len(), 7);
     let t = r.transcript.join(
         "
 ",
@@ -133,7 +133,7 @@ fn a_clean_load_has_a_compact_transcript() {
     for needle in [
         "host shown to the plug-in: \"EffectCraft\"",
         "OfxSetHost -> kOfxStatOK (0)",
-        "OfxGetNumberOfPlugins -> 6",
+        "OfxGetNumberOfPlugins -> 7",
         // A plug-in that registered without anything to report is one line, not a page per effect.
         "org.effectcraft.test.Invert v1.0: registered as effect org.effectcraft.test.invert (filter context) (Load, Describe and DescribeInContext: OK)",
         "org.effectcraft.test.Mix v1.0: registered as effect org.effectcraft.test.mix (general context)",

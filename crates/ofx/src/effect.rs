@@ -28,6 +28,7 @@ use crate::clips::{ClipImage, Comps};
 use crate::ffi::*;
 use crate::instance::*;
 use crate::params::Bindings;
+use crate::props::PVal;
 
 /// The most idle instances kept per instance key.
 const MAX_IDLE: usize = 8;
@@ -95,8 +96,11 @@ impl OfxEffect {
         f64::from_bits(self.fps_bits.load(Ordering::Relaxed))
     }
 
-    /// An idle instance last used for `key`, or a new one.
-    fn checkout(&self, key: u64) -> Result<Instance, String> {
+    /// An idle instance last used for `key`, or a new one. A new instance gets the parameter
+    /// `values` before the plug-in's `CreateInstance` (and the clip preferences after it) run:
+    /// plug-ins read their parameters there and cache what they find (a model, a mode), so
+    /// creating them with the defaults and changing the values afterwards left them stale.
+    fn checkout(&self, key: u64, values: &HashMap<String, Vec<PVal>>) -> Result<Instance, String> {
         let pooled = {
             let mut pool = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
             let popped = pool.idle.get_mut(&key).and_then(|(_, list)| list.pop());
@@ -109,6 +113,7 @@ impl OfxEffect {
             return Ok(i);
         }
         let mut inst = Instance::build(self.entry.clone(), self.cfg.clone(), &self.desc);
+        inst.apply_values(values);
         inst.create()?;
         Ok(inst)
     }
@@ -177,9 +182,9 @@ impl OfxEffect {
 
     fn measure_pad(&self, params: &PluginParams, time: f64, scale: f64, layer_size: [f64; 2], key: u64) -> Option<i32> {
         let _serial = self.serialise();
-        let inst = self.checkout(key).ok()?;
         let geom = measure_geometry(scale, layer_size);
         let values = self.bindings.decode(params.flat, params.texts, &geom.coord());
+        let mut inst = self.checkout(key, &values).ok()?;
         inst.apply_values(&values);
         let fps = self.fps();
         let ctx = Arc::new(RenderCtx::new(
@@ -219,8 +224,9 @@ impl OfxEffect {
         let geom = Geometry { scale, layer, origin: frame.origin, w, h, pad };
 
         let _serial = self.serialise();
-        let mut inst = self.checkout(key)?;
-        let result = self.run(&mut inst, frame, params, time, fps, geom, host);
+        let values = self.bindings.decode(params.flat, params.texts, &geom.coord());
+        let mut inst = self.checkout(key, &values)?;
+        let result = self.run(&mut inst, frame, params, &values, time, fps, geom, host);
         inst.end();
         let msg = inst.obj.message();
         self.checkin(key, inst);
@@ -235,6 +241,7 @@ impl OfxEffect {
         inst: &mut Instance,
         frame: &mut PluginFrame,
         params: &PluginParams,
+        values: &HashMap<String, Vec<PVal>>,
         time: f64,
         fps: f64,
         geom: Geometry,
@@ -242,8 +249,7 @@ impl OfxEffect {
     ) -> Result<(), String> {
         let (w, h, pad) = (geom.w as usize, geom.h as usize, geom.pad as usize);
         let t = time * fps;
-        let values = self.bindings.decode(params.flat, params.texts, &geom.coord());
-        let changed = inst.apply_values(&values);
+        let changed = inst.apply_values(values);
 
         // The plug-in's own layer at the current time: the buffer minus our padding.
         let src_rect = geom.src_rect();
@@ -270,9 +276,6 @@ impl OfxEffect {
         if inst.rendered {
             for name in &changed {
                 inst.instance_changed(name, t);
-            }
-            if changed.iter().any(|n| self.cfg.slave_params.contains(n)) {
-                inst.refresh_prefs();
             }
         }
 
