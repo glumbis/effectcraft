@@ -6,7 +6,7 @@
 //! (Filter, General, Transition, Generator), maps the parameters to a manifest and registers an
 //! [`OfxEffect`]. Libraries stay loaded for the life of the process.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -92,8 +92,12 @@ pub fn load_path(path: &Path) -> LoadReport {
     // The same binary can be reached twice (through a link, or a folder listed twice).
     let mut seen = std::collections::HashSet::new();
     binaries.retain(|(bin, _)| seen.insert(std::fs::canonicalize(bin).unwrap_or_else(|_| bin.clone())));
-    for (bin, bundle) in binaries {
-        load_binary(&bin, &bundle, &mut report);
+    // Phase one lists every binary's plug-ins, so that copies of one plug-in can be told apart
+    // before any of them is described; phase two describes what is kept.
+    let mut probed: Vec<Probed> = binaries.iter().filter_map(|(bin, bundle)| probe_binary(bin, bundle, &mut report)).collect();
+    mark_duplicates(&mut probed, &mut report.notes);
+    for p in probed {
+        describe_binary(p, &mut report);
     }
     report
 }
@@ -212,35 +216,76 @@ fn in_scope<R>(diag: &Arc<PluginDiag>, plugin: &str, action: &str, f: impl FnOnc
     f()
 }
 
-fn load_binary(bin: &Path, bundle: &str, report: &mut LoadReport) {
+/// A binary after the probe: loaded, offered the host, its plug-ins listed, nothing described yet.
+struct Probed {
+    bin: PathBuf,
+    bundle: String,
+    label: String,
+    key: PathBuf,
+    /// The binary's load transcript so far (the describe phase adds the plug-ins).
+    tr: Vec<String>,
+    /// Shared by the plug-ins of this library that declare themselves render-thread-unsafe.
+    lock: Arc<Mutex<()>>,
+    plugins: Vec<Listed>,
+}
+
+/// One plug-in a binary lists through `OfxGetPlugin`.
+struct Listed {
+    ptr: *mut OfxPlugin,
+    id: String,
+    version: (u32, u32),
+    /// Why it is not described: another copy of the plug-in is kept.
+    skip: Option<String>,
+}
+
+/// The plug-in identifiers registered so far in this process, with their versions: a later
+/// `load_path` call cannot replace one that is already registered.
+fn registered_ids() -> &'static Mutex<HashMap<String, (u32, u32)>> {
+    static R: OnceLock<Mutex<HashMap<String, (u32, u32)>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Phase one of loading a binary: open it, offer it the host (`OfxSetHost`), ask how many plug-ins
+/// it has and list them. Nothing is described (no `Load`), so copies of one plug-in (the alpha,
+/// beta and release folders some vendors leave behind) can be told apart before any of their code
+/// runs. `None`: nothing to describe (already loaded, declined the host, failed, no plug-ins).
+fn probe_binary(bin: &Path, bundle: &str, report: &mut LoadReport) -> Option<Probed> {
     let key = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
     if let Some(done) = loaded_cache().lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         report.loaded.extend(done.iter().cloned());
-        return;
+        return None;
     }
     let label = bin.display().to_string();
     // A binary that crashed the process last time is skipped; the crash marker stays on disk
-    // until this binary has been loaded and described (the guard removes it when dropped).
-    let _marker = match crate::blocklist::begin(&key, &label) {
+    // until this binary has been loaded and described (the guard removes it when dropped). The
+    // probe keeps the binary's earlier strikes: only a finished describe phase clears them.
+    let mut marker = match crate::blocklist::begin_phase(&key, &label, false) {
         Ok(g) => g,
         Err(e) => {
             report.errors.push(e);
-            return;
+            return None;
         }
     };
     let mut tr = vec![label.clone(), format!("  host shown to the plug-in: {}", crate::suites::host_summary())];
-    load_open(bin, bundle, &label, &key, report, &mut tr);
-    report.transcript.push(tr.join("\n"));
+    match probe_open(bin, &label, report, &mut tr) {
+        Some((lock, plugins)) => Some(Probed { bin: bin.to_path_buf(), bundle: bundle.to_string(), label, key, tr, lock, plugins }),
+        None => {
+            // Over without a crash: nothing more will be described for this binary.
+            marker.forgive();
+            report.transcript.push(tr.join("\n"));
+            None
+        }
+    }
 }
 
-/// The part of [`load_binary`] that runs plug-in code; what happens goes to `tr`.
-fn load_open(bin: &Path, bundle: &str, label: &str, key: &Path, report: &mut LoadReport, tr: &mut Vec<String>) {
+/// The part of [`probe_binary`] that runs plug-in code; what happens goes to `tr`.
+fn probe_open(bin: &Path, label: &str, report: &mut LoadReport, tr: &mut Vec<String>) -> Option<(Arc<Mutex<()>>, Vec<Listed>)> {
     let lib = match open_library(bin) {
         Ok(l) => l,
         Err(e) => {
             tr.push(format!("  cannot load the library: {e}"));
             report.errors.push(format!("{label}: cannot load the library: {e}"));
-            return;
+            return None;
         }
     };
     // The library stays loaded for the life of the process: plug-ins keep code and state alive.
@@ -252,7 +297,7 @@ fn load_open(bin: &Path, bundle: &str, label: &str, key: &Path, report: &mut Loa
             _ => {
                 tr.push("  OfxGetNumberOfPlugins / OfxGetPlugin are not exported".to_string());
                 report.errors.push(format!("{label}: not an OpenFX plug-in (OfxGetNumberOfPlugins / OfxGetPlugin not exported)"));
-                return;
+                return None;
             }
         }
     };
@@ -276,7 +321,7 @@ fn load_open(bin: &Path, bundle: &str, label: &str, key: &Path, report: &mut Loa
                     "{label}: declined this host: OfxSetHost returned {} (the plug-in says it is not for this host; the host name it was shown is \"{host}\")",
                     status_name(st)
                 ));
-                return;
+                return None;
             }
             Ok(K_STAT_OK) => tr.push("  OfxSetHost -> kOfxStatOK (0)".to_string()),
             Ok(st) => tr.push(format!("  OfxSetHost -> {} (not a failure: ignored)", status_name(st))),
@@ -289,12 +334,10 @@ fn load_open(bin: &Path, bundle: &str, label: &str, key: &Path, report: &mut Loa
         report.notes.push(format!(
             "{label}: exports no OpenFX plug-ins (OfxGetNumberOfPlugins returned {n_raw}); it is not a plug-in for this host, or it declined the host name \"{host}\""
         ));
-        return;
+        return None;
     }
-    let n = n_raw.clamp(0, 4096);
-    let lock = Arc::new(Mutex::new(()));
-    let mut here: Vec<LoadedEffect> = Vec::new();
-    for i in 0..n {
+    let mut plugins = Vec::new();
+    for i in 0..n_raw.clamp(0, 4096) {
         // SAFETY: as above.
         let p = in_scope(&bin_diag, &bin_name, "OfxGetPlugin", || std::panic::catch_unwind(|| unsafe { get(i) })).unwrap_or(std::ptr::null_mut());
         if p.is_null() {
@@ -302,21 +345,138 @@ fn load_open(bin: &Path, bundle: &str, label: &str, key: &Path, report: &mut Loa
             report.errors.push(format!("{label}: OfxGetPlugin({i}) returned null"));
             continue;
         }
-        match describe_plugin(p, bin, bundle, lock.clone(), tr) {
-            Outcome::Registered(e) => here.push(e),
+        // SAFETY: a non-null OfxPlugin* from the binary; the struct is static data in the plug-in.
+        let pl = unsafe { &*p };
+        let id = unsafe { str_arg(pl.plugin_identifier) }.unwrap_or("").to_string();
+        plugins.push(Listed { ptr: p, id, version: (pl.plugin_version_major, pl.plugin_version_minor), skip: None });
+    }
+    Some((Arc::new(Mutex::new(())), plugins))
+}
+
+/// A plug-in offered by a binary, for [`pick_duplicates`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Offer {
+    id: String,
+    version: (u32, u32),
+}
+
+/// Who keeps a plug-in identifier that several copies offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Winner {
+    /// Another binary of this scan (its index and the version it offers).
+    Binary(usize, (u32, u32)),
+    /// An earlier scan registered it already (and registrations cannot be replaced).
+    Registered((u32, u32)),
+}
+
+/// Which offers lose because the same plug-in identifier is offered more than once. `offers[i]`
+/// are the offers of binary `i` in scan order; `claimed` are the identifiers registered by earlier
+/// scans. The highest version wins; among equal versions the copy found first. Result: (binary
+/// index, offer index) of every loser, with the winner.
+fn pick_duplicates(offers: &[Vec<Offer>], claimed: &HashMap<String, (u32, u32)>) -> BTreeMap<(usize, usize), Winner> {
+    let mut by_id: BTreeMap<&str, Vec<(usize, usize, (u32, u32))>> = BTreeMap::new();
+    for (i, list) in offers.iter().enumerate() {
+        for (j, o) in list.iter().enumerate() {
+            by_id.entry(o.id.as_str()).or_default().push((i, j, o.version));
+        }
+    }
+    let mut losers = BTreeMap::new();
+    for (id, candidates) in by_id {
+        if let Some(&v) = claimed.get(id) {
+            for (i, j, _) in candidates {
+                losers.insert((i, j), Winner::Registered(v));
+            }
+            continue;
+        }
+        if candidates.len() < 2 {
+            continue;
+        }
+        // `reduce` keeps the earlier candidate unless a later one has a higher version.
+        let Some(best) = candidates.iter().copied().reduce(|a, b| if b.2 > a.2 { b } else { a }) else { continue };
+        for (i, j, _) in candidates {
+            if (i, j) != (best.0, best.1) {
+                losers.insert((i, j), Winner::Binary(best.0, best.2));
+            }
+        }
+    }
+    losers
+}
+
+/// Mark the plug-ins that lose to another copy of themselves, and say so in a note per binary.
+/// Users end up with alpha, beta and release bundles of one product side by side in the OFX
+/// folder (Topaz documents crashes from the older ones in Nuke); the newest is the one that runs.
+fn mark_duplicates(probed: &mut [Probed], notes: &mut Vec<String>) {
+    let offers: Vec<Vec<Offer>> = probed.iter().map(|p| p.plugins.iter().map(|l| Offer { id: l.id.clone(), version: l.version }).collect()).collect();
+    let claimed = registered_ids().lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let losers = pick_duplicates(&offers, &claimed);
+    let version = |v: (u32, u32)| format!("{}.{}", v.0, v.1);
+    let mut per_binary: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (&(i, j), winner) in &losers {
+        let why = match winner {
+            Winner::Binary(b, v) => {
+                let winner_label = probed.get(*b).map(|p| p.label.as_str()).unwrap_or("another copy");
+                (
+                    format!("duplicate: {winner_label} offers version {} of it", version(*v)),
+                    format!("{} (this copy {}, kept {} in {winner_label})", offers[i][j].id, version(offers[i][j].version), version(*v)),
+                )
+            }
+            Winner::Registered(v) => (
+                format!("duplicate: it is already registered (version {})", version(*v)),
+                format!("{} (this copy {}, already registered {})", offers[i][j].id, version(offers[i][j].version), version(*v)),
+            ),
+        };
+        if let Some(l) = probed.get_mut(i).and_then(|p| p.plugins.get_mut(j)) {
+            l.skip = Some(why.0);
+        }
+        per_binary.entry(i).or_default().push(why.1);
+    }
+    for (i, list) in per_binary {
+        let Some(p) = probed.get(i) else { continue };
+        let shown: Vec<&str> = list.iter().take(3).map(String::as_str).collect();
+        let more = if list.len() > 3 { format!(" and {} more", list.len() - 3) } else { String::new() };
+        notes.push(format!("{}: {} duplicate plug-in(s) skipped, the newest copy is kept: {}{more}", p.label, list.len(), shown.join("; ")));
+    }
+}
+
+/// Phase two: describe and register the plug-ins of a probed binary that were not marked as
+/// duplicates.
+fn describe_binary(p: Probed, report: &mut LoadReport) {
+    let Probed { bin, bundle, label, key, mut tr, lock, plugins } = p;
+    let _marker = match crate::blocklist::begin_phase(&key, &label, true) {
+        Ok(g) => g,
+        Err(e) => {
+            report.errors.push(e);
+            report.transcript.push(tr.join("\n"));
+            return;
+        }
+    };
+    let mut here: Vec<LoadedEffect> = Vec::new();
+    for l in &plugins {
+        if let Some(why) = &l.skip {
+            tr.push(format!("  {} v{}.{}: skipped, {why}", l.id, l.version.0, l.version.1));
+            continue;
+        }
+        match describe_plugin(l.ptr, &bin, &bundle, lock.clone(), &mut tr) {
+            Outcome::Registered(e, notes) => {
+                registered_ids().lock().unwrap_or_else(PoisonError::into_inner).insert(l.id.clone(), l.version);
+                report.notes.extend(notes.into_iter().map(|n| format!("{label}: {n}")));
+                here.push(e);
+            }
             Outcome::Skipped(note) => report.notes.push(format!("{label}: {note}")),
             Outcome::Failed(e) => report.errors.push(format!("{label}: {e}")),
         }
     }
     report.loaded.extend(here.iter().cloned());
     if !here.is_empty() {
-        loaded_cache().lock().unwrap_or_else(PoisonError::into_inner).insert(key.to_path_buf(), here);
+        loaded_cache().lock().unwrap_or_else(PoisonError::into_inner).insert(key, here);
     }
+    report.transcript.push(tr.join("\n"));
 }
 
 /// What became of one plug-in.
 enum Outcome {
-    Registered(LoadedEffect),
+    /// Registered, with notes about how it was described (a fallback context, a guessed input).
+    Registered(LoadedEffect, Vec<String>),
     /// Left out on purpose: the note says why.
     Skipped(String),
     /// Could not be made into an effect: the error says why.
@@ -416,7 +576,8 @@ fn run_action(entry: &PluginEntry, block: &mut Block, name: &str, action: &str, 
 
 /// What [`describe_steps`] made of a plug-in.
 enum Step {
-    Registered(LoadedEffect),
+    /// Registered, with notes about how it was described.
+    Registered(LoadedEffect, Vec<String>),
     /// Left out on purpose (a note, without the plug-in's id).
     Skip(String),
     /// Could not be made into an effect (the reason, without the plug-in's id).
@@ -431,10 +592,12 @@ fn describe_plugin(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mute
     let id = block.id.clone();
     let prefixed = |s: String| if id.is_empty() { s } else { format!("{id}: {s}") };
     match step {
-        Step::Registered(e) => {
+        Step::Registered(e, notes) => {
             let outcome = format!("registered as effect {} ({} context)", e.id, e.context);
+            // A fallback or a guess is worth the full lines (a failed attempt's status and message).
+            block.noteworthy |= !notes.is_empty();
             block.finish(tr, &diag, &outcome, true);
-            Outcome::Registered(e)
+            Outcome::Registered(e, notes.into_iter().map(prefixed).collect())
         }
         Step::Skip(note) => {
             block.finish(tr, &diag, &format!("skipped: {note}"), false);
@@ -497,10 +660,17 @@ fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex
         return Step::Fail(entry.failure("Describe", st, mark));
     }
 
+    // A plug-in that only renders on the GPU would load and then fail every render.
+    if let Some(why) = gpu_only(&desc.props) {
+        return Step::Fail(format!("needs GPU rendering, which this host does not offer ({why})"));
+    }
+
+    // The contexts this host can run, in preference order, among those the plug-in lists.
     let contexts = desc.props.strs(IE_SUPPORTED_CONTEXTS);
-    let Some(context) = [CTX_FILTER, CTX_GENERAL, CTX_TRANSITION, CTX_GENERATOR].into_iter().find(|c| contexts.iter().any(|s| s == c)) else {
+    let candidates: Vec<&str> = [CTX_FILTER, CTX_GENERAL, CTX_TRANSITION, CTX_GENERATOR].into_iter().filter(|c| contexts.iter().any(|s| s == c)).collect();
+    if candidates.is_empty() {
         return Step::Fail(format!("no supported context (needs filter, general, transition or generator; it lists {contexts:?})"));
-    };
+    }
 
     let depths = desc.props.strs(IE_SUPPORTED_PIXEL_DEPTHS);
     let depth = if depths.is_empty() {
@@ -519,27 +689,63 @@ fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex
         _ => Safety::InstanceSafe,
     };
 
-    let inp = PropSet::new();
-    inp.put_str(IE_CONTEXT, context);
-    let (st, mark) = run_action(&entry, block, "DescribeInContext", ACT_DESCRIBE_IN_CONTEXT, desc.handle(), Some(&inp));
-    if st != K_STAT_OK {
-        return Step::Fail(entry.failure(&format!("DescribeInContext ({})", short_context(context)), st, mark));
+    // The first context that describes wins; the reasons the others did not are kept for the notes.
+    // An attempt may have defined clips and parameters and extended lists before it failed, so each
+    // one starts from what Describe left.
+    let described = desc.props.clone();
+    let mut notes: Vec<String> = Vec::new();
+    let mut failed_contexts: Vec<String> = Vec::new();
+    let mut chosen: Option<&str> = None;
+    for ctx in candidates {
+        desc.reset_to(&described);
+        let inp = PropSet::new();
+        inp.put_str(IE_CONTEXT, ctx);
+        let short = short_context(ctx);
+        let (st, mark) = run_action(&entry, block, &format!("DescribeInContext({short})"), ACT_DESCRIBE_IN_CONTEXT, desc.handle(), Some(&inp));
+        if st == K_STAT_OK {
+            chosen = Some(ctx);
+            break;
+        }
+        failed_contexts.push(entry.failure(&format!("DescribeInContext ({short})"), st, mark));
+    }
+    let Some(context) = chosen else {
+        return Step::Fail(failed_contexts.join("; "));
+    };
+    if !failed_contexts.is_empty() {
+        notes.push(format!("{}; the {} context is used instead", failed_contexts.join("; "), short_context(context)));
     }
 
     // Clips: Output; the effect's own layer; everything else becomes a Layer parameter.
-    let input_name = if context == CTX_TRANSITION { CLIP_SOURCE_FROM } else { CLIP_SOURCE };
-    let mut clip_infos: Vec<(String, Comps, bool)> = Vec::new();
-    desc.each_clip(|c| clip_infos.push((c.name.clone(), pick_comps(&c.props.strs(IE_SUPPORTED_COMPONENTS)), c.props.flag(CLIP_OPTIONAL, false))));
-    if !clip_infos.iter().any(|(n, ..)| n == CLIP_OUTPUT) {
+    let standard_input = if context == CTX_TRANSITION { CLIP_SOURCE_FROM } else { CLIP_SOURCE };
+    let mut clip_infos: Vec<ClipInfo> = Vec::new();
+    desc.each_clip(|c| {
+        clip_infos.push(ClipInfo {
+            name: c.name.clone(),
+            comps: pick_comps(&c.props.strs(IE_SUPPORTED_COMPONENTS)),
+            optional: c.props.flag(CLIP_OPTIONAL, false),
+            mask: c.props.flag(CLIP_IS_MASK, false),
+        })
+    });
+    if !clip_infos.iter().any(|c| c.name == CLIP_OUTPUT) {
         return Step::Fail("describes no Output clip".into());
     }
-    let layer_clips: Vec<String> = clip_infos.iter().filter(|(n, ..)| n != CLIP_OUTPUT && n != input_name).map(|(n, ..)| n.clone()).collect();
+    // The effect's own pixels come in on `Source` (`SourceFrom` in a transition). A plug-in that
+    // calls its main input something else gets its first required, non-mask clip instead of a
+    // Layer parameter with nothing behind it.
+    let input_name = match main_input(&clip_infos, standard_input) {
+        Some(n) => n,
+        None => String::new(),
+    };
+    if !input_name.is_empty() && input_name != standard_input {
+        notes.push(format!("it has no clip named {standard_input}; its first required clip, {input_name}, is used as the main input"));
+    }
+    let layer_clips: Vec<String> = clip_infos.iter().filter(|c| c.name != CLIP_OUTPUT && c.name != input_name).map(|c| c.name.clone()).collect();
     let page_order = desc.props.strs(IE_PARAM_PAGE_ORDER);
     let mapped = map_params(&desc.params, &page_order, &layer_clips);
 
     let clips: Vec<ClipCfg> = clip_infos
         .into_iter()
-        .map(|(name, comps, optional)| {
+        .map(|ClipInfo { name, comps, optional, .. }| {
             let role = if name == CLIP_OUTPUT {
                 ClipRole::Output
             } else if name == input_name {
@@ -575,12 +781,120 @@ fn describe_steps(ptr: *mut OfxPlugin, bin: &Path, bundle: &str, lock: Arc<Mutex
     if let Err(e) = register_plugin(Arc::new(effect)) {
         return Step::Fail(e);
     }
-    Step::Registered(LoadedEffect { id, name, category, ofx_id, context: short_context(context).to_string(), bundle: bundle.to_string() })
+    Step::Registered(LoadedEffect { id, name, category, ofx_id, context: short_context(context).to_string(), bundle: bundle.to_string() }, notes)
+}
+
+/// What the loader needs to know about a described clip.
+struct ClipInfo {
+    name: String,
+    comps: Comps,
+    optional: bool,
+    mask: bool,
+}
+
+/// The clip that carries the effect's own pixels: the standard name if the plug-in defines it,
+/// else the first clip that is not `Output`, not optional and not a mask; `None` when there is
+/// none (generators).
+fn main_input(clips: &[ClipInfo], standard: &str) -> Option<String> {
+    if clips.iter().any(|c| c.name == standard) {
+        return Some(standard.to_string());
+    }
+    clips.iter().find(|c| c.name != CLIP_OUTPUT && !c.optional && !c.mask).map(|c| c.name.clone())
+}
+
+/// Why a plug-in can only render on the GPU, if it can: it says it does not support CPU rendering
+/// (`OfxImageEffectPropCPURenderSupported` is "false", OFX 1.5.1) or that it needs OpenGL, CUDA,
+/// Metal or OpenCL (`"needed"`).
+fn gpu_only(props: &PropSet) -> Option<String> {
+    let mut why = Vec::new();
+    if props.str(IE_CPU_RENDER_SUPPORTED).as_deref() == Some("false") {
+        why.push(format!("{IE_CPU_RENDER_SUPPORTED} is \"false\""));
+    }
+    for (name, api) in [
+        (IE_OPENGL_RENDER_SUPPORTED, "OpenGL"),
+        (IE_CUDA_RENDER_SUPPORTED, "CUDA"),
+        (IE_METAL_RENDER_SUPPORTED, "Metal"),
+        (IE_OPENCL_RENDER_SUPPORTED, "OpenCL"),
+    ] {
+        if props.str(name).as_deref() == Some("needed") {
+            why.push(format!("{name} is \"needed\": it requires {api}"));
+        }
+    }
+    (!why.is_empty()).then(|| why.join("; "))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offer(id: &str, major: u32, minor: u32) -> Offer {
+        Offer { id: id.into(), version: (major, minor) }
+    }
+
+    #[test]
+    fn the_newest_copy_of_a_plugin_is_kept() {
+        let claimed = HashMap::new();
+        // Release 3.1 is found between an older and a newer copy: only the newest stays.
+        let offers = vec![
+            vec![offer("com.topaz.enhance", 3, 0), offer("com.topaz.other", 1, 0)],
+            vec![offer("com.topaz.enhance", 3, 1)],
+            vec![offer("com.topaz.enhance", 2, 9)],
+        ];
+        let losers = pick_duplicates(&offers, &claimed);
+        assert_eq!(losers.len(), 2);
+        assert_eq!(losers.get(&(0, 0)), Some(&Winner::Binary(1, (3, 1))));
+        assert_eq!(losers.get(&(2, 0)), Some(&Winner::Binary(1, (3, 1))));
+        // The other identifier is only offered once.
+        assert!(!losers.contains_key(&(0, 1)));
+    }
+
+    #[test]
+    fn equal_versions_keep_the_copy_found_first() {
+        let offers = vec![vec![offer("a", 1, 0)], vec![offer("a", 1, 0)], vec![offer("a", 1, 0)]];
+        let losers = pick_duplicates(&offers, &HashMap::new());
+        assert_eq!(losers.keys().copied().collect::<Vec<_>>(), [(1, 0), (2, 0)]);
+        assert!(losers.values().all(|w| *w == Winner::Binary(0, (1, 0))));
+    }
+
+    #[test]
+    fn a_plugin_registered_by_an_earlier_scan_cannot_be_replaced() {
+        // Even a newer copy loses: registrations are permanent.
+        let claimed = HashMap::from([("a".to_string(), (1, 0))]);
+        let losers = pick_duplicates(&[vec![offer("a", 2, 0), offer("b", 1, 0)]], &claimed);
+        assert_eq!(losers.len(), 1);
+        assert_eq!(losers.get(&(0, 0)), Some(&Winner::Registered((1, 0))));
+    }
+
+    fn clip(name: &str, optional: bool, mask: bool) -> ClipInfo {
+        ClipInfo { name: name.into(), comps: Comps::Rgba, optional, mask }
+    }
+
+    #[test]
+    fn the_main_input_is_source_or_the_first_required_clip() {
+        // The standard name wins, wherever it is.
+        let clips = [clip("Output", false, false), clip("Depth", false, false), clip("Source", false, false)];
+        assert_eq!(main_input(&clips, "Source").as_deref(), Some("Source"));
+        // Without it: the first clip that is not Output, optional or a mask.
+        let clips =
+            [clip("Output", false, false), clip("Mask", false, true), clip("Overlay", true, false), clip("Image", false, false), clip("Other", false, false)];
+        assert_eq!(main_input(&clips, "Source").as_deref(), Some("Image"));
+        // A generator has no input.
+        assert_eq!(main_input(&[clip("Output", false, false), clip("Matte", true, false)], "Source"), None);
+    }
+
+    #[test]
+    fn gpu_only_plugins_are_recognised() {
+        let p = PropSet::new();
+        assert_eq!(gpu_only(&p), None);
+        p.put_str(IE_OPENGL_RENDER_SUPPORTED, "true");
+        p.put_str(IE_CPU_RENDER_SUPPORTED, "true");
+        assert_eq!(gpu_only(&p), None, "supporting a GPU API next to the CPU is fine");
+        p.put_str(IE_CPU_RENDER_SUPPORTED, "false");
+        assert!(gpu_only(&p).is_some_and(|w| w.contains("CPURenderSupported")));
+        p.put_str(IE_CPU_RENDER_SUPPORTED, "true");
+        p.put_str(IE_CUDA_RENDER_SUPPORTED, "needed");
+        assert!(gpu_only(&p).is_some_and(|w| w.contains("CUDA")));
+    }
 
     #[test]
     fn a_bundle_binary_is_found_in_any_of_the_platform_directories() {

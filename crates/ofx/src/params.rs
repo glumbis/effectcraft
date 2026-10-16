@@ -195,6 +195,11 @@ impl ParamSet {
         self.lock().iter().map(|p| &**p as *const ParamObj).collect()
     }
 
+    /// Remove every parameter (descriptors, between attempts at describing a context).
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
     pub fn len(&self) -> usize {
         self.lock().len()
     }

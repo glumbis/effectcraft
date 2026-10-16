@@ -320,6 +320,14 @@ impl EffectObj {
         }
     }
 
+    /// Forget what an attempt at `DescribeInContext` defined: the clips and parameters go, and the
+    /// properties are put back as they were in `described` (a copy taken after `Describe`).
+    pub fn reset_to(&self, described: &PropSet) {
+        self.clips.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        self.params.clear();
+        self.props.replace_with(described);
+    }
+
     pub fn current_render(&self) -> Option<Arc<RenderCtx>> {
         self.render.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }

@@ -77,11 +77,17 @@ struct Marker {
 impl Marker {
     /// The load finished: unlock (closing the file releases the lock), remove the marker and
     /// forget the binary's earlier strikes.
+    #[cfg(test)]
     fn finish(self) {
+        self.close(true);
+    }
+
+    /// Unlock and remove the marker; `forgive` also forgets the binary's earlier strikes.
+    fn close(self, forgive: bool) {
         let Marker { path, file, bin } = self;
         drop(file);
         let _ = std::fs::remove_file(&path);
-        if let Some(dir) = path.parent() {
+        if forgive && let Some(dir) = path.parent() {
             forget(dir, &bin);
         }
     }
@@ -89,24 +95,44 @@ impl Marker {
 
 /// Held while a binary is being loaded; removes the marker when dropped (not reached if the
 /// process dies).
-pub(crate) struct LoadGuard(Option<Marker>);
+pub(crate) struct LoadGuard {
+    marker: Option<Marker>,
+    /// Whether dropping the guard also clears the binary's strikes (a load that went all the way).
+    forgive: bool,
+}
+
+impl LoadGuard {
+    /// This phase was the last one and went without a crash: dropping the guard clears the
+    /// binary's strikes.
+    pub(crate) fn forgive(&mut self) {
+        self.forgive = true;
+    }
+}
 
 impl Drop for LoadGuard {
     fn drop(&mut self) {
-        if let Some(m) = self.0.take() {
-            m.finish();
+        if let Some(m) = self.marker.take() {
+            m.close(self.forgive);
         }
     }
 }
 
 /// Called by the loader before it opens the binary at `bin` (canonical path; `label` is how
 /// errors name it). `Err` = the binary crashed the process last time and is skipped.
+#[cfg(test)]
 pub(crate) fn begin(bin: &Path, label: &str) -> Result<LoadGuard, String> {
-    let Some(dir) = state_dir() else { return Ok(LoadGuard(None)) };
+    begin_phase(bin, label, true)
+}
+
+/// [`begin`] for one phase of loading a binary (listing its plug-ins, then describing them).
+/// Only the phase that ends the load (`last`) clears the binary's earlier strikes when its guard
+/// is dropped, so a crash in a later phase still counts against the binary.
+pub(crate) fn begin_phase(bin: &Path, label: &str, last: bool) -> Result<LoadGuard, String> {
+    let Some(dir) = state_dir() else { return Ok(LoadGuard { marker: None, forgive: last }) };
     if !RECOVERED.swap(true, Ordering::SeqCst) {
         recover(&dir);
     }
-    check_and_mark(&dir, bin, label, std::process::id()).map(LoadGuard)
+    check_and_mark(&dir, bin, label, std::process::id()).map(|marker| LoadGuard { marker, forgive: last })
 }
 
 /// How paths are compared: case-insensitively on Windows.
@@ -347,6 +373,20 @@ mod tests {
         assert!(!t.0.join(LIST).exists());
         crash_and_recover(&t.0, &b, 3);
         assert!(!is_blocked(&t.0, &b.to_string_lossy()));
+    }
+
+    /// Loading a binary has two phases (list its plug-ins, then describe them): finishing the
+    /// first must not forgive earlier crashes, or a binary that dies while describing would never
+    /// reach the strike limit.
+    #[test]
+    fn only_the_last_phase_of_a_load_clears_strikes() {
+        let t = TempDir::new("phases");
+        let b = bin("Phased.ofx");
+        crash_and_recover(&t.0, &b, 1);
+        check_and_mark(&t.0, &b, "Phased", 2).unwrap().unwrap().close(false);
+        assert_eq!(read_list(&t.0).len(), 1, "the first phase alone keeps the strike");
+        check_and_mark(&t.0, &b, "Phased", 2).unwrap().unwrap().close(true);
+        assert!(!t.0.join(LIST).exists());
     }
 
     /// Lists written by earlier versions (a bare path after one crash) count as one strike.

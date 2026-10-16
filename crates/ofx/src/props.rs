@@ -136,6 +136,12 @@ impl PropSet {
 
     // ---- Rust-side convenience ----
 
+    /// Make this set hold exactly what `other` holds (its kind stays).
+    pub fn replace_with(&self, other: &PropSet) {
+        let copy = other.lock().clone();
+        *self.lock() = copy;
+    }
+
     /// Set a whole property.
     pub fn put(&self, name: &str, vals: Vec<PVal>) {
         self.lock().insert(name.to_string(), vals);

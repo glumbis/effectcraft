@@ -133,6 +133,9 @@ fn all_effects_register() {
         ("org.effectcraft.test.AllParams", "filter"),
         ("org.effectcraft.test.SupportLib", "filter"),
         ("org.effectcraft.test.CreateTime", "filter"),
+        // Lists Filter and General, but only General describes.
+        ("org.effectcraft.test.ContextFallback", "general"),
+        ("org.effectcraft.test.NoSource", "general"),
     ] {
         let e = r.loaded.iter().find(|e| e.ofx_id == ofx_id).unwrap_or_else(|| panic!("{ofx_id} missing from {:?}", r.loaded));
         assert_eq!(e.id, ofx_id.to_lowercase(), "effect id");
@@ -194,6 +197,40 @@ fn support_library_pattern_describes() {
     let px: Vec<Px> = (0..12).map(|i| [i as f32 / 12.0, 0.5, 0.25, 1.0]).collect();
     let (.., out) = run(&*p, 4, 3, &px, &[], &FakeHost::default());
     assert!(out.iter().zip(&px).all(|(a, b)| close(*a, *b)));
+}
+
+/// The first context that describes wins: Filter fails (after defining a parameter), General works,
+/// and the effect has only General's parameters. The notes say why Filter was passed over.
+#[test]
+fn a_context_that_fails_to_describe_falls_back_to_the_next() {
+    let Some(p) = effect("org.effectcraft.test.ContextFallback") else { return };
+    let ids: Vec<&str> = p.manifest().params.iter().map(|q| q.id.as_str()).collect();
+    assert_eq!(ids, ["gain"], "the failed Filter attempt's parameter must be gone");
+    let r = report().expect("loaded");
+    let note = r.notes.iter().find(|n| n.contains("org.effectcraft.test.ContextFallback")).unwrap_or_else(|| panic!("notes: {:?}", r.notes));
+    assert!(note.contains("DescribeInContext (filter) failed: kOfxStatErrMissingHostFeature (4)"), "{note}");
+    assert!(note.contains("the plug-in said \"The filter context is not available\"") && note.contains("the general context is used instead"), "{note}");
+    // It renders (pass-through).
+    let px: Vec<Px> = (0..4).map(|i| [i as f32 / 4.0, 0.5, 0.25, 1.0]).collect();
+    let (.., out) = run(&*p, 2, 2, &px, &[], &FakeHost::default());
+    assert!(out.iter().zip(&px).all(|(a, b)| close(*a, *b)));
+}
+
+/// A general-context effect whose main input is called `Image`, with a required mask and an
+/// optional overlay around it: `Image` is the effect's own layer, the other two are Layer parameters.
+#[test]
+fn the_main_input_need_not_be_called_source() {
+    let Some(p) = effect("org.effectcraft.test.NoSource") else { return };
+    let params = &p.manifest().params;
+    let layers: Vec<&str> = params.iter().filter(|q| matches!(q.kind, PluginParamKind::Layer)).map(|q| q.id.as_str()).collect();
+    assert_eq!(layers, ["Mask", "Overlay"], "{params:?}");
+    assert!(params.iter().all(|q| q.id != "Image"));
+    let r = report().expect("loaded");
+    assert!(r.notes.iter().any(|n| n.contains("org.effectcraft.test.NoSource") && n.contains("no clip named Source") && n.contains("Image")), "{:?}", r.notes);
+    // The plug-in reads the layer's pixels through its `Image` clip.
+    let px: Vec<Px> = (0..4).map(|i| [0.1 * (i + 1) as f32, 0.5, 0.25, 1.0]).collect();
+    let (.., out) = run(&*p, 2, 2, &px, &[], &FakeHost::default());
+    assert!(out.iter().zip(&px).all(|(a, b)| close(*a, *b)), "{out:?}");
 }
 
 /// A plug-in reads its parameters in `CreateInstance` and keeps what it finds (a model, a mode);

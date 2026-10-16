@@ -1,4 +1,4 @@
-//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports seven effects:
+//! A tiny OpenFX plug-in bundle used to test EffectCraft's OFX host. It exports nine effects:
 //!
 //! * `org.effectcraft.test.Invert`: filter, inverts the colours (double param `amount`);
 //! * `org.effectcraft.test.Echo`: filter, averages Source at `t` and `t - 1` (temporal access);
@@ -12,7 +12,14 @@
 //!   `propGetDimension` fails Describe), passes the image through;
 //! * `org.effectcraft.test.CreateTime`: reads its `level` parameter in CreateInstance (and keeps it
 //!   as instance data), multiplies the source by that created value, and answers
-//!   GetClipPreferences from the *current* `level` (a slave parameter): "unpremultiplied" below 0.5.
+//!   GetClipPreferences from the *current* `level` (a slave parameter): "unpremultiplied" below 0.5;
+//! * `org.effectcraft.test.ContextFallback`: lists the Filter and General contexts, but its Filter
+//!   DescribeInContext fails (after defining a parameter), so the host has to fall back to General;
+//! * `org.effectcraft.test.NoSource`: general context, clips Output / Mask / Overlay / Image: the
+//!   main input is not called Source.
+//!
+//! With `EC_TEST_OFX_MODE=extras` it exports only two more, which cannot become effects:
+//! `GpuOnly` (needs OpenGL, no CPU rendering) and `NotAnImageEffect` (another plug-in API).
 //!
 //! Float RGBA only. Rows are addressed through `OfxImagePropRowBytes` (which may be negative).
 
@@ -33,9 +40,24 @@ const MIX: usize = 3;
 const ALL_PARAMS: usize = 4;
 const SUPPORT_LIB: usize = 5;
 const CREATE_TIME: usize = 6;
+const CONTEXT_FALLBACK: usize = 7;
+const NO_SOURCE: usize = 8;
+const GPU_ONLY: usize = 9;
+const NOT_AN_IMAGE_EFFECT: usize = 10;
 
-const LABELS: [&CStr; 7] =
-    [c"EC Test Invert", c"EC Test Echo", c"EC Test Border", c"EC Test Mix", c"EC Test All Params", c"EC Test Support Lib", c"EC Test Create Time"];
+const LABELS: [&CStr; 11] = [
+    c"EC Test Invert",
+    c"EC Test Echo",
+    c"EC Test Border",
+    c"EC Test Mix",
+    c"EC Test All Params",
+    c"EC Test Support Lib",
+    c"EC Test Create Time",
+    c"EC Test Context Fallback",
+    c"EC Test No Source",
+    c"EC Test GPU Only",
+    c"EC Test Not An Image Effect",
+];
 
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(null_mut());
 /// Set when the host has called `OfxSetHost` (the header orders it before `OfxGetNumberOfPlugins`).
@@ -74,8 +96,11 @@ unsafe impl Sync for Plug {}
 
 macro_rules! plug {
     ($id:expr, $k:expr) => {
+        plug!($id, $k, c"OfxImageEffectPluginAPI")
+    };
+    ($id:expr, $k:expr, $api:expr) => {
         Plug(OfxPlugin {
-            plugin_api: c"OfxImageEffectPluginAPI".as_ptr(),
+            plugin_api: $api.as_ptr(),
             api_version: 1,
             plugin_identifier: $id.as_ptr(),
             version_major: 1,
@@ -86,7 +111,7 @@ macro_rules! plug {
     };
 }
 
-static PLUGINS: [Plug; 7] = [
+static PLUGINS: [Plug; 9] = [
     plug!(c"org.effectcraft.test.Invert", INVERT),
     plug!(c"org.effectcraft.test.Echo", ECHO),
     plug!(c"org.effectcraft.test.Border", BORDER),
@@ -94,17 +119,27 @@ static PLUGINS: [Plug; 7] = [
     plug!(c"org.effectcraft.test.AllParams", ALL_PARAMS),
     plug!(c"org.effectcraft.test.SupportLib", SUPPORT_LIB),
     plug!(c"org.effectcraft.test.CreateTime", CREATE_TIME),
+    plug!(c"org.effectcraft.test.ContextFallback", CONTEXT_FALLBACK),
+    plug!(c"org.effectcraft.test.NoSource", NO_SOURCE),
 ];
+
+/// What `EC_TEST_OFX_MODE=extras` exports instead of [`PLUGINS`].
+static EXTRAS: [Plug; 2] =
+    [plug!(c"org.effectcraft.test.GpuOnly", GPU_ONLY), plug!(c"org.effectcraft.test.NotAnImageEffect", NOT_AN_IMAGE_EFFECT, c"OfxEffectTestOtherPluginAPI")];
+
+fn table() -> &'static [Plug] {
+    if mode() == "extras" { &EXTRAS } else { &PLUGINS }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn OfxGetNumberOfPlugins() -> c_int {
     // A plug-in library may decide what it exports once it has seen the host.
-    if mode() == "no-plugins" || !SET_HOST_CALLED.load(Ordering::SeqCst) { 0 } else { PLUGINS.len() as c_int }
+    if mode() == "no-plugins" || !SET_HOST_CALLED.load(Ordering::SeqCst) { 0 } else { table().len() as c_int }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn OfxGetPlugin(nth: c_int) -> *mut OfxPlugin {
-    usize::try_from(nth).ok().and_then(|n| PLUGINS.get(n)).map_or(null_mut(), |p| &p.0 as *const OfxPlugin as *mut OfxPlugin)
+    usize::try_from(nth).ok().and_then(|n| table().get(n)).map_or(null_mut(), |p| &p.0 as *const OfxPlugin as *mut OfxPlugin)
 }
 
 // ---- actions ---------------------------------------------------------------------------------
@@ -130,7 +165,7 @@ unsafe fn dispatch(k: usize, action: &[u8], effect: Effect, in_args: Props, out_
                 None => ERR_UNSUPPORTED,
             },
             b"OfxActionDescribe" => describe(k, effect),
-            b"OfxImageEffectActionDescribeInContext" => describe_in_context(k, effect),
+            b"OfxImageEffectActionDescribeInContext" => describe_in_context(k, effect, in_args),
             b"OfxActionCreateInstance" if k == CREATE_TIME => create_time_create(effect),
             b"OfxActionDestroyInstance" if k == CREATE_TIME => create_time_destroy(effect),
             b"OfxImageEffectActionGetClipPreferences" if k == CREATE_TIME => create_time_prefs(effect, out_args),
@@ -172,8 +207,17 @@ unsafe fn describe(k: usize, effect: Effect) -> Status {
                 return status;
             }
         } else {
-            s.set_str(p, c"OfxImageEffectPropSupportedContexts", 0, if k == MIX { c"OfxImageEffectContextGeneral" } else { c"OfxImageEffectContextFilter" });
+            let general = k == MIX || k == NO_SOURCE;
+            s.set_str(p, c"OfxImageEffectPropSupportedContexts", 0, if general { c"OfxImageEffectContextGeneral" } else { c"OfxImageEffectContextFilter" });
+            if k == CONTEXT_FALLBACK {
+                s.set_str(p, c"OfxImageEffectPropSupportedContexts", 1, c"OfxImageEffectContextGeneral");
+            }
             s.set_str(p, c"OfxImageEffectPropSupportedPixelDepths", 0, c"OfxBitDepthFloat");
+        }
+        if k == GPU_ONLY {
+            // Renders on the GPU only: says it needs OpenGL and has no CPU path.
+            s.set_str(p, c"OfxImageEffectPropOpenGLRenderSupported", 0, c"needed");
+            s.set_str(p, c"OfxImageEffectPropCPURenderSupported", 0, c"false");
         }
         s.set_str(p, c"OfxImageEffectPluginRenderThreadSafety", 0, c"OfxImageEffectRenderFullySafe");
         s.set_int(p, c"OfxImageEffectPropSupportsTiles", 0, 0);
@@ -231,13 +275,26 @@ unsafe fn define_param(set: ParamSet, kind: &CStr, name: &CStr, label: &CStr) ->
     }
 }
 
-unsafe fn describe_in_context(k: usize, effect: Effect) -> Status {
+unsafe fn describe_in_context(k: usize, effect: Effect, in_args: Props) -> Status {
     let s = suites();
     unsafe {
-        define_clip(effect, c"Output", false, false, k == SUPPORT_LIB);
-        define_clip(effect, c"Source", false, k == ECHO, k == SUPPORT_LIB);
-        if k == MIX {
-            define_clip(effect, c"Matte", true, false, false);
+        let context = s.get_string(in_args, c"OfxImageEffectPropContext").unwrap_or_default();
+        if k == NO_SOURCE {
+            // The main input is `Image`, not `Source`; a required mask and an optional overlay
+            // come before it.
+            define_clip(effect, c"Output", false, false, false);
+            define_clip(effect, c"Mask", false, false, false);
+            let (mut c, mut p) = (null_mut(), null_mut());
+            (s.fx.clip_get_handle)(effect, c"Mask".as_ptr(), &mut c, &mut p);
+            s.set_int(p, c"OfxImageClipPropIsMask", 0, 1);
+            define_clip(effect, c"Overlay", true, false, false);
+            define_clip(effect, c"Image", false, false, false);
+        } else {
+            define_clip(effect, c"Output", false, false, k == SUPPORT_LIB);
+            define_clip(effect, c"Source", false, k == ECHO, k == SUPPORT_LIB);
+            if k == MIX {
+                define_clip(effect, c"Matte", true, false, false);
+            }
         }
         let mut set = null_mut();
         (s.fx.get_param_set)(effect, &mut set);
@@ -257,6 +314,17 @@ unsafe fn describe_in_context(k: usize, effect: Effect) -> Status {
                 s.set_int(p, c"OfxParamPropMax", 0, 256);
             }
             ALL_PARAMS => describe_all_params(set),
+            CONTEXT_FALLBACK => {
+                if context == "OfxImageEffectContextFilter" {
+                    // Fails after defining a parameter: the host must not keep it for the General
+                    // context it falls back to.
+                    define_param(set, c"OfxParamTypeDouble", c"stale", c"Stale");
+                    s.post_error(effect, c"The filter context is not available");
+                    return ERR_MISSING_HOST_FEATURE;
+                }
+                let p = define_param(set, c"OfxParamTypeDouble", c"gain", c"Gain");
+                s.set_dbl(p, c"OfxParamPropDefault", 0, 1.0);
+            }
             CREATE_TIME => {
                 let p = define_param(set, c"OfxParamTypeDouble", c"level", c"Level");
                 s.set_dbl(p, c"OfxParamPropDefault", 0, 1.0);
@@ -529,7 +597,7 @@ unsafe fn render(k: usize, effect: Effect, in_args: Props) -> Status {
         }
         let scale = [0, 1].map(|i| s.get_dbl(in_args, c"OfxImageEffectPropRenderScale", i).unwrap_or(1.0));
         let Some(out) = Img::fetch(clip(effect, c"Output"), time) else { return FAILED };
-        let src_clip = clip(effect, c"Source");
+        let src_clip = clip(effect, if k == NO_SOURCE { c"Image" } else { c"Source" });
         let src = Img::fetch(src_clip, time);
 
         // The per-pixel function of each effect, in output pixel coordinates (y up).
